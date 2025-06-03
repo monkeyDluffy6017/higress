@@ -9,7 +9,9 @@ spec:
   matchRules:
   - config:
       redis_key_prefix: "chat_quota:"
-      admin_consumer: consumer3
+      token_header: "authorization"
+      admin_header: "x-admin-key"
+      admin_key: "your-admin-secret"
       admin_path: /quota
       redis:
         service_name: redis-service.default.svc.cluster.local
