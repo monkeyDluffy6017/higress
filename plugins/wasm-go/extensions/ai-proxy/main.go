@@ -92,6 +92,37 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 		}
 	}
 
+	// Handle /v1/models request locally
+	if apiName == provider.ApiNameModels {
+		log.Debugf("[onHttpRequestHeader] handling /v1/models request locally")
+		ctx.DontReadRequestBody()
+		ctx.DontReadResponseBody()
+
+		// Generate models response based on modelMapping
+		responseBody, err := providerConfig.BuildModelsResponse()
+		if err != nil {
+			log.Errorf("failed to build models response: %v", err)
+			_ = util.ErrorHandler("ai-proxy.build_models_failed", fmt.Errorf("failed to build models response: %v", err))
+			return types.ActionContinue
+		}
+
+		// Set response headers
+		_ = proxywasm.ReplaceHttpResponseHeader(":status", "200")
+		_ = proxywasm.ReplaceHttpResponseHeader("content-type", "application/json")
+		_ = proxywasm.ReplaceHttpResponseHeader("content-length", fmt.Sprintf("%d", len(responseBody)))
+
+		// Set response body
+		err = proxywasm.ReplaceHttpResponseBody(responseBody)
+		if err != nil {
+			log.Errorf("failed to replace response body: %v", err)
+			_ = util.ErrorHandler("ai-proxy.replace_models_response_failed", fmt.Errorf("failed to replace response body: %v", err))
+			return types.ActionContinue
+		}
+
+		log.Debugf("[onHttpRequestHeader] models response sent: %s", string(responseBody))
+		return types.ActionContinue
+	}
+
 	if contentType, _ := proxywasm.GetHttpRequestHeader(util.HeaderContentType); contentType != "" && !strings.Contains(contentType, util.MimeTypeApplicationJson) {
 		ctx.DontReadRequestBody()
 		log.Debugf("[onHttpRequestHeader] unsupported content type: %s, will not process the request body", contentType)
