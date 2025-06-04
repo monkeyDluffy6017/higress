@@ -72,55 +72,84 @@ func parseOverrideRuleConfig(json gjson.Result, global config.PluginConfig, plug
 }
 
 func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConfig) types.Action {
-	activeProvider := pluginConfig.GetProvider()
-
-	if activeProvider == nil {
-		log.Debugf("[onHttpRequestHeader] no active provider, skip processing")
-		ctx.DontReadRequestBody()
-		return types.ActionContinue
-	}
-
-	log.Debugf("[onHttpRequestHeader] provider=%s", activeProvider.GetProviderType())
-
+	// Handle /v1/models request locally first (before model selection)
 	rawPath := ctx.Path()
 	path, _ := url.Parse(rawPath)
 	apiName := getApiName(path.Path)
-	providerConfig := pluginConfig.GetProviderConfig()
-	if providerConfig.IsOriginal() {
-		if handler, ok := activeProvider.(provider.ApiNameHandler); ok {
-			apiName = handler.GetApiName(path.Path)
-		}
-	}
 
-	// Handle /v1/models request locally
 	if apiName == provider.ApiNameModels {
 		log.Debugf("[onHttpRequestHeader] handling /v1/models request locally")
 		ctx.DontReadRequestBody()
-		ctx.DontReadResponseBody()
 
-		// Generate models response based on modelMapping
-		responseBody, err := providerConfig.BuildModelsResponse()
+		// Generate models response based on all configured providers
+		responseBody, err := pluginConfig.BuildCombinedModelsResponse()
 		if err != nil {
 			log.Errorf("failed to build models response: %v", err)
 			_ = util.ErrorHandler("ai-proxy.build_models_failed", fmt.Errorf("failed to build models response: %v", err))
 			return types.ActionContinue
 		}
 
-		// Set response headers
-		_ = proxywasm.ReplaceHttpResponseHeader(":status", "200")
-		_ = proxywasm.ReplaceHttpResponseHeader("content-type", "application/json")
-		_ = proxywasm.ReplaceHttpResponseHeader("content-length", fmt.Sprintf("%d", len(responseBody)))
-
-		// Set response body
-		err = proxywasm.ReplaceHttpResponseBody(responseBody)
+		// Send HTTP response directly
+		headers := [][2]string{
+			{"content-type", "application/json"},
+		}
+		err = proxywasm.SendHttpResponse(200, headers, responseBody, -1)
 		if err != nil {
-			log.Errorf("failed to replace response body: %v", err)
-			_ = util.ErrorHandler("ai-proxy.replace_models_response_failed", fmt.Errorf("failed to replace response body: %v", err))
+			log.Errorf("failed to send response: %v", err)
+			_ = util.ErrorHandler("ai-proxy.send_models_response_failed", fmt.Errorf("failed to send response: %v", err))
 			return types.ActionContinue
 		}
 
 		log.Debugf("[onHttpRequestHeader] models response sent: %s", string(responseBody))
 		return types.ActionContinue
+	}
+
+	// Get model name from request for provider selection
+	if contentType, _ := proxywasm.GetHttpRequestHeader(util.HeaderContentType); contentType != "" && strings.Contains(contentType, util.MimeTypeApplicationJson) {
+		// For requests with body, we'll extract model in onHttpRequestBody
+		// For now, use a placeholder to avoid null provider
+		if len(pluginConfig.GetProviderConfigs()) > 0 {
+			ctx.SetContext("needs_model_extraction", true)
+		}
+	}
+
+	// Try to get active provider first (for legacy single provider configuration)
+	activeProviderConfig := pluginConfig.GetProviderConfig()
+	var activeProvider provider.Provider
+
+	if activeProviderConfig != nil {
+		// Legacy single provider configuration
+		activeProvider = pluginConfig.GetProvider()
+	} else {
+		// Multi-provider configuration - we'll determine the provider later based on model
+		// Use first provider as temporary fallback
+		providerConfigs := pluginConfig.GetProviderConfigs()
+		if len(providerConfigs) == 0 {
+			log.Debugf("[onHttpRequestHeader] no providers configured, skip processing")
+			ctx.DontReadRequestBody()
+			return types.ActionContinue
+		}
+
+		// Store provider configs in context for later use
+		ctx.SetContext("providerConfigs", providerConfigs)
+	}
+
+	// If we have a selected provider, continue with it
+	if activeProvider != nil {
+		log.Debugf("[onHttpRequestHeader] using provider=%s", activeProvider.GetProviderType())
+
+		// Store provider info in context
+		ctx.SetContext("activeProvider", activeProvider)
+		ctx.SetContext("activeProviderConfig", activeProviderConfig)
+	} else {
+		log.Debugf("[onHttpRequestHeader] multi-provider mode, will select provider based on model")
+	}
+
+	// Handle protocol checking for existing provider
+	if activeProviderConfig != nil && activeProviderConfig.IsOriginal() {
+		if handler, ok := activeProvider.(provider.ApiNameHandler); ok {
+			apiName = handler.GetApiName(path.Path)
+		}
 	}
 
 	if contentType, _ := proxywasm.GetHttpRequestHeader(util.HeaderContentType); contentType != "" && !strings.Contains(contentType, util.MimeTypeApplicationJson) {
@@ -142,57 +171,120 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 	// allowing plugins to inspect or modify the response correctly
 	_ = proxywasm.RemoveHttpRequestHeader("Accept-Encoding")
 
-	if handler, ok := activeProvider.(provider.RequestHeadersHandler); ok {
-		// Set the apiToken for the current request.
-		providerConfig.SetApiTokenInUse(ctx)
-		// Set available apiTokens of current request in the context, will be used in the retryOnFailure
-		providerConfig.SetAvailableApiTokens(ctx)
+	// If we have an active provider, process headers immediately
+	if activeProvider != nil && activeProviderConfig != nil {
+		if handler, ok := activeProvider.(provider.RequestHeadersHandler); ok {
+			// Set the apiToken for the current request.
+			activeProviderConfig.SetApiTokenInUse(ctx)
+			// Set available apiTokens of current request in the context, will be used in the retryOnFailure
+			activeProviderConfig.SetAvailableApiTokens(ctx)
 
-		// save the original request host and path in case they are needed for apiToken health check and retry
-		ctx.SetContext(provider.CtxRequestHost, wrapper.GetRequestHost())
-		ctx.SetContext(provider.CtxRequestPath, wrapper.GetRequestPath())
+			// save the original request host and path in case they are needed for apiToken health check and retry
+			ctx.SetContext(provider.CtxRequestHost, wrapper.GetRequestHost())
+			ctx.SetContext(provider.CtxRequestPath, wrapper.GetRequestPath())
 
-		err := handler.OnRequestHeaders(ctx, apiName)
-		if err != nil {
-			_ = util.ErrorHandler("ai-proxy.proc_req_headers_failed", fmt.Errorf("failed to process request headers: %v", err))
+			err := handler.OnRequestHeaders(ctx, apiName)
+			if err != nil {
+				_ = util.ErrorHandler("ai-proxy.proc_req_headers_failed", fmt.Errorf("failed to process request headers: %v", err))
+				return types.ActionContinue
+			}
+
+			hasRequestBody := wrapper.HasRequestBody()
+			if hasRequestBody {
+				_ = proxywasm.RemoveHttpRequestHeader("Content-Length")
+				ctx.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
+				// Delay the header processing to allow changing in OnRequestBody
+				return types.HeaderStopIteration
+			}
+			ctx.DontReadRequestBody()
 			return types.ActionContinue
 		}
-
+	} else {
+		// Multi-provider mode: need to read body to extract model
 		hasRequestBody := wrapper.HasRequestBody()
 		if hasRequestBody {
 			_ = proxywasm.RemoveHttpRequestHeader("Content-Length")
 			ctx.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
-			// Delay the header processing to allow changing in OnRequestBody
 			return types.HeaderStopIteration
 		}
 		ctx.DontReadRequestBody()
-		return types.ActionContinue
 	}
 
 	return types.ActionContinue
 }
 
 func onHttpRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, body []byte) types.Action {
-	activeProvider := pluginConfig.GetProvider()
+	// Try to get provider from context (set in header phase)
+	var activeProvider provider.Provider
+	var activeProviderConfig *provider.ProviderConfig
+
+	if providerInstance, ok := ctx.GetContext("activeProvider").(provider.Provider); ok {
+		// Legacy single provider mode
+		activeProvider = providerInstance
+		if config, ok := ctx.GetContext("activeProviderConfig").(*provider.ProviderConfig); ok {
+			activeProviderConfig = config
+		}
+	} else {
+		// Multi-provider mode: select provider based on model in request
+		if needsExtraction, _ := ctx.GetContext("needs_model_extraction").(bool); needsExtraction {
+			// Extract model name from request body
+			modelName := gjson.GetBytes(body, "model").String()
+			if modelName != "" {
+				log.Debugf("[onHttpRequestBody] extracted model name: %s", modelName)
+
+				// Select provider based on model
+				selectedConfig, selectedProvider := pluginConfig.GetProviderForModel(modelName)
+				if selectedConfig != nil && selectedProvider != nil {
+					activeProviderConfig = selectedConfig
+					activeProvider = selectedProvider
+
+					log.Debugf("[onHttpRequestBody] selected provider=%s for model=%s", selectedProvider.GetProviderType(), modelName)
+
+					// Set up the selected provider (similar to header phase)
+					activeProviderConfig.SetApiTokenInUse(ctx)
+					activeProviderConfig.SetAvailableApiTokens(ctx)
+					ctx.SetContext("requestHost", wrapper.GetRequestHost())
+					ctx.SetContext("requestPath", wrapper.GetRequestPath())
+
+					// Process request headers for the selected provider
+					if handler, ok := selectedProvider.(provider.RequestHeadersHandler); ok {
+						apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
+						err := handler.OnRequestHeaders(ctx, apiName)
+						if err != nil {
+							log.Errorf("failed to process request headers for provider %s: %v", selectedProvider.GetProviderType(), err)
+							_ = util.ErrorHandler("ai-proxy.proc_req_headers_failed", fmt.Errorf("failed to process request headers: %v", err))
+							return types.ActionContinue
+						}
+					}
+				} else {
+					log.Warnf("[onHttpRequestBody] no provider can handle model: %s", modelName)
+					return types.ActionContinue
+				}
+			} else {
+				log.Warnf("[onHttpRequestBody] no model found in request body")
+				return types.ActionContinue
+			}
+		}
+	}
 
 	if activeProvider == nil {
 		log.Debugf("[onHttpRequestBody] no active provider, skip processing")
 		return types.ActionContinue
 	}
+
 	log.Debugf("[onHttpRequestBody] provider=%s", activeProvider.GetProviderType())
 
 	if handler, ok := activeProvider.(provider.RequestBodyHandler); ok {
 		apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
-		providerConfig := pluginConfig.GetProviderConfig()
 		// If retryOnFailure is enabled, save the transformed body to the context in case of retry
-		if providerConfig.IsRetryOnFailureEnabled() {
-			ctx.SetContext(provider.CtxRequestBody, body)
+		if activeProviderConfig.IsRetryOnFailureEnabled() {
+			ctx.SetContext("requestBody", body)
 		}
-		newBody, settingErr := providerConfig.ReplaceByCustomSettings(body)
+		newBody, settingErr := activeProviderConfig.ReplaceByCustomSettings(body)
 		if settingErr != nil {
 			log.Errorf("failed to replace request body by custom settings: %v", settingErr)
 		}
-		if providerConfig.IsOpenAIProtocol() {
+		if activeProviderConfig.IsOpenAIProtocol() {
 			newBody = normalizeOpenAiRequestBody(newBody)
 		}
 		log.Debugf("[onHttpRequestBody] newBody=%s", newBody)
