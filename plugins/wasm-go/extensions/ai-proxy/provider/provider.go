@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"math/rand"
 	"net/http"
@@ -278,10 +279,10 @@ type ProviderConfig struct {
 	// @Description zh-CN 仅适用于 minimax 服务。minimax API 类型为 pro 时必填
 	minimaxGroupId string `required:"false" yaml:"minimaxGroupId" json:"minimaxGroupId"`
 	// @Title zh-CN 模型名称映射表
-	// @Description zh-CN 用于将请求中的模型名称映射为目标AI服务商支持的模型名称。支持通过“*”来配置全局映射
+	// @Description zh-CN 用于将请求中的模型名称映射为目标AI服务商支持的模型名称。支持通过"*"来配置全局映射
 	modelMapping map[string]string `required:"false" yaml:"modelMapping" json:"modelMapping"`
 	// @Title zh-CN 对外接口协议
-	// @Description zh-CN 通过本插件对外提供的AI服务接口协议。默认值为“openai”，即OpenAI的接口协议。如需保留原有接口协议，可配置为“original"
+	// @Description zh-CN 通过本插件对外提供的AI服务接口协议。默认值为"openai"，即OpenAI的接口协议。如需保留原有接口协议，可配置为"original"
 	protocol string `required:"false" yaml:"protocol" json:"protocol"`
 	// @Title zh-CN 模型对话上下文
 	// @Description zh-CN 配置一个外部获取对话上下文的文件来源，用于在AI请求中补充对话上下文
@@ -802,4 +803,172 @@ func (c *ProviderConfig) needToProcessRequestBody(apiName ApiName) bool {
 		return true
 	}
 	return false
+}
+
+// BuildModelsResponse creates an OpenAI-compatible models list response based on modelMapping
+func (c *ProviderConfig) BuildModelsResponse() ([]byte, error) {
+	// Initialize with empty slice instead of nil slice to ensure JSON serialization returns [] instead of null
+	models := make([]modelInfo, 0)
+
+	// If modelMapping is empty, return an empty models list
+	if len(c.modelMapping) == 0 {
+		log.Debugf("modelMapping is empty, returning empty models list")
+		response := modelsResponse{
+			Object: "list",
+			Data:   models, // Use the same empty slice for consistency
+		}
+		return json.Marshal(response)
+	}
+
+	// Extract model names from modelMapping keys
+	for modelName, modelValue := range c.modelMapping {
+		// Skip wildcard entries
+		if modelName == wildcard {
+			continue
+		}
+
+		// Skip prefix matching patterns (ending with *)
+		if strings.HasSuffix(modelName, wildcard) {
+			continue
+		}
+
+		// Skip models mapped to empty strings (which means "keep original model name" but causes issues)
+		// When a model is mapped to empty string, it should be treated as not configured properly
+		if modelValue == "" {
+			log.Debugf("Skipping model [%s] mapped to empty string", modelName)
+			continue
+		}
+
+		// Determine the owner based on provider type
+		owner := "organization-owner"
+		if c.typ != "" {
+			switch c.typ {
+			case providerTypeOpenAI:
+				owner = "openai"
+			case providerTypeAzure:
+				owner = "openai-internal"
+			case providerTypeQwen:
+				owner = "alibaba"
+			case providerTypeMoonshot:
+				owner = "moonshot"
+			case providerTypeClaude:
+				owner = "anthropic"
+			case providerTypeGemini:
+				owner = "google"
+			default:
+				owner = c.typ // Use provider type as owner
+			}
+		}
+
+		models = append(models, modelInfo{
+			Id:      modelName,
+			Object:  "model",
+			Created: 1686935002, // Fixed timestamp as requested
+			OwnedBy: owner,
+		})
+	}
+
+	log.Debugf("BuildModelsResponse: generated %d models from modelMapping", len(models))
+
+	// Always return the same models slice (empty or with content)
+	// This ensures consistent JSON response: [] instead of null
+	response := modelsResponse{
+		Object: "list",
+		Data:   models,
+	}
+
+	return json.Marshal(response)
+}
+
+// ModelInfo is an alias for modelInfo for external access
+type ModelInfo = modelInfo
+
+// ModelsResponse is an alias for modelsResponse for external access
+type ModelsResponse = modelsResponse
+
+// CanHandleModel checks if this provider can handle the given model
+func (c *ProviderConfig) CanHandleModel(modelName string) bool {
+	if len(c.modelMapping) == 0 {
+		return false
+	}
+
+	// Check exact match
+	if _, exists := c.modelMapping[modelName]; exists {
+		return true
+	}
+
+	// Check prefix match
+	for k := range c.modelMapping {
+		if k == wildcard || !strings.HasSuffix(k, wildcard) {
+			continue
+		}
+		prefix := strings.TrimSuffix(k, wildcard)
+		if strings.HasPrefix(modelName, prefix) {
+			return true
+		}
+	}
+
+	// Check wildcard
+	if _, exists := c.modelMapping[wildcard]; exists {
+		return true
+	}
+
+	return false
+}
+
+// GetModelList returns the list of models available for this provider
+func (c *ProviderConfig) GetModelList() ([]ModelInfo, error) {
+	var models []ModelInfo
+
+	if len(c.modelMapping) == 0 {
+		return models, nil
+	}
+
+	// Extract model names from modelMapping keys
+	for modelName, modelValue := range c.modelMapping {
+		// Skip wildcard entries
+		if modelName == wildcard {
+			continue
+		}
+
+		// Skip prefix matching patterns (ending with *)
+		if strings.HasSuffix(modelName, wildcard) {
+			continue
+		}
+
+		// Skip models mapped to empty strings
+		if modelValue == "" {
+			continue
+		}
+
+		// Determine the owner based on provider type
+		owner := "organization-owner"
+		if c.typ != "" {
+			switch c.typ {
+			case providerTypeOpenAI:
+				owner = "openai"
+			case providerTypeAzure:
+				owner = "openai-internal"
+			case providerTypeQwen:
+				owner = "alibaba"
+			case providerTypeMoonshot:
+				owner = "moonshot"
+			case providerTypeClaude:
+				owner = "anthropic"
+			case providerTypeGemini:
+				owner = "google"
+			default:
+				owner = c.typ // Use provider type as owner
+			}
+		}
+
+		models = append(models, ModelInfo{
+			Id:      modelName,
+			Object:  "model",
+			Created: 1686935002,
+			OwnedBy: owner,
+		})
+	}
+
+	return models, nil
 }

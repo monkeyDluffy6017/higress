@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/json"
+
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/provider"
 	"github.com/tidwall/gjson"
 )
@@ -31,36 +33,29 @@ type PluginConfig struct {
 }
 
 func (c *PluginConfig) FromJson(json gjson.Result) {
+	// Reset configuration to avoid state pollution
+	c.providerConfigs = make([]provider.ProviderConfig, 0)
+	c.activeProviderConfig = nil
+	c.activeProvider = nil
+
 	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
-		c.providerConfigs = make([]provider.ProviderConfig, 0)
 		for _, providerJson := range providersJson.Array() {
 			providerConfig := provider.ProviderConfig{}
 			providerConfig.FromJson(providerJson)
 			c.providerConfigs = append(c.providerConfigs, providerConfig)
 		}
-	}
-
-	if providerJson := json.Get("provider"); providerJson.Exists() && providerJson.IsObject() {
-		// TODO: For legacy config support. To be removed later.
-		providerConfig := provider.ProviderConfig{}
-		providerConfig.FromJson(providerJson)
-		c.providerConfigs = []provider.ProviderConfig{providerConfig}
-		c.activeProviderConfig = &providerConfig
-		// Legacy configuration is used and the active provider is determined.
-		// We don't need to continue with the new configuration style.
+		// For multi-provider configuration, we don't set activeProviderConfig
+		// Instead, we'll select provider dynamically based on model name
 		return
 	}
 
-	c.activeProviderConfig = nil
-
-	activeProviderId := json.Get("activeProviderId").String()
-	if activeProviderId != "" {
-		for _, providerConfig := range c.providerConfigs {
-			if providerConfig.GetId() == activeProviderId {
-				c.activeProviderConfig = &providerConfig
-				break
-			}
-		}
+	if providerJson := json.Get("provider"); providerJson.Exists() && providerJson.IsObject() {
+		// Legacy single provider configuration
+		providerConfig := provider.ProviderConfig{}
+		providerConfig.FromJson(providerJson)
+		c.providerConfigs = []provider.ProviderConfig{providerConfig}
+		c.activeProviderConfig = &c.providerConfigs[0]
+		return
 	}
 }
 
@@ -97,4 +92,83 @@ func (c *PluginConfig) GetProvider() provider.Provider {
 
 func (c *PluginConfig) GetProviderConfig() *provider.ProviderConfig {
 	return c.activeProviderConfig
+}
+
+// GetProviderConfigs returns all provider configurations
+func (c *PluginConfig) GetProviderConfigs() []provider.ProviderConfig {
+	return c.providerConfigs
+}
+
+// GetProviderForModel returns the provider that should handle the given model
+// It searches through providers in order and returns the first one that has a mapping for the model
+func (c *PluginConfig) GetProviderForModel(modelName string) (*provider.ProviderConfig, provider.Provider) {
+	// For legacy single provider configuration
+	if c.activeProviderConfig != nil {
+		return c.activeProviderConfig, c.activeProvider
+	}
+
+	// For multi-provider configuration, find the first provider that can handle this model
+	for i := range c.providerConfigs {
+		providerConfig := &c.providerConfigs[i]
+		if providerConfig.CanHandleModel(modelName) {
+			// Create provider instance if not exists
+			if p, err := provider.CreateProvider(*providerConfig); err == nil {
+				return providerConfig, p
+			}
+		}
+	}
+
+	// If no specific provider found, use the first one as fallback
+	if len(c.providerConfigs) > 0 {
+		providerConfig := &c.providerConfigs[0]
+		if p, err := provider.CreateProvider(*providerConfig); err == nil {
+			return providerConfig, p
+		}
+	}
+
+	return nil, nil
+}
+
+// BuildCombinedModelsResponse builds a models response that combines all configured providers
+func (c *PluginConfig) BuildCombinedModelsResponse() ([]byte, error) {
+	// For legacy single provider configuration
+	if c.activeProviderConfig != nil {
+		return c.activeProviderConfig.BuildModelsResponse()
+	}
+
+	// For multi-provider configuration, combine all model mappings
+	if len(c.providerConfigs) == 0 {
+		return []byte(`{"object":"list","data":[]}`), nil
+	}
+
+	// Collect all unique models from all providers (first provider wins for duplicates)
+	modelMap := make(map[string]provider.ModelInfo)
+
+	for _, providerConfig := range c.providerConfigs {
+		models, err := providerConfig.GetModelList()
+		if err != nil {
+			continue
+		}
+
+		// Add models that don't already exist (first provider priority)
+		for _, model := range models {
+			if _, exists := modelMap[model.Id]; !exists {
+				modelMap[model.Id] = model
+			}
+		}
+	}
+
+	// Convert map to slice
+	var models []provider.ModelInfo
+	for _, model := range modelMap {
+		models = append(models, model)
+	}
+
+	// Build response
+	response := provider.ModelsResponse{
+		Object: "list",
+		Data:   models,
+	}
+
+	return json.Marshal(response)
 }
