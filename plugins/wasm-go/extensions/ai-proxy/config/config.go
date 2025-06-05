@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/provider"
-	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tidwall/gjson"
 )
 
@@ -34,50 +33,41 @@ type PluginConfig struct {
 }
 
 func (c *PluginConfig) FromJson(json gjson.Result) {
-	// Reset configuration to avoid state pollution
-	c.providerConfigs = make([]provider.ProviderConfig, 0)
-	c.activeProviderConfig = nil
-	c.activeProvider = nil
-
-	proxywasm.LogInfof("[ai-proxy] Start parsing configuration: %s", json.Raw)
-	proxywasm.LogInfof("[ai-proxy] Initial state - providerConfigs: %d, activeProviderConfig: %v, activeProvider: %v",
-		len(c.providerConfigs), c.activeProviderConfig != nil, c.activeProvider != nil)
-
+	// Process providers array configuration first
 	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
-		proxywasm.LogInfof("[ai-proxy] Found 'providers' array configuration")
-		proxywasm.LogInfof("[ai-proxy] Providers array content: %s", providersJson.Raw)
-
-		for idx, providerJson := range providersJson.Array() {
-			proxywasm.LogInfof("[ai-proxy] Processing provider[%d]: %s", idx, providerJson.Raw)
+		c.providerConfigs = make([]provider.ProviderConfig, 0)
+		for _, providerJson := range providersJson.Array() {
 			providerConfig := provider.ProviderConfig{}
 			providerConfig.FromJson(providerJson)
 			c.providerConfigs = append(c.providerConfigs, providerConfig)
-			proxywasm.LogInfof("[ai-proxy] Added provider[%d], current providerConfigs length: %d", idx, len(c.providerConfigs))
 		}
-
-		proxywasm.LogInfof("[ai-proxy] Completed processing providers array. Total providers: %d", len(c.providerConfigs))
-		proxywasm.LogInfof("[ai-proxy] Multi-provider mode: activeProviderConfig will be selected dynamically")
-		// For multi-provider configuration, we don't set activeProviderConfig
-		// Instead, we'll select provider dynamically based on model name
-		return
 	}
 
+	// Process legacy single provider configuration
 	if providerJson := json.Get("provider"); providerJson.Exists() && providerJson.IsObject() {
-		proxywasm.LogInfof("[ai-proxy] Found single 'provider' object configuration")
-		proxywasm.LogInfof("[ai-proxy] Provider object content: %s", providerJson.Raw)
-
 		// Legacy single provider configuration
 		providerConfig := provider.ProviderConfig{}
 		providerConfig.FromJson(providerJson)
 		c.providerConfigs = []provider.ProviderConfig{providerConfig}
 		c.activeProviderConfig = &c.providerConfigs[0]
-
-		proxywasm.LogInfof("[ai-proxy] Single provider mode: activeProviderConfig has been set")
-		proxywasm.LogInfof("[ai-proxy] Provider type: %s", c.activeProviderConfig.GetType())
+		// Legacy configuration is used and the active provider is determined.
+		// We don't need to continue with the new configuration style.
 		return
 	}
 
-	proxywasm.LogWarnf("[ai-proxy] No valid provider configuration found in JSON: %s", json.Raw)
+	// Reset active provider config
+	c.activeProviderConfig = nil
+
+	// Process activeProviderId to select from configured providers
+	activeProviderId := json.Get("activeProviderId").String()
+	if activeProviderId != "" {
+		for i := range c.providerConfigs {
+			if c.providerConfigs[i].GetId() == activeProviderId {
+				c.activeProviderConfig = &c.providerConfigs[i]
+				break
+			}
+		}
+	}
 }
 
 func (c *PluginConfig) Validate() error {
@@ -91,8 +81,10 @@ func (c *PluginConfig) Validate() error {
 }
 
 func (c *PluginConfig) Complete() error {
+	// Reset active provider
+	c.activeProvider = nil
+
 	if c.activeProviderConfig == nil {
-		c.activeProvider = nil
 		return nil
 	}
 
