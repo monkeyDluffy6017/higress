@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/tidwall/gjson"
@@ -37,7 +38,7 @@ const (
 	RouteName                  = "route"
 	ClusterName                = "cluster"
 	APIName                    = "api"
-	ConsumerKey                = "x-mse-consumer"
+	UserInfoKey                = "x-userinfo"
 
 	// Source Type
 	FixedValue            = "fixed_value"
@@ -73,6 +74,15 @@ const (
 	RuleAppend  = "append"
 )
 
+// AuthUser struct for parsing user info from JWT token
+type AuthUser struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	StaffID string `json:"staffID"`
+	Github  string `json:"github"`
+	Phone   string `json:"phone"`
+}
+
 // TracingSpan is the tracing span configuration.
 type Attribute struct {
 	Key          string `json:"key"`
@@ -92,10 +102,12 @@ type AIStatisticsConfig struct {
 	attributes []Attribute
 	// If there exist attributes extracted from streaming body, chunks should be buffered
 	shouldBufferStreamingBody bool
+	// Token header name
+	TokenHeader string
 }
 
-func generateMetricName(route, cluster, model, consumer, metricName string) string {
-	return fmt.Sprintf("route.%s.upstream.%s.model.%s.consumer.%s.metric.%s", route, cluster, model, consumer, metricName)
+func generateMetricName(ctx wrapper.HttpContext, route, cluster, model, userName, metricName string) string {
+	return fmt.Sprintf("route.%s.upstream.%s.model.%s.consumer.%s.metric.%s", route, cluster, model, userName, metricName)
 }
 
 func getRouteName() (string, error) {
@@ -140,6 +152,12 @@ func (config *AIStatisticsConfig) incrementCounter(metricName string, inc uint64
 }
 
 func parseConfig(configJson gjson.Result, config *AIStatisticsConfig, log wrapper.Log) error {
+	// Parse token header configuration
+	config.TokenHeader = configJson.Get("token_header").String()
+	if config.TokenHeader == "" {
+		config.TokenHeader = "authorization"
+	}
+
 	// Parse tracing span attributes setting.
 	attributeConfigs := configJson.Get("attributes").Array()
 	config.attributes = make([]Attribute, len(attributeConfigs))
@@ -163,6 +181,62 @@ func parseConfig(configJson gjson.Result, config *AIStatisticsConfig, log wrappe
 	return nil
 }
 
+// extractTokenFromHeader extracts token from header
+func extractTokenFromHeader(header string) string {
+	// remove Bearer prefix
+	if strings.HasPrefix(header, "Bearer ") {
+		return strings.TrimSpace(header[7:])
+	}
+	// if no Bearer prefix, return directly
+	return strings.TrimSpace(header)
+}
+
+// parseUserInfoFromToken parses user info from JWT token
+func parseUserInfoFromToken(accessToken string) (*AuthUser, error) {
+	// use ParseSigned method to parse JWT token without signature verification
+	token, err := jwt.ParseSigned(accessToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse JWT token: %w", err)
+	}
+
+	// get unverified claims
+	var customClaims map[string]interface{}
+	err = token.UnsafeClaimsWithoutVerification(&customClaims)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract claims: %w", err)
+	}
+
+	// serialize and deserialize claims to get user info
+	jsonBytes, err := json.Marshal(customClaims)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize user info: %w", err)
+	}
+
+	var userInfo AuthUser
+	if err := json.Unmarshal(jsonBytes, &userInfo); err != nil {
+		return nil, fmt.Errorf("failed to deserialize user info: %w", err)
+	}
+
+	return &userInfo, nil
+}
+
+// generateUserName generates user name based on priority: name+staffID > name > github > phone
+func generateUserName(userInfo *AuthUser) string {
+	if userInfo.Name != "" && userInfo.StaffID != "" {
+		return userInfo.Name + userInfo.StaffID
+	}
+	if userInfo.Name != "" {
+		return userInfo.Name
+	}
+	if userInfo.Github != "" {
+		return userInfo.Github
+	}
+	if userInfo.Phone != "" {
+		return userInfo.Phone
+	}
+	return "undefined"
+}
+
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config AIStatisticsConfig, log wrapper.Log) types.Action {
 	route, _ := getRouteName()
 	cluster, _ := getClusterName()
@@ -174,9 +248,24 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config AIStatisticsConfig, lo
 	ctx.SetContext(ClusterName, cluster)
 	ctx.SetUserAttribute(APIName, api)
 	ctx.SetContext(StatisticsRequestStartTime, time.Now().UnixMilli())
-	if consumer, _ := proxywasm.GetHttpRequestHeader(ConsumerKey); consumer != "" {
-		ctx.SetContext(ConsumerKey, consumer)
+
+	// Get token from configured header and parse user info
+	if tokenHeader, err := proxywasm.GetHttpRequestHeader(config.TokenHeader); err == nil && tokenHeader != "" {
+		// extract token (remove Bearer prefix etc.)
+		token := extractTokenFromHeader(tokenHeader)
+		if token != "" {
+			// parse token to get user info
+			userInfo, err := parseUserInfoFromToken(token)
+			if err != nil {
+				log.Warnf("failed to parse token: %v", err)
+			} else {
+				userName := generateUserName(userInfo)
+				log.Infof("set user name in context: %s", userName)
+				ctx.SetContext(UserInfoKey, userName)
+			}
+		}
 	}
+
 	hasRequestBody := wrapper.HasRequestBody()
 	if hasRequestBody {
 		_ = proxywasm.RemoveHttpRequestHeader("Content-Length")
@@ -460,7 +549,7 @@ func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig, log wrapper
 	var ok bool
 	var route, cluster, model string
 	var inputToken, outputToken uint64
-	consumer := ctx.GetStringContext(ConsumerKey, "none")
+	consumer := ctx.GetStringContext(UserInfoKey, "none")
 	route, ok = ctx.GetContext(RouteName).(string)
 	if !ok {
 		log.Warnf("RouteName typd assert failed, skip metric record")
@@ -494,8 +583,8 @@ func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig, log wrapper
 		log.Warnf("inputToken and outputToken cannot equal to 0, skip metric record")
 		return
 	}
-	config.incrementCounter(generateMetricName(route, cluster, model, consumer, InputToken), inputToken)
-	config.incrementCounter(generateMetricName(route, cluster, model, consumer, OutputToken), outputToken)
+	config.incrementCounter(generateMetricName(ctx, route, cluster, model, consumer, InputToken), inputToken)
+	config.incrementCounter(generateMetricName(ctx, route, cluster, model, consumer, OutputToken), outputToken)
 
 	// Generate duration metrics
 	var llmFirstTokenDuration, llmServiceDuration uint64
@@ -506,8 +595,8 @@ func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig, log wrapper
 			log.Warnf("LLMFirstTokenDuration typd assert failed")
 			return
 		}
-		config.incrementCounter(generateMetricName(route, cluster, model, consumer, LLMFirstTokenDuration), llmFirstTokenDuration)
-		config.incrementCounter(generateMetricName(route, cluster, model, consumer, LLMStreamDurationCount), 1)
+		config.incrementCounter(generateMetricName(ctx, route, cluster, model, consumer, LLMFirstTokenDuration), llmFirstTokenDuration)
+		config.incrementCounter(generateMetricName(ctx, route, cluster, model, consumer, LLMStreamDurationCount), 1)
 	}
 	if ctx.GetUserAttribute(LLMServiceDuration) != nil {
 		llmServiceDuration, ok = convertToUInt(ctx.GetUserAttribute(LLMServiceDuration))
@@ -515,8 +604,8 @@ func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig, log wrapper
 			log.Warnf("LLMServiceDuration typd assert failed")
 			return
 		}
-		config.incrementCounter(generateMetricName(route, cluster, model, consumer, LLMServiceDuration), llmServiceDuration)
-		config.incrementCounter(generateMetricName(route, cluster, model, consumer, LLMDurationCount), 1)
+		config.incrementCounter(generateMetricName(ctx, route, cluster, model, consumer, LLMServiceDuration), llmServiceDuration)
+		config.incrementCounter(generateMetricName(ctx, route, cluster, model, consumer, LLMDurationCount), 1)
 	}
 }
 
