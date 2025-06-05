@@ -22,6 +22,7 @@ description: AI可观测配置参考
 
 | 名称             | 数据类型  | 填写要求 | 默认值 | 描述                     |
 |----------------|-------|------|-----|------------------------|
+| `token_header` | string | 非必填  | authorization   | JWT token的HTTP头名称，用于提取用户信息 |
 | `attributes` | []Attribute | 非必填  | -   | 用户希望记录在log/span中的信息 |
 
 Attribute 配置说明:
@@ -150,6 +151,21 @@ route_upstream_model_consumer_metric_llm_duration_count{ai_route="bailian",ai_cl
 
 #### 链路追踪
 链路追踪的 span 中可以看到 model, input_token, output_token 三个额外的 attribute
+
+### 配置JWT token提取用户信息
+```yaml
+token_header: authorization # 默认从authorization头获取JWT token
+# token_header: x-custom-token  # 也可以指定其他头名称
+```
+
+插件会从JWT token中解析出以下用户字段：
+- `id`: 用户唯一ID
+- `name`: 用户姓名
+- `staffID`: 工号
+- `github`: GitHub账号
+- `phone`: 手机号
+
+用户名生成优先级：`name + staffID` > `name` > `github` > `phone`
 
 ### 配合认证鉴权记录consumer
 举例如下：
