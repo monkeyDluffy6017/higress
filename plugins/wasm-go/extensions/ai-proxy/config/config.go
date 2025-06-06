@@ -33,29 +33,40 @@ type PluginConfig struct {
 }
 
 func (c *PluginConfig) FromJson(json gjson.Result) {
-	// Reset configuration to avoid state pollution
-	c.providerConfigs = make([]provider.ProviderConfig, 0)
-	c.activeProviderConfig = nil
-	c.activeProvider = nil
-
+	// Process providers array configuration first
 	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
+		c.providerConfigs = make([]provider.ProviderConfig, 0)
 		for _, providerJson := range providersJson.Array() {
 			providerConfig := provider.ProviderConfig{}
 			providerConfig.FromJson(providerJson)
 			c.providerConfigs = append(c.providerConfigs, providerConfig)
 		}
-		// For multi-provider configuration, we don't set activeProviderConfig
-		// Instead, we'll select provider dynamically based on model name
-		return
 	}
 
+	// Process legacy single provider configuration
 	if providerJson := json.Get("provider"); providerJson.Exists() && providerJson.IsObject() {
 		// Legacy single provider configuration
 		providerConfig := provider.ProviderConfig{}
 		providerConfig.FromJson(providerJson)
 		c.providerConfigs = []provider.ProviderConfig{providerConfig}
 		c.activeProviderConfig = &c.providerConfigs[0]
+		// Legacy configuration is used and the active provider is determined.
+		// We don't need to continue with the new configuration style.
 		return
+	}
+
+	// Reset active provider config
+	c.activeProviderConfig = nil
+
+	// Process activeProviderId to select from configured providers
+	activeProviderId := json.Get("activeProviderId").String()
+	if activeProviderId != "" {
+		for i := range c.providerConfigs {
+			if c.providerConfigs[i].GetId() == activeProviderId {
+				c.activeProviderConfig = &c.providerConfigs[i]
+				break
+			}
+		}
 	}
 }
 
@@ -70,8 +81,10 @@ func (c *PluginConfig) Validate() error {
 }
 
 func (c *PluginConfig) Complete() error {
+	// Reset active provider
+	c.activeProvider = nil
+
 	if c.activeProviderConfig == nil {
-		c.activeProvider = nil
 		return nil
 	}
 
