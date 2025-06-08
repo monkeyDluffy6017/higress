@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,10 +33,13 @@ const (
 type AdminMode string
 
 const (
-	AdminModeRefresh AdminMode = "refresh"
-	AdminModeQuery   AdminMode = "query"
-	AdminModeDelta   AdminMode = "delta"
-	AdminModeNone    AdminMode = "none"
+	AdminModeRefresh      AdminMode = "refresh"
+	AdminModeQuery        AdminMode = "query"
+	AdminModeDelta        AdminMode = "delta"
+	AdminModeUsedQuery    AdminMode = "used_query"
+	AdminModeUsedRefresh  AdminMode = "used_refresh"
+	AdminModeUsedDelta    AdminMode = "used_delta"
+	AdminModeNone         AdminMode = "none"
 )
 
 // AuthUser struct for parsing user info from JWT
@@ -56,14 +58,17 @@ func main() {
 }
 
 type QuotaConfig struct {
-	redisInfo       RedisInfo         `yaml:"redis"`
-	RedisKeyPrefix  string            `yaml:"redis_key_prefix"`
-	TokenHeader     string            `yaml:"token_header"`
-	AdminHeader     string            `yaml:"admin_header"`
-	AdminKey        string            `yaml:"admin_key"`
-	AdminPath       string            `yaml:"admin_path"`
-	credential2Name map[string]string `yaml:"-"`
-	redisClient     wrapper.RedisClient
+	redisInfo         RedisInfo         `yaml:"redis"`
+	RedisKeyPrefix    string            `yaml:"redis_key_prefix"`
+	RedisUsedPrefix   string            `yaml:"redis_used_prefix"`
+	TokenHeader       string            `yaml:"token_header"`
+	AdminHeader       string            `yaml:"admin_header"`
+	AdminKey          string            `yaml:"admin_key"`
+	AdminPath         string            `yaml:"admin_path"`
+	DeductHeader      string            `yaml:"deduct_header"`
+	DeductHeaderValue string            `yaml:"deduct_header_value"`
+	credential2Name   map[string]string `yaml:"-"`
+	redisClient       wrapper.RedisClient
 }
 
 type Consumer struct {
@@ -106,11 +111,28 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		return errors.New("missing admin_key in config")
 	}
 
+	// deduct header and value
+	config.DeductHeader = json.Get("deduct_header").String()
+	if config.DeductHeader == "" {
+		config.DeductHeader = "x-quota-deduct"
+	}
+
+	config.DeductHeaderValue = json.Get("deduct_header_value").String()
+	if config.DeductHeaderValue == "" {
+		config.DeductHeaderValue = "true"
+	}
+
 	// Redis
 	config.RedisKeyPrefix = json.Get("redis_key_prefix").String()
 	if config.RedisKeyPrefix == "" {
 		config.RedisKeyPrefix = "chat_quota:"
 	}
+
+	config.RedisUsedPrefix = json.Get("redis_used_prefix").String()
+	if config.RedisUsedPrefix == "" {
+		config.RedisUsedPrefix = "chat_quota_used:"
+	}
+
 	redisConfig := json.Get("redis")
 	if !redisConfig.Exists() {
 		return errors.New("missing redis in config")
@@ -200,11 +222,11 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 			return types.ActionContinue
 		}
 
-		// query quota
-		if adminMode == AdminModeQuery {
-			return queryQuota(context, config, path, log)
+		// query quota or used quota
+		if adminMode == AdminModeQuery || adminMode == AdminModeUsedQuery {
+			return queryQuota(context, config, path, adminMode, log)
 		}
-		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta {
+		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta || adminMode == AdminModeUsedRefresh || adminMode == AdminModeUsedDelta {
 			context.BufferRequestBody()
 			return types.HeaderStopIteration
 		}
@@ -244,24 +266,51 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 
 	context.SetContext("userId", userInfo.ID)
 
-	// check quota here
-	config.redisClient.Get(config.RedisKeyPrefix+userInfo.ID, func(response resp.Value) {
-		isDenied := false
-		if err := response.Error(); err != nil {
-			isDenied = true
-		}
-		if response.IsNull() {
-			isDenied = true
-		}
-		if response.Integer() <= 0 {
-			isDenied = true
-		}
-		log.Debugf("get userId:%s quota:%d isDenied:%t", userInfo.ID, response.Integer(), isDenied)
-		if isDenied {
-			util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota left")
+	// check quota here: get both total and used quota
+	totalKey := config.RedisKeyPrefix + userInfo.ID
+	usedKey := config.RedisUsedPrefix + userInfo.ID
+
+	// First get total quota
+	config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
+		if err := totalResponse.Error(); err != nil {
+			util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota available")
 			return
 		}
-		proxywasm.ResumeHttpRequest()
+
+		totalQuota := 0
+		if !totalResponse.IsNull() {
+			totalQuota = totalResponse.Integer()
+		}
+
+		if totalQuota <= 0 {
+			util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota available")
+			return
+		}
+
+		// Then get used quota
+		config.redisClient.Get(usedKey, func(usedResponse resp.Value) {
+			usedQuota := 0
+			if err := usedResponse.Error(); err == nil && !usedResponse.IsNull() {
+				usedQuota = usedResponse.Integer()
+			}
+
+			remainingQuota := totalQuota - usedQuota
+			log.Debugf("get userId:%s totalQuota:%d usedQuota:%d remainingQuota:%d", userInfo.ID, totalQuota, usedQuota, remainingQuota)
+
+			if remainingQuota <= 0 {
+				util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota left")
+				return
+			}
+
+			// Check if we need to deduct quota based on header
+			deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.DeductHeader)
+			if err == nil && deductHeaderValue == config.DeductHeaderValue {
+				// Increment used quota by 1
+				config.redisClient.IncrBy(usedKey, 1, nil)
+			}
+
+			proxywasm.ResumeHttpRequest()
+		})
 	})
 	return types.HeaderStopAllIterationAndWatermark
 }
@@ -296,6 +345,12 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 	if adminMode == AdminModeDelta {
 		return deltaQuota(ctx, config, string(body), log)
 	}
+	if adminMode == AdminModeUsedRefresh {
+		return refreshUsedQuota(ctx, config, string(body), log)
+	}
+	if adminMode == AdminModeUsedDelta {
+		return deltaUsedQuota(ctx, config, string(body), log)
+	}
 
 	return types.ActionContinue
 }
@@ -308,49 +363,9 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 	if chatMode == ChatModeNone || chatMode == ChatModeAdmin {
 		return data
 	}
-	var inputToken, outputToken int64
-	var userId string
-	if inputToken, outputToken, ok := getUsage(data); ok {
-		ctx.SetContext("input_token", inputToken)
-		ctx.SetContext("output_token", outputToken)
-	}
 
-	// chat completion mode
-	if !endOfStream {
-		return data
-	}
-
-	if ctx.GetContext("input_token") == nil || ctx.GetContext("output_token") == nil || ctx.GetContext("userId") == nil {
-		return data
-	}
-
-	inputToken = ctx.GetContext("input_token").(int64)
-	outputToken = ctx.GetContext("output_token").(int64)
-	userId = ctx.GetContext("userId").(string)
-	totalToken := int(inputToken + outputToken)
-	log.Debugf("update userId:%s, totalToken:%d", userId, totalToken)
-	config.redisClient.DecrBy(config.RedisKeyPrefix+userId, totalToken, nil)
+	// chat completion mode - no longer need to deduct quota here as it's handled in request headers
 	return data
-}
-
-func getUsage(data []byte) (inputTokenUsage int64, outputTokenUsage int64, ok bool) {
-	chunks := bytes.Split(bytes.TrimSpace(data), []byte("\n\n"))
-	for _, chunk := range chunks {
-		// the feature strings are used to identify the usage data, like:
-		// {"model":"gpt2","usage":{"prompt_tokens":1,"completion_tokens":1}}
-		if !bytes.Contains(chunk, []byte("prompt_tokens")) || !bytes.Contains(chunk, []byte("completion_tokens")) {
-			continue
-		}
-		inputTokenObj := gjson.GetBytes(chunk, "usage.prompt_tokens")
-		outputTokenObj := gjson.GetBytes(chunk, "usage.completion_tokens")
-		if inputTokenObj.Exists() && outputTokenObj.Exists() {
-			inputTokenUsage = inputTokenObj.Int()
-			outputTokenUsage = outputTokenObj.Int()
-			ok = true
-			return
-		}
-	}
-	return
 }
 
 func getOperationMode(path string, adminPath string, log wrapper.Log) (ChatMode, AdminMode) {
@@ -360,6 +375,15 @@ func getOperationMode(path string, adminPath string, log wrapper.Log) (ChatMode,
 	}
 	if strings.HasSuffix(path, fullAdminPath+"/delta") {
 		return ChatModeAdmin, AdminModeDelta
+	}
+	if strings.HasSuffix(path, fullAdminPath+"/used/refresh") {
+		return ChatModeAdmin, AdminModeUsedRefresh
+	}
+	if strings.HasSuffix(path, fullAdminPath+"/used/delta") {
+		return ChatModeAdmin, AdminModeUsedDelta
+	}
+	if strings.HasSuffix(path, fullAdminPath+"/used") {
+		return ChatModeAdmin, AdminModeUsedQuery
 	}
 	if strings.HasSuffix(path, fullAdminPath) {
 		return ChatModeAdmin, AdminModeQuery
@@ -399,7 +423,7 @@ func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log 
 	return types.ActionPause
 }
 
-func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, log wrapper.Log) types.Action {
+func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, adminMode AdminMode, log wrapper.Log) types.Action {
 	// check url
 	queryValues := url.Query()
 	values := make(map[string]string, len(queryValues))
@@ -411,7 +435,19 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, log w
 		return types.ActionContinue
 	}
 	userId := values["user_id"]
-	err := config.redisClient.Get(config.RedisKeyPrefix+userId, func(response resp.Value) {
+
+	// Determine which key to use based on admin mode
+	var redisKey string
+	var responseType string
+	if adminMode == AdminModeUsedQuery {
+		redisKey = config.RedisUsedPrefix + userId
+		responseType = "used_quota"
+	} else {
+		redisKey = config.RedisKeyPrefix + userId
+		responseType = "total_quota"
+	}
+
+	err := config.redisClient.Get(redisKey, func(response resp.Value) {
 		quota := 0
 		if err := response.Error(); err != nil {
 			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
@@ -424,9 +460,11 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, log w
 		result := struct {
 			UserID string `json:"user_id"`
 			Quota  int    `json:"quota"`
+			Type   string `json:"type"`
 		}{
 			UserID: userId,
 			Quota:  quota,
+			Type:   responseType,
 		}
 		body, _ := json.Marshal(result)
 		util.SendResponse(http.StatusOK, "ai-quota.queryquota", "application/json", string(body))
@@ -472,6 +510,79 @@ func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wr
 				return
 			}
 			util.SendResponse(http.StatusOK, "ai-quota.deltaquota", "text/plain", "delta quota successful")
+		})
+		if err != nil {
+			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			return types.ActionContinue
+		}
+	}
+
+	return types.ActionPause
+}
+
+func refreshUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wrapper.Log) types.Action {
+	queryValues, _ := url.ParseQuery(body)
+	values := make(map[string]string, len(queryValues))
+	for k, v := range queryValues {
+		values[k] = v[0]
+	}
+	userId := values["user_id"]
+	quota, err := strconv.Atoi(values["quota"])
+	if userId == "" || err != nil {
+		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. user_id can't be empty and quota must be integer.")
+		return types.ActionContinue
+	}
+	err2 := config.redisClient.Set(config.RedisUsedPrefix+userId, quota, func(response resp.Value) {
+		log.Debugf("Redis set key = %s quota = %d", config.RedisUsedPrefix+userId, quota)
+		if err := response.Error(); err != nil {
+			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			return
+		}
+		util.SendResponse(http.StatusOK, "ai-quota.refreshusedquota", "text/plain", "refresh used quota successful")
+	})
+
+	if err2 != nil {
+		util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+		return types.ActionContinue
+	}
+
+	return types.ActionPause
+}
+
+func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wrapper.Log) types.Action {
+	queryValues, _ := url.ParseQuery(body)
+	values := make(map[string]string, len(queryValues))
+	for k, v := range queryValues {
+		values[k] = v[0]
+	}
+	userId := values["user_id"]
+	value, err := strconv.Atoi(values["value"])
+	if userId == "" || err != nil {
+		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. user_id can't be empty and value must be integer.")
+		return types.ActionContinue
+	}
+
+	if value >= 0 {
+		err := config.redisClient.IncrBy(config.RedisUsedPrefix+userId, value, func(response resp.Value) {
+			log.Debugf("Redis Incr key = %s value = %d", config.RedisUsedPrefix+userId, value)
+			if err := response.Error(); err != nil {
+				util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+				return
+			}
+			util.SendResponse(http.StatusOK, "ai-quota.deltausedquota", "text/plain", "delta used quota successful")
+		})
+		if err != nil {
+			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			return types.ActionContinue
+		}
+	} else {
+		err := config.redisClient.DecrBy(config.RedisUsedPrefix+userId, 0-value, func(response resp.Value) {
+			log.Debugf("Redis Decr key = %s value = %d", config.RedisUsedPrefix+userId, 0-value)
+			if err := response.Error(); err != nil {
+				util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+				return
+			}
+			util.SendResponse(http.StatusOK, "ai-quota.deltausedquota", "text/plain", "delta used quota successful")
 		})
 		if err != nil {
 			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
