@@ -33,13 +33,13 @@ const (
 type AdminMode string
 
 const (
-	AdminModeRefresh      AdminMode = "refresh"
-	AdminModeQuery        AdminMode = "query"
-	AdminModeDelta        AdminMode = "delta"
-	AdminModeUsedQuery    AdminMode = "used_query"
-	AdminModeUsedRefresh  AdminMode = "used_refresh"
-	AdminModeUsedDelta    AdminMode = "used_delta"
-	AdminModeNone         AdminMode = "none"
+	AdminModeRefresh     AdminMode = "refresh"
+	AdminModeQuery       AdminMode = "query"
+	AdminModeDelta       AdminMode = "delta"
+	AdminModeUsedQuery   AdminMode = "used_query"
+	AdminModeUsedRefresh AdminMode = "used_refresh"
+	AdminModeUsedDelta   AdminMode = "used_delta"
+	AdminModeNone        AdminMode = "none"
 )
 
 // AuthUser struct for parsing user info from JWT
@@ -67,6 +67,7 @@ type QuotaConfig struct {
 	AdminPath         string            `yaml:"admin_path"`
 	DeductHeader      string            `yaml:"deduct_header"`
 	DeductHeaderValue string            `yaml:"deduct_header_value"`
+	ModelQuotaWeights map[string]int    `yaml:"model_quota_weights"`
 	credential2Name   map[string]string `yaml:"-"`
 	redisClient       wrapper.RedisClient
 }
@@ -120,6 +121,16 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 	config.DeductHeaderValue = json.Get("deduct_header_value").String()
 	if config.DeductHeaderValue == "" {
 		config.DeductHeaderValue = "true"
+	}
+
+	// Parse model quota weights
+	config.ModelQuotaWeights = make(map[string]int)
+	modelWeights := json.Get("model_quota_weights")
+	if modelWeights.Exists() {
+		modelWeights.ForEach(func(key, value gjson.Result) bool {
+			config.ModelQuotaWeights[key.String()] = int(value.Int())
+			return true
+		})
 	}
 
 	// Redis
@@ -233,10 +244,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		return types.ActionContinue
 	}
 
-	// for completion mode, need to get userId from token
-	// there is no need to read request body when it is on chat completion mode
-	context.DontReadRequestBody()
-
+	// for completion mode, need to get userId from token and read request body to extract model
 	// get token
 	tokenHeader, err := proxywasm.GetHttpRequestHeader(config.TokenHeader)
 	if err != nil || tokenHeader == "" {
@@ -266,9 +274,89 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 
 	context.SetContext("userId", userInfo.ID)
 
-	// check quota here: get both total and used quota
-	totalKey := config.RedisKeyPrefix + userInfo.ID
-	usedKey := config.RedisUsedPrefix + userInfo.ID
+	// Buffer request body to extract model info
+	// Note: ai-proxy plugin (priority 100) may have already buffered the request body
+	// This call is safe and won't conflict with existing buffering
+	context.BufferRequestBody()
+	return types.HeaderStopIteration
+}
+
+// extractTokenFromHeader extracts token from header
+func extractTokenFromHeader(header string) string {
+	// remove Bearer prefix
+	if strings.HasPrefix(header, "Bearer ") {
+		return strings.TrimSpace(header[7:])
+	}
+	// if no Bearer prefix, return directly
+	return strings.TrimSpace(header)
+}
+
+func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte, log wrapper.Log) types.Action {
+	log.Debugf("onHttpRequestBody()")
+	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
+	if !ok {
+		return types.ActionContinue
+	}
+
+	if chatMode == ChatModeCompletion {
+		// Handle quota check and deduction for completion requests
+		return handleCompletionQuota(ctx, config, body, log)
+	}
+
+	if chatMode == ChatModeNone {
+		return types.ActionContinue
+	}
+
+	adminMode, ok := ctx.GetContext("adminMode").(AdminMode)
+	if !ok {
+		return types.ActionContinue
+	}
+
+	if adminMode == AdminModeRefresh {
+		return refreshQuota(ctx, config, string(body), log)
+	}
+	if adminMode == AdminModeDelta {
+		return deltaQuota(ctx, config, string(body), log)
+	}
+	if adminMode == AdminModeUsedRefresh {
+		return refreshUsedQuota(ctx, config, string(body), log)
+	}
+	if adminMode == AdminModeUsedDelta {
+		return deltaUsedQuota(ctx, config, string(body), log)
+	}
+
+	return types.ActionContinue
+}
+
+func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []byte, log wrapper.Log) types.Action {
+	// Extract model from request body
+	modelName := gjson.GetBytes(body, "model").String()
+	log.Debugf("Extracted model name: %s", modelName)
+
+	// Get quota weight for this model, default to 0 if not configured
+	quotaWeight := 0
+	if weight, exists := config.ModelQuotaWeights[modelName]; exists {
+		quotaWeight = weight
+	}
+
+	log.Debugf("Model %s quota weight: %d", modelName, quotaWeight)
+
+	// If quota weight is 0, no deduction needed, allow request to continue
+	if quotaWeight == 0 {
+		log.Debugf("Model %s has zero quota weight, skipping quota check", modelName)
+		return types.ActionContinue
+	}
+
+	// Get user ID from context
+	userId, ok := ctx.GetContext("userId").(string)
+	if !ok {
+		util.SendResponse(http.StatusUnauthorized, "ai-quota.no_userid", "text/plain", "Request denied by ai quota check. No user ID found.")
+		return types.ActionContinue
+	}
+
+	// Check and deduct quota
+	totalKey := config.RedisKeyPrefix + userId
+	usedKey := config.RedisUsedPrefix + userId
 
 	// First get total quota
 	config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
@@ -295,64 +383,31 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 			}
 
 			remainingQuota := totalQuota - usedQuota
-			log.Debugf("get userId:%s totalQuota:%d usedQuota:%d remainingQuota:%d", userInfo.ID, totalQuota, usedQuota, remainingQuota)
+			log.Debugf("User %s: totalQuota:%d usedQuota:%d remainingQuota:%d requiredQuota:%d", userId, totalQuota, usedQuota, remainingQuota, quotaWeight)
 
-			if remainingQuota <= 0 {
-				util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota left")
+			if remainingQuota < quotaWeight {
+				util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", fmt.Sprintf("Request denied by ai quota check, insufficient quota. Required: %d, Remaining: %d", quotaWeight, remainingQuota))
 				return
 			}
 
 			// Check if we need to deduct quota based on header
 			deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.DeductHeader)
 			if err == nil && deductHeaderValue == config.DeductHeaderValue {
-				// Increment used quota by 1
-				config.redisClient.IncrBy(usedKey, 1, nil)
+				// Increment used quota by the model's quota weight
+				config.redisClient.IncrBy(usedKey, quotaWeight, func(response resp.Value) {
+					if err := response.Error(); err != nil {
+						log.Errorf("Failed to deduct quota: %v", err)
+					} else {
+						log.Debugf("Successfully deducted %d quota for user %s, model %s", quotaWeight, userId, modelName)
+					}
+					proxywasm.ResumeHttpRequest()
+				})
+			} else {
+				proxywasm.ResumeHttpRequest()
 			}
-
-			proxywasm.ResumeHttpRequest()
 		})
 	})
-	return types.HeaderStopAllIterationAndWatermark
-}
-
-// extractTokenFromHeader extracts token from header
-func extractTokenFromHeader(header string) string {
-	// remove Bearer prefix
-	if strings.HasPrefix(header, "Bearer ") {
-		return strings.TrimSpace(header[7:])
-	}
-	// if no Bearer prefix, return directly
-	return strings.TrimSpace(header)
-}
-
-func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte, log wrapper.Log) types.Action {
-	log.Debugf("onHttpRequestBody()")
-	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
-	if !ok {
-		return types.ActionContinue
-	}
-	if chatMode == ChatModeNone || chatMode == ChatModeCompletion {
-		return types.ActionContinue
-	}
-	adminMode, ok := ctx.GetContext("adminMode").(AdminMode)
-	if !ok {
-		return types.ActionContinue
-	}
-
-	if adminMode == AdminModeRefresh {
-		return refreshQuota(ctx, config, string(body), log)
-	}
-	if adminMode == AdminModeDelta {
-		return deltaQuota(ctx, config, string(body), log)
-	}
-	if adminMode == AdminModeUsedRefresh {
-		return refreshUsedQuota(ctx, config, string(body), log)
-	}
-	if adminMode == AdminModeUsedDelta {
-		return deltaUsedQuota(ctx, config, string(body), log)
-	}
-
-	return types.ActionContinue
+	return types.ActionPause
 }
 
 func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool, log wrapper.Log) []byte {
