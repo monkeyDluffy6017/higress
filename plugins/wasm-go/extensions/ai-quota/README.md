@@ -35,7 +35,10 @@ description: AI 配额管理插件配置参考
 - `{redis_used_prefix}{user_id}` - 存储用户的已使用量
 
 ### 配额扣减机制
-当请求包含指定的请求头和值时，系统会将用户的已使用量增加1。这种机制允许灵活控制何时扣减配额。
+插件从请求体中提取模型名称，根据 `model_quota_weights` 配置确定扣减额度：
+- 如果模型在 `model_quota_weights` 中配置了权重值，则按权重扣减配额
+- 如果模型未在 `model_quota_weights` 中配置，则扣减额度为 0（不扣减配额）
+- 只有当请求包含指定的请求头和值时，才会真正扣减配额
 
 ## 配置说明
 
@@ -49,6 +52,7 @@ description: AI 配额管理插件配置参考
 | `admin_path`           | string    | 选填     | /quota                 | 管理quota请求path前缀           |
 | `deduct_header`        | string    | 选填     | x-quota-deduct         | 扣减配额的触发请求头名称        |
 | `deduct_header_value`  | string    | 选填     | true                   | 扣减配额的触发请求头值          |
+| `model_quota_weights`  | object    | 选填     | {}                     | 模型配额权重配置，指定每个模型的扣减额度 |
 | `redis`                | object    | 是       | -                      | redis相关配置                  |
 
 `redis`中每一项的配置字段说明
@@ -74,10 +78,65 @@ admin_key: "your-admin-secret"
 admin_path: "/quota"
 deduct_header: "x-quota-deduct"
 deduct_header_value: "true"
+model_quota_weights:
+  'gpt-3.5-turbo': 1
+  'gpt-4': 2
+  'gpt-4-turbo': 3
+  'gpt-4o': 4
 redis:
   service_name: redis-service.default.svc.cluster.local
   service_port: 6379
   timeout: 2000
+```
+
+### 模型权重配置说明
+
+`model_quota_weights` 配置项用于指定不同模型的配额扣减权重：
+
+- **键**: 模型名称（如 'gpt-3.5-turbo', 'gpt-4' 等）
+- **值**: 扣减权重（正整数）
+
+示例配置说明：
+- `gpt-3.5-turbo` 每次调用扣减 1 个配额
+- `gpt-4` 每次调用扣减 2 个配额
+- `gpt-4-turbo` 每次调用扣减 3 个配额
+- `gpt-4o` 每次调用扣减 4 个配额
+- 未配置的模型（如 `claude-3`）扣减 0 个配额（不限制）
+
+## 使用示例
+
+以下是请求不同模型时的配额扣减行为：
+
+```bash
+# 请求 gpt-3.5-turbo 模型，扣减 1 个配额
+curl -X POST https://example.com/v1/chat/completions \
+  -H "Authorization: Bearer <jwt-token>" \
+  -H "x-quota-deduct: true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-3.5-turbo",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+
+# 请求 gpt-4 模型，扣减 2 个配额
+curl -X POST https://example.com/v1/chat/completions \
+  -H "Authorization: Bearer <jwt-token>" \
+  -H "x-quota-deduct: true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+
+# 请求未配置的模型，不扣减配额
+curl -X POST https://example.com/v1/chat/completions \
+  -H "Authorization: Bearer <jwt-token>" \
+  -H "x-quota-deduct: true" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-3",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
 ```
 
 ## JWT Token 格式
@@ -107,9 +166,11 @@ redis:
 
 **行为**:
 1. 从JWT token中提取用户ID
-2. 检查用户的剩余配额（总数 - 已使用量）
-3. 如果剩余配额 > 0，允许请求继续
-4. 如果包含扣减触发头，将已使用量+1
+2. 从请求体中提取模型名称
+3. 根据 `model_quota_weights` 配置确定所需配额
+4. 检查用户的剩余配额是否足够（总数 - 已使用量 >= 所需配额）
+5. 如果配额足够且包含扣减触发头，则按模型权重扣减配额
+6. 如果模型未配置权重，则不扣减配额直接放行
 
 ### 管理接口
 
