@@ -50,7 +50,7 @@ description: AI 配额管理插件配置参考
 | `admin_header`         | string    | 选填     | x-admin-key            | 管理操作验证用的请求头名称       |
 | `admin_key`            | string    | 必填     | -                      | 管理操作验证用的密钥            |
 | `admin_path`           | string    | 选填     | /quota                 | 管理quota请求path前缀           |
-| `deduct_header`        | string    | 选填     | x-quota-deduct         | 扣减配额的触发请求头名称        |
+| `deduct_header`        | string    | 选填     | x-quota-identity       | 扣减配额的触发请求头名称        |
 | `deduct_header_value`  | string    | 选填     | true                   | 扣减配额的触发请求头值          |
 | `model_quota_weights`  | object    | 选填     | {}                     | 模型配额权重配置，指定每个模型的扣减额度 |
 | `redis`                | object    | 是       | -                      | redis相关配置                  |
@@ -76,7 +76,7 @@ token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
 admin_path: "/quota"
-deduct_header: "x-quota-deduct"
+deduct_header: "x-quota-identity"
 deduct_header_value: "true"
 model_quota_weights:
   'gpt-3.5-turbo': 1
@@ -111,7 +111,7 @@ redis:
 # 请求 gpt-3.5-turbo 模型，扣减 1 个配额
 curl -X POST https://example.com/v1/chat/completions \
   -H "Authorization: Bearer <jwt-token>" \
-  -H "x-quota-deduct: true" \
+  -H "x-quota-identity: user" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-3.5-turbo",
@@ -121,7 +121,7 @@ curl -X POST https://example.com/v1/chat/completions \
 # 请求 gpt-4 模型，扣减 2 个配额
 curl -X POST https://example.com/v1/chat/completions \
   -H "Authorization: Bearer <jwt-token>" \
-  -H "x-quota-deduct: true" \
+  -H "x-quota-identity: user" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4",
@@ -131,7 +131,7 @@ curl -X POST https://example.com/v1/chat/completions \
 # 请求未配置的模型，不扣减配额
 curl -X POST https://example.com/v1/chat/completions \
   -H "Authorization: Bearer <jwt-token>" \
-  -H "x-quota-deduct: true" \
+  -H "x-quota-identity: user" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-3",
@@ -162,7 +162,7 @@ curl -X POST https://example.com/v1/chat/completions \
 
 **请求头**:
 - `Authorization`: JWT token，用于用户身份验证
-- `x-quota-deduct`: 可选，值为"true"时触发配额扣减
+- `x-quota-identity`: 可选，值为"user"时触发配额扣减
 
 **行为**:
 1. 从JWT token中提取用户ID
@@ -282,7 +282,7 @@ curl "https://example.com/v1/chat/completions" \
 ```bash
 curl "https://example.com/v1/chat/completions" \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
-  -H "x-quota-deduct: true" \
+  -H "x-quota-identity: user" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-3.5-turbo",

@@ -115,12 +115,12 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 	// deduct header and value
 	config.DeductHeader = json.Get("deduct_header").String()
 	if config.DeductHeader == "" {
-		config.DeductHeader = "x-quota-deduct"
+		config.DeductHeader = "x-quota-identity"
 	}
 
 	config.DeductHeaderValue = json.Get("deduct_header_value").String()
 	if config.DeductHeaderValue == "" {
-		config.DeductHeaderValue = "true"
+		config.DeductHeaderValue = "user"
 	}
 
 	// Parse model quota weights

@@ -47,7 +47,7 @@ When a request contains specified headers and values, the system increments the 
 | `admin_header`         | string    | Optional           | x-admin-key         | Request header name for admin verification    |
 | `admin_key`            | string    | Required           | -                   | Secret key for admin operation verification   |
 | `admin_path`           | string    | Optional           | /quota              | Prefix for quota management request paths     |
-| `deduct_header`        | string    | Optional           | x-quota-deduct      | Header name triggering quota deduction        |
+| `deduct_header`        | string    | Optional           | x-quota-identity    | Header name triggering quota deduction        |
 | `deduct_header_value`  | string    | Optional           | true                | Header value triggering quota deduction       |
 | `redis`                | object    | Yes                | -                   | Redis related configuration                    |
 
@@ -72,8 +72,8 @@ token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
 admin_path: "/quota"
-deduct_header: "x-quota-deduct"
-deduct_header_value: "true"
+deduct_header: "x-quota-identity"
+deduct_header_value: "user"
 redis:
   service_name: redis-service.default.svc.cluster.local
   service_port: 6379
@@ -103,7 +103,7 @@ The plugin will extract the user ID from the `id` field of the token as the key 
 
 **Headers**:
 - `Authorization`: JWT token for user authentication
-- `x-quota-deduct`: Optional, triggers quota deduction when value is "true"
+- `x-quota-identity`: Optional, triggers quota deduction when value is "true"
 
 **Behavior**:
 1. Extract user ID from JWT token
@@ -221,7 +221,7 @@ curl "https://example.com/v1/chat/completions" \
 ```bash
 curl "https://example.com/v1/chat/completions" \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
-  -H "x-quota-deduct: true" \
+  -H "x-quota-identity: user" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-3.5-turbo",
