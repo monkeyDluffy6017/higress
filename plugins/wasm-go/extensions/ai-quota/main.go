@@ -44,7 +44,7 @@ const (
 
 // AuthUser struct for parsing user info from JWT
 type AuthUser struct {
-	ID string `json:"id"`
+	ID string `json:"universal_id"`
 }
 
 func main() {
