@@ -76,11 +76,10 @@ const (
 
 // AuthUser struct for parsing user info from JWT token
 type AuthUser struct {
-	ID      string `json:"universal_id"`
-	Name    string `json:"name"`
-	StaffID string `json:"staffID"`
-	Github  string `json:"github"`
-	Phone   string `json:"phone"`
+	ID     string `json:"universal_id"`
+	Name   string `json:"name"`
+	Github string `json:"github"`
+	Phone  string `json:"phone"`
 }
 
 // TracingSpan is the tracing span configuration.
@@ -220,11 +219,8 @@ func parseUserInfoFromToken(accessToken string) (*AuthUser, error) {
 	return &userInfo, nil
 }
 
-// generateUserName generates user name based on priority: name+staffID > name > github > phone
+// generateUserName generates user name based on priority: name > github > phone
 func generateUserName(userInfo *AuthUser) string {
-	if userInfo.Name != "" && userInfo.StaffID != "" {
-		return userInfo.Name + userInfo.StaffID
-	}
 	if userInfo.Name != "" {
 		return userInfo.Name
 	}
