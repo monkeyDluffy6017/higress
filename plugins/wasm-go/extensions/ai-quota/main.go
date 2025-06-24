@@ -22,6 +22,29 @@ const (
 	pluginName = "ai-quota"
 )
 
+// ResponseData 统一响应结构体
+type ResponseData struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Success bool   `json:"success"`
+	Data    any    `json:"data,omitempty"`
+}
+
+// sendJSONResponse 发送JSON格式的响应
+func sendJSONResponse(statusCode uint32, code string, message string, success bool, data any) error {
+	response := ResponseData{
+		Code:    code,
+		Message: message,
+		Success: success,
+		Data:    data,
+	}
+	body, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+	return util.SendResponse(statusCode, code, util.MimeTypeApplicationJson, string(body))
+}
+
 type ChatMode string
 
 const (
@@ -240,7 +263,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		// for admin operations, check admin header and key
 		adminKey, err := proxywasm.GetHttpRequestHeader(config.AdminHeader)
 		if err != nil || adminKey != config.AdminKey {
-			util.SendResponse(http.StatusForbidden, "ai-quota.unauthorized", "text/plain", "Request denied by ai quota check. Unauthorized admin operation.")
+			sendJSONResponse(http.StatusForbidden, "ai-gateway.unauthorized", "Request denied by ai quota check. Unauthorized admin operation.", false, nil)
 			return types.ActionContinue
 		}
 
@@ -259,14 +282,14 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 	// get token
 	tokenHeader, err := proxywasm.GetHttpRequestHeader(config.TokenHeader)
 	if err != nil || tokenHeader == "" {
-		util.SendResponse(http.StatusUnauthorized, "ai-quota.no_token", "text/plain", "Request denied by ai quota check. No token found.")
+		sendJSONResponse(http.StatusUnauthorized, "ai-gateway.no_token", "Request denied by ai quota check. No token found.", false, nil)
 		return types.ActionContinue
 	}
 
 	// extract token (remove Bearer prefix etc.)
 	token := extractTokenFromHeader(tokenHeader)
 	if token == "" {
-		util.SendResponse(http.StatusUnauthorized, "ai-quota.invalid_token", "text/plain", "Request denied by ai quota check. Invalid token format.")
+		sendJSONResponse(http.StatusUnauthorized, "ai-gateway.invalid_token", "Request denied by ai quota check. Invalid token format.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -274,12 +297,12 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 	userInfo, err := parseUserInfoFromToken(token)
 	if err != nil {
 		log.Warnf("Failed to parse token: %v", err)
-		util.SendResponse(http.StatusUnauthorized, "ai-quota.token_parse_failed", "text/plain", "Request denied by ai quota check. Token parse failed.")
+		sendJSONResponse(http.StatusUnauthorized, "ai-gateway.token_parse_failed", "Request denied by ai quota check. Token parse failed.", false, nil)
 		return types.ActionContinue
 	}
 
 	if userInfo.ID == "" {
-		util.SendResponse(http.StatusUnauthorized, "ai-quota.no_userid", "text/plain", "Request denied by ai quota check. No user ID found in token.")
+		sendJSONResponse(http.StatusUnauthorized, "ai-gateway.no_userid", "Request denied by ai quota check. No user ID found in token.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -364,7 +387,7 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 	// Get user ID from context
 	userId, ok := ctx.GetContext("userId").(string)
 	if !ok {
-		util.SendResponse(http.StatusUnauthorized, "ai-quota.no_userid", "text/plain", "Request denied by ai quota check. No user ID found.")
+		sendJSONResponse(http.StatusUnauthorized, "ai-gateway.no_userid", "Request denied by ai quota check. No user ID found.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -373,7 +396,7 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 		starKey := config.RedisStarPrefix + userId
 		config.redisClient.Get(starKey, func(starResponse resp.Value) {
 			if err := starResponse.Error(); err != nil || starResponse.IsNull() || starResponse.String() != "true" {
-				util.SendResponse(http.StatusForbidden, "ai-quota.star_required", "text/plain", "Please star the project first: https://github.com/zgsm-ai/zgsm")
+				sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", "Please star the project first: https://github.com/zgsm-ai/zgsm", false, nil)
 				return
 			}
 			// Continue with quota check
@@ -394,7 +417,7 @@ func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, qu
 	// First get total quota
 	config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
 		if err := totalResponse.Error(); err != nil {
-			util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota available")
+			sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", "Request denied by ai quota check, No quota available", false, nil)
 			return
 		}
 
@@ -404,7 +427,7 @@ func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, qu
 		}
 
 		if totalQuota <= 0 {
-			util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", "Request denied by ai quota check, No quota available")
+			sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", "Request denied by ai quota check, No quota available", false, nil)
 			return
 		}
 
@@ -419,7 +442,7 @@ func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, qu
 			log.Debugf("User %s: totalQuota:%d usedQuota:%d remainingQuota:%d requiredQuota:%d", userId, totalQuota, usedQuota, remainingQuota, quotaWeight)
 
 			if remainingQuota < quotaWeight {
-				util.SendResponse(http.StatusForbidden, "ai-quota.noquota", "text/plain", fmt.Sprintf("Request denied by ai quota check, insufficient quota. Required: %d, Remaining: %d", quotaWeight, remainingQuota))
+				sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", fmt.Sprintf("Request denied by ai quota check, insufficient quota. Required: %d, Remaining: %d", quotaWeight, remainingQuota), false, nil)
 				return
 			}
 
@@ -496,20 +519,20 @@ func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log 
 	userId := values["user_id"]
 	quota, err := strconv.Atoi(values["quota"])
 	if userId == "" || err != nil {
-		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. user_id can't be empty and quota must be integer.")
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and quota must be integer.", false, nil)
 		return types.ActionContinue
 	}
 	err2 := config.redisClient.Set(config.RedisKeyPrefix+userId, quota, func(response resp.Value) {
 		log.Debugf("Redis set key = %s quota = %d", config.RedisKeyPrefix+userId, quota)
 		if err := response.Error(); err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
-		util.SendResponse(http.StatusOK, "ai-quota.refreshquota", "text/plain", "refresh quota successful")
+		sendJSONResponse(http.StatusOK, "ai-gateway.refreshquota", "refresh quota successful", true, nil)
 	})
 
 	if err2 != nil {
-		util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 		return types.ActionContinue
 	}
 
@@ -524,7 +547,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 		values[k] = v[0]
 	}
 	if values["user_id"] == "" {
-		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. user_id can't be empty.")
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 	userId := values["user_id"]
@@ -545,7 +568,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 
 	err := config.redisClient.Get(redisKey, func(response resp.Value) {
 		if err := response.Error(); err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
 
@@ -555,29 +578,28 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 			if !response.IsNull() {
 				starValue = response.String()
 			}
-			resultStr := fmt.Sprintf(`{"user_id":"%s","star_value":"%s","type":"%s"}`, userId, starValue, responseType)
-			util.SendResponse(http.StatusOK, "ai-quota.querystar", "application/json", resultStr)
+			data := map[string]string{
+				"user_id":    userId,
+				"star_value": starValue,
+				"type":       responseType,
+			}
+			sendJSONResponse(http.StatusOK, "ai-gateway.querystar", "query star status successful", true, data)
 		} else {
 			// Handle quota query (integer value)
 			quota := 0
 			if !response.IsNull() {
 				quota = response.Integer()
 			}
-			result := struct {
-				UserID string `json:"user_id"`
-				Quota  int    `json:"quota"`
-				Type   string `json:"type"`
-			}{
-				UserID: userId,
-				Quota:  quota,
-				Type:   responseType,
+			data := map[string]interface{}{
+				"user_id": userId,
+				"quota":   quota,
+				"type":    responseType,
 			}
-			body, _ := json.Marshal(result)
-			util.SendResponse(http.StatusOK, "ai-quota.queryquota", "application/json", string(body))
+			sendJSONResponse(http.StatusOK, "ai-gateway.queryquota", "query quota successful", true, data)
 		}
 	})
 	if err != nil {
-		util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 		return types.ActionContinue
 	}
 	return types.ActionPause
@@ -592,7 +614,7 @@ func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wr
 	userId := values["user_id"]
 	value, err := strconv.Atoi(values["value"])
 	if userId == "" || err != nil {
-		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. user_id can't be empty and value must be integer.")
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and value must be integer.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -600,26 +622,26 @@ func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wr
 		err := config.redisClient.IncrBy(config.RedisKeyPrefix+userId, value, func(response resp.Value) {
 			log.Debugf("Redis Incr key = %s value = %d", config.RedisKeyPrefix+userId, value)
 			if err := response.Error(); err != nil {
-				util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 				return
 			}
-			util.SendResponse(http.StatusOK, "ai-quota.deltaquota", "text/plain", "delta quota successful")
+			sendJSONResponse(http.StatusOK, "ai-gateway.deltaquota", "delta quota successful", true, nil)
 		})
 		if err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return types.ActionContinue
 		}
 	} else {
 		err := config.redisClient.DecrBy(config.RedisKeyPrefix+userId, 0-value, func(response resp.Value) {
 			log.Debugf("Redis Decr key = %s value = %d", config.RedisKeyPrefix+userId, 0-value)
 			if err := response.Error(); err != nil {
-				util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 				return
 			}
-			util.SendResponse(http.StatusOK, "ai-quota.deltaquota", "text/plain", "delta quota successful")
+			sendJSONResponse(http.StatusOK, "ai-gateway.deltaquota", "delta quota successful", true, nil)
 		})
 		if err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return types.ActionContinue
 		}
 	}
@@ -636,20 +658,20 @@ func refreshUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, 
 	userId := values["user_id"]
 	quota, err := strconv.Atoi(values["quota"])
 	if userId == "" || err != nil {
-		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. user_id can't be empty and quota must be integer.")
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and quota must be integer.", false, nil)
 		return types.ActionContinue
 	}
 	err2 := config.redisClient.Set(config.RedisUsedPrefix+userId, quota, func(response resp.Value) {
 		log.Debugf("Redis set key = %s quota = %d", config.RedisUsedPrefix+userId, quota)
 		if err := response.Error(); err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
-		util.SendResponse(http.StatusOK, "ai-quota.refreshusedquota", "text/plain", "refresh used quota successful")
+		sendJSONResponse(http.StatusOK, "ai-gateway.refreshusedquota", "refresh used quota successful", true, nil)
 	})
 
 	if err2 != nil {
-		util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 		return types.ActionContinue
 	}
 
@@ -665,7 +687,7 @@ func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, lo
 	userId := values["user_id"]
 	value, err := strconv.Atoi(values["value"])
 	if userId == "" || err != nil {
-		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. user_id can't be empty and value must be integer.")
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and value must be integer.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -673,26 +695,26 @@ func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, lo
 		err := config.redisClient.IncrBy(config.RedisUsedPrefix+userId, value, func(response resp.Value) {
 			log.Debugf("Redis Incr key = %s value = %d", config.RedisUsedPrefix+userId, value)
 			if err := response.Error(); err != nil {
-				util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 				return
 			}
-			util.SendResponse(http.StatusOK, "ai-quota.deltausedquota", "text/plain", "delta used quota successful")
+			sendJSONResponse(http.StatusOK, "ai-gateway.deltausedquota", "delta used quota successful", true, nil)
 		})
 		if err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return types.ActionContinue
 		}
 	} else {
 		err := config.redisClient.DecrBy(config.RedisUsedPrefix+userId, 0-value, func(response resp.Value) {
 			log.Debugf("Redis Decr key = %s value = %d", config.RedisUsedPrefix+userId, 0-value)
 			if err := response.Error(); err != nil {
-				util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 				return
 			}
-			util.SendResponse(http.StatusOK, "ai-quota.deltausedquota", "text/plain", "delta used quota successful")
+			sendJSONResponse(http.StatusOK, "ai-gateway.deltausedquota", "delta used quota successful", true, nil)
 		})
 		if err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return types.ActionContinue
 		}
 	}
@@ -711,13 +733,13 @@ func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log
 	userId := values["user_id"]
 	starValue := values["star_value"]
 	if userId == "" || starValue == "" {
-		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. user_id and star_value can't be empty.")
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id and star_value can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
 	// Validate star_value should be "true" or "false"
 	if starValue != "true" && starValue != "false" {
-		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. star_value must be 'true' or 'false'.")
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. star_value must be 'true' or 'false'.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -725,14 +747,14 @@ func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log
 	err := config.redisClient.Set(redisKey, starValue, func(response resp.Value) {
 		log.Debugf("Redis set key = %s star_value = %s", redisKey, starValue)
 		if err := response.Error(); err != nil {
-			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
-		util.SendResponse(http.StatusOK, "ai-quota.setstar", "text/plain", "set star status successful")
+		sendJSONResponse(http.StatusOK, "ai-gateway.setstar", "set star status successful", true, nil)
 	})
 
 	if err != nil {
-		util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 		return types.ActionContinue
 	}
 
