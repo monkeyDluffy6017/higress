@@ -33,6 +33,7 @@ Remaining Quota = Total Quota - Used Quota
 ### Redis Key Structure
 - `{redis_key_prefix}{user_id}` - Stores user's total quota
 - `{redis_used_prefix}{user_id}` - Stores user's used quota
+- `{redis_star_prefix}{user_id}` - Stores user's GitHub star status (when check_github_star is enabled)
 
 ### Quota Deduction Mechanism
 When a request contains specified headers and values, the system increments the user's used quota by 1. This mechanism allows flexible control over when quotas are deducted.
@@ -43,6 +44,8 @@ When a request contains specified headers and values, the system increments the 
 |------------------------|-----------|---------------------|---------------------|------------------------------------------------|
 | `redis_key_prefix`     | string    | Optional           | chat_quota:         | Redis key prefix for total quota              |
 | `redis_used_prefix`    | string    | Optional           | chat_quota_used:    | Redis key prefix for used quota               |
+| `redis_star_prefix`    | string    | Optional           | chat_quota_star:    | Redis key prefix for GitHub star status       |
+| `check_github_star`    | boolean   | Optional           | false               | Whether to enable GitHub star checking        |
 | `token_header`         | string    | Optional           | authorization       | Request header name storing JWT token         |
 | `admin_header`         | string    | Optional           | x-admin-key         | Request header name for admin verification    |
 | `admin_key`            | string    | Required           | -                   | Secret key for admin operation verification   |
@@ -68,6 +71,8 @@ Explanation of each configuration field in `redis`
 ```yaml
 redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
+redis_star_prefix: "chat_quota_star:"
+check_github_star: false
 token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
@@ -79,6 +84,26 @@ redis:
   service_port: 6379
   timeout: 2000
 ```
+
+### Configuration with GitHub Star Check Enabled
+```yaml
+redis_key_prefix: "chat_quota:"
+redis_used_prefix: "chat_quota_used:"
+redis_star_prefix: "chat_quota_star:"
+check_github_star: true
+token_header: "authorization"
+admin_header: "x-admin-key"
+admin_key: "your-admin-secret"
+admin_path: "/quota"
+deduct_header: "x-quota-identity"
+deduct_header_value: "user"
+redis:
+  service_name: "local-redis.static"
+  service_port: 80
+  timeout: 2000
+```
+
+**Note**: When `check_github_star` is set to `true`, users must star the GitHub project before using AI services. The system will check if the value of the Redis key `chat_quota_star:{user_id}` is "true".
 
 ## JWT Token Format
 
@@ -107,9 +132,15 @@ The plugin will extract the user ID from the `id` field of the token as the key 
 
 **Behavior**:
 1. Extract user ID from JWT token
-2. Check user's remaining quota (total - used)
-3. Allow request to proceed if remaining quota > 0
-4. Increment used quota by 1 if deduction trigger header is present
+2. If `check_github_star` is enabled, check user's GitHub star status (`{redis_star_prefix}{user_id}` must be "true")
+3. Check user's remaining quota (total - used)
+4. Allow request to proceed if remaining quota > 0
+5. Increment used quota by 1 if deduction trigger header is present
+
+**GitHub Star Check**:
+- When `check_github_star` is set to `true`, the system will first check if the user has starred the GitHub project
+- If the value of `{redis_star_prefix}{user_id}` in Redis is not "true", a 403 error will be returned, prompting the user to star https://github.com/zgsm-ai/zgsm project
+- Only after passing the GitHub star check will the system proceed with quota check and deduction
 
 ### Management APIs
 

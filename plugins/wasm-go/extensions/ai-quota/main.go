@@ -61,6 +61,8 @@ type QuotaConfig struct {
 	redisInfo         RedisInfo         `yaml:"redis"`
 	RedisKeyPrefix    string            `yaml:"redis_key_prefix"`
 	RedisUsedPrefix   string            `yaml:"redis_used_prefix"`
+	RedisStarPrefix   string            `yaml:"redis_star_prefix"`
+	CheckGithubStar   bool              `yaml:"check_github_star"`
 	TokenHeader       string            `yaml:"token_header"`
 	AdminHeader       string            `yaml:"admin_header"`
 	AdminKey          string            `yaml:"admin_key"`
@@ -143,6 +145,13 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 	if config.RedisUsedPrefix == "" {
 		config.RedisUsedPrefix = "chat_quota_used:"
 	}
+
+	config.RedisStarPrefix = json.Get("redis_star_prefix").String()
+	if config.RedisStarPrefix == "" {
+		config.RedisStarPrefix = "chat_quota_star:"
+	}
+
+	config.CheckGithubStar = json.Get("check_github_star").Bool()
 
 	redisConfig := json.Get("redis")
 	if !redisConfig.Exists() {
@@ -354,7 +363,26 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 		return types.ActionContinue
 	}
 
-	// Check and deduct quota
+	// Check GitHub star status if enabled
+	if config.CheckGithubStar {
+		starKey := config.RedisStarPrefix + userId
+		config.redisClient.Get(starKey, func(starResponse resp.Value) {
+			if err := starResponse.Error(); err != nil || starResponse.IsNull() || starResponse.String() != "true" {
+				util.SendResponse(http.StatusForbidden, "ai-quota.star_required", "text/plain", "Please star the project first: https://github.com/zgsm-ai/zgsm")
+				return
+			}
+			// Continue with quota check
+			doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
+		})
+		return types.ActionPause
+	}
+
+	// Check and deduct quota directly if GitHub star check is disabled
+	doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
+	return types.ActionPause
+}
+
+func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, quotaWeight int, modelName string, log wrapper.Log) {
 	totalKey := config.RedisKeyPrefix + userId
 	usedKey := config.RedisUsedPrefix + userId
 
@@ -407,7 +435,6 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 			}
 		})
 	})
-	return types.ActionPause
 }
 
 func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool, log wrapper.Log) []byte {

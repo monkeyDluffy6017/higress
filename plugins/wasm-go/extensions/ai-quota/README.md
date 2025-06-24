@@ -22,6 +22,7 @@ description: AI 配额管理插件配置参考
 - **灵活的配额扣减机制**：基于请求头触发配额扣减
 - **完整的管理接口**：支持配额总数和已使用量的查询、刷新、增减操作
 - **Redis集群支持**：兼容Redis单机和集群模式
+- **GitHub关注检查**：可选的GitHub项目关注状态验证
 
 ## 工作原理
 
@@ -33,6 +34,7 @@ description: AI 配额管理插件配置参考
 ### Redis Key结构
 - `{redis_key_prefix}{user_id}` - 存储用户的配额总数
 - `{redis_used_prefix}{user_id}` - 存储用户的已使用量
+- `{redis_star_prefix}{user_id}` - 存储用户的GitHub关注状态（当启用check_github_star时）
 
 ### 配额扣减机制
 插件从请求体中提取模型名称，根据 `model_quota_weights` 配置确定扣减额度：
@@ -46,6 +48,8 @@ description: AI 配额管理插件配置参考
 |------------------------|-----------|----------|------------------------|--------------------------------|
 | `redis_key_prefix`     | string    | 选填     | chat_quota:            | 配额总数的redis key前缀         |
 | `redis_used_prefix`    | string    | 选填     | chat_quota_used:       | 已使用量的redis key前缀         |
+| `redis_star_prefix`    | string    | 选填     | chat_quota_star:       | GitHub关注状态的redis key前缀   |
+| `check_github_star`    | boolean   | 选填     | false                  | 是否启用GitHub关注检查          |
 | `token_header`         | string    | 选填     | authorization          | 存储JWT token的请求头名称       |
 | `admin_header`         | string    | 选填     | x-admin-key            | 管理操作验证用的请求头名称       |
 | `admin_key`            | string    | 必填     | -                      | 管理操作验证用的密钥            |
@@ -72,6 +76,8 @@ description: AI 配额管理插件配置参考
 ```yaml
 redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
+redis_star_prefix: "chat_quota_star:"
+check_github_star: false
 token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
@@ -88,6 +94,28 @@ redis:
   service_port: 6379
   timeout: 2000
 ```
+
+### 启用GitHub关注检查的配置
+```yaml
+redis_key_prefix: "chat_quota:"
+redis_used_prefix: "chat_quota_used:"
+redis_star_prefix: "chat_quota_star:"
+check_github_star: true
+token_header: "authorization"
+admin_header: "x-admin-key"
+admin_key: "your-admin-secret"
+admin_path: "/quota"
+deduct_header: "x-quota-identity"
+deduct_header_value: "user"
+model_quota_weights:
+  'deepseek-chat': 1
+redis:
+  service_name: "local-redis.static"
+  service_port: 80
+  timeout: 2000
+```
+
+**说明**: 当 `check_github_star` 设置为 `true` 时，用户必须先关注 GitHub 项目才能使用AI服务。系统会检查Redis中键为 `chat_quota_star:{user_id}` 的值是否为 "true"。
 
 ### 模型权重配置说明
 
@@ -166,11 +194,17 @@ curl -X POST https://example.com/v1/chat/completions \
 
 **行为**:
 1. 从JWT token中提取用户ID
-2. 从请求体中提取模型名称
-3. 根据 `model_quota_weights` 配置确定所需配额
-4. 检查用户的剩余配额是否足够（总数 - 已使用量 >= 所需配额）
-5. 如果配额足够且包含扣减触发头，则按模型权重扣减配额
-6. 如果模型未配置权重，则不扣减配额直接放行
+2. 如果启用了 `check_github_star`，检查用户的GitHub关注状态（`{redis_star_prefix}{user_id}` 必须为 "true"）
+3. 从请求体中提取模型名称
+4. 根据 `model_quota_weights` 配置确定所需配额
+5. 检查用户的剩余配额是否足够（总数 - 已使用量 >= 所需配额）
+6. 如果配额足够且包含扣减触发头，则按模型权重扣减配额
+7. 如果模型未配置权重，则不扣减配额直接放行
+
+**GitHub关注检查**:
+- 当 `check_github_star` 设置为 `true` 时，会首先检查用户是否关注了GitHub项目
+- 如果Redis中 `{redis_star_prefix}{user_id}` 的值不是 "true"，将返回403错误，提示用户需要关注 https://github.com/zgsm-ai/zgsm 项目
+- 只有通过GitHub关注检查后，才会继续进行配额检查和扣减
 
 ### 管理接口
 
