@@ -72,13 +72,13 @@ func parseOverrideRuleConfig(json gjson.Result, global config.PluginConfig, plug
 }
 
 func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConfig) types.Action {
-	// Handle /v1/models request locally first (before model selection)
+	// Handle /ai-gateway/api/v1/models request locally first (before model selection)
 	rawPath := ctx.Path()
 	path, _ := url.Parse(rawPath)
 	apiName := getApiName(path.Path)
 
 	if apiName == provider.ApiNameModels {
-		log.Debugf("[onHttpRequestHeader] handling /v1/models request locally")
+		log.Debugf("[onHttpRequestHeader] handling /ai-gateway/api/v1/models request locally")
 		ctx.DontReadRequestBody()
 
 		// Generate models response based on all configured providers
@@ -499,7 +499,7 @@ func getApiName(path string) provider.ApiName {
 	if util.RegRetrieveFileContentPath.MatchString(path) {
 		return provider.ApiNameRetrieveFileContent
 	}
-	if strings.HasSuffix(path, "/v1/models") {
+	if strings.HasSuffix(path, "/ai-gateway/api/v1/models") {
 		return provider.ApiNameModels
 	}
 	// cohere style
