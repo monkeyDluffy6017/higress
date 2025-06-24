@@ -39,6 +39,8 @@ const (
 	AdminModeUsedQuery   AdminMode = "used_query"
 	AdminModeUsedRefresh AdminMode = "used_refresh"
 	AdminModeUsedDelta   AdminMode = "used_delta"
+	AdminModeStarQuery   AdminMode = "star_query"
+	AdminModeStarSet     AdminMode = "star_set"
 	AdminModeNone        AdminMode = "none"
 )
 
@@ -242,11 +244,11 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 			return types.ActionContinue
 		}
 
-		// query quota or used quota
-		if adminMode == AdminModeQuery || adminMode == AdminModeUsedQuery {
+		// query quota, used quota or star status
+		if adminMode == AdminModeQuery || adminMode == AdminModeUsedQuery || adminMode == AdminModeStarQuery {
 			return queryQuota(context, config, path, adminMode, log)
 		}
-		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta || adminMode == AdminModeUsedRefresh || adminMode == AdminModeUsedDelta {
+		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta || adminMode == AdminModeUsedRefresh || adminMode == AdminModeUsedDelta || adminMode == AdminModeStarSet {
 			context.BufferRequestBody()
 			return types.HeaderStopIteration
 		}
@@ -332,6 +334,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 	}
 	if adminMode == AdminModeUsedDelta {
 		return deltaUsedQuota(ctx, config, string(body), log)
+	}
+	if adminMode == AdminModeStarSet {
+		return setStarStatus(ctx, config, string(body), log)
 	}
 
 	return types.ActionContinue
@@ -467,6 +472,12 @@ func getOperationMode(path string, adminPath string, log wrapper.Log) (ChatMode,
 	if strings.HasSuffix(path, fullAdminPath+"/used") {
 		return ChatModeAdmin, AdminModeUsedQuery
 	}
+	if strings.HasSuffix(path, fullAdminPath+"/star/set") {
+		return ChatModeAdmin, AdminModeStarSet
+	}
+	if strings.HasSuffix(path, fullAdminPath+"/star") {
+		return ChatModeAdmin, AdminModeStarQuery
+	}
 	if strings.HasSuffix(path, fullAdminPath) {
 		return ChatModeAdmin, AdminModeQuery
 	}
@@ -524,32 +535,46 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 	if adminMode == AdminModeUsedQuery {
 		redisKey = config.RedisUsedPrefix + userId
 		responseType = "used_quota"
+	} else if adminMode == AdminModeStarQuery {
+		redisKey = config.RedisStarPrefix + userId
+		responseType = "star_status"
 	} else {
 		redisKey = config.RedisKeyPrefix + userId
 		responseType = "total_quota"
 	}
 
 	err := config.redisClient.Get(redisKey, func(response resp.Value) {
-		quota := 0
 		if err := response.Error(); err != nil {
 			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
 			return
-		} else if response.IsNull() {
-			quota = 0
+		}
+
+		if adminMode == AdminModeStarQuery {
+			// Handle star status query (string value)
+			starValue := "false"
+			if !response.IsNull() {
+				starValue = response.String()
+			}
+			resultStr := fmt.Sprintf(`{"user_id":"%s","star_value":"%s","type":"%s"}`, userId, starValue, responseType)
+			util.SendResponse(http.StatusOK, "ai-quota.querystar", "application/json", resultStr)
 		} else {
-			quota = response.Integer()
+			// Handle quota query (integer value)
+			quota := 0
+			if !response.IsNull() {
+				quota = response.Integer()
+			}
+			result := struct {
+				UserID string `json:"user_id"`
+				Quota  int    `json:"quota"`
+				Type   string `json:"type"`
+			}{
+				UserID: userId,
+				Quota:  quota,
+				Type:   responseType,
+			}
+			body, _ := json.Marshal(result)
+			util.SendResponse(http.StatusOK, "ai-quota.queryquota", "application/json", string(body))
 		}
-		result := struct {
-			UserID string `json:"user_id"`
-			Quota  int    `json:"quota"`
-			Type   string `json:"type"`
-		}{
-			UserID: userId,
-			Quota:  quota,
-			Type:   responseType,
-		}
-		body, _ := json.Marshal(result)
-		util.SendResponse(http.StatusOK, "ai-quota.queryquota", "application/json", string(body))
 	})
 	if err != nil {
 		util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
@@ -670,6 +695,45 @@ func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, lo
 			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
 			return types.ActionContinue
 		}
+	}
+
+	return types.ActionPause
+}
+
+func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log wrapper.Log) types.Action {
+	queryValues, _ := url.ParseQuery(body)
+	values := make(map[string]string)
+	for k, v := range queryValues {
+		if len(v) > 0 {
+			values[k] = v[0]
+		}
+	}
+	userId := values["user_id"]
+	starValue := values["star_value"]
+	if userId == "" || starValue == "" {
+		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. user_id and star_value can't be empty.")
+		return types.ActionContinue
+	}
+
+	// Validate star_value should be "true" or "false"
+	if starValue != "true" && starValue != "false" {
+		util.SendResponse(http.StatusBadRequest, "ai-quota.invalid_params", "text/plain", "Request denied by ai quota check. star_value must be 'true' or 'false'.")
+		return types.ActionContinue
+	}
+
+	redisKey := config.RedisStarPrefix + userId
+	err := config.redisClient.Set(redisKey, starValue, func(response resp.Value) {
+		log.Debugf("Redis set key = %s star_value = %s", redisKey, starValue)
+		if err := response.Error(); err != nil {
+			util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+			return
+		}
+		util.SendResponse(http.StatusOK, "ai-quota.setstar", "text/plain", "set star status successful")
+	})
+
+	if err != nil {
+		util.SendResponse(http.StatusServiceUnavailable, "ai-quota.error", "text/plain", fmt.Sprintf("redis error:%v", err))
+		return types.ActionContinue
 	}
 
 	return types.ActionPause

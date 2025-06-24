@@ -299,6 +299,44 @@ curl -X POST \
   "https://example.com/v1/chat/completions/quota/used/delta"
 ```
 
+#### GitHub关注状态管理
+
+##### 查询GitHub关注状态
+```bash
+curl -H "x-admin-key: your-admin-secret" \
+  "https://example.com/v1/chat/completions/quota/star?user_id=user123"
+```
+
+**响应示例**:
+```json
+{
+  "user_id": "user123",
+  "star_value": "true",
+  "type": "star_status"
+}
+```
+
+##### 设置GitHub关注状态
+```bash
+# 设置为已关注
+curl -X POST \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "user_id=user123&star_value=true" \
+  "https://example.com/v1/chat/completions/quota/star/set"
+
+# 设置为未关注
+curl -X POST \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "user_id=user123&star_value=false" \
+  "https://example.com/v1/chat/completions/quota/star/set"
+```
+
+**参数说明**:
+- `user_id`: 用户ID（必填）
+- `star_value`: 关注状态，只能是 "true" 或 "false"（必填）
+
 ## 使用示例
 
 ### 正常的AI请求（不扣减配额）
@@ -335,6 +373,7 @@ curl "https://example.com/v1/chat/completions" \
 | 401 | `ai-quota.token_parse_failed` | JWT token解析失败 |
 | 401 | `ai-quota.no_userid` | JWT token中未找到用户ID |
 | 403 | `ai-quota.unauthorized` | 管理接口认证失败 |
+| 403 | `ai-quota.star_required` | 需要先关注GitHub项目 |
 | 403 | `ai-quota.noquota` | 配额不足 |
 | 400 | `ai-quota.invalid_params` | 请求参数无效 |
 | 503 | `ai-quota.error` | Redis连接错误 |

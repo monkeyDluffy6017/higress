@@ -235,6 +235,44 @@ curl -X POST \
   "https://example.com/v1/chat/completions/quota/used/delta"
 ```
 
+#### GitHub Star Status Management
+
+##### Query GitHub Star Status
+```bash
+curl -H "x-admin-key: your-admin-secret" \
+  "https://example.com/v1/chat/completions/quota/star?user_id=user123"
+```
+
+**Response Example**:
+```json
+{
+  "user_id": "user123",
+  "star_value": "true",
+  "type": "star_status"
+}
+```
+
+##### Set GitHub Star Status
+```bash
+# Set as starred
+curl -X POST \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "user_id=user123&star_value=true" \
+  "https://example.com/v1/chat/completions/quota/star/set"
+
+# Set as not starred
+curl -X POST \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "user_id=user123&star_value=false" \
+  "https://example.com/v1/chat/completions/quota/star/set"
+```
+
+**Parameter Description**:
+- `user_id`: User ID (required)
+- `star_value`: Star status, must be "true" or "false" (required)
+
 ## Usage Examples
 
 ### Normal AI Request (No Quota Deduction)
@@ -271,6 +309,7 @@ curl "https://example.com/v1/chat/completions" \
 | 401 | `ai-quota.token_parse_failed` | JWT token parsing failed |
 | 401 | `ai-quota.no_userid` | User ID not found in JWT token |
 | 403 | `ai-quota.unauthorized` | Management API authentication failed |
+| 403 | `ai-quota.star_required` | Need to star the GitHub project first |
 | 403 | `ai-quota.noquota` | Insufficient quota |
 | 400 | `ai-quota.invalid_params` | Invalid request parameters |
 | 503 | `ai-quota.error` | Redis connection error |
