@@ -1,78 +1,73 @@
 ---
-title: AI 配额管理
-keywords: [ AI网关, AI配额 ]
-description: AI 配额管理插件配置参考
+title: AI Quota Management
+keywords: [ AI Gateway, AI Quota ]
+description: AI quota management plugin configuration reference
 ---
 
-## 功能说明
+## Function Description
 
-`ai-quota` 插件实现基于用户身份的AI配额管理，支持JWT token身份验证和精确的配额控制。插件采用双Redis Key架构设计，分别存储配额总数和已使用量，能够精确跟踪和控制用户的配额使用情况。
+The `ai-quota` plugin implements AI quota management based on user identity with JWT token authentication and precise quota control. It features a dual Redis key architecture that separately stores total quota and used quota, enabling precise tracking and control of user quota consumption.
 
-插件从请求头中获取JWT token，解码后提取用户ID作为配额限制的key。管理操作需要通过指定的请求头和密钥进行验证。
+The plugin extracts JWT token from request headers, decodes it to extract user ID as the key for quota limiting. Administrative operations require verification through specified request headers and secret keys.
 
-## 运行属性
+## Runtime Properties
 
-插件执行阶段：`默认阶段`
-插件执行优先级：`750`
+Plugin execution phase: `default phase`
+Plugin execution priority: `750`
 
-## 核心特性
+## Key Features
 
-- **双Redis Key架构**：分别存储配额总数和已使用量，计算剩余配额
-- **JWT身份验证**：从JWT token中提取用户身份信息
-- **灵活的配额扣减机制**：基于请求头触发配额扣减
-- **完整的管理接口**：支持配额总数和已使用量的查询、刷新、增减操作
-- **Redis集群支持**：兼容Redis单机和集群模式
-- **GitHub关注检查**：可选的GitHub项目关注状态验证
+- **Dual Redis Key Architecture**: Separate storage for total quota and used quota, calculating remaining quota
+- **JWT Authentication**: Extract user identity information from JWT tokens
+- **Flexible Quota Deduction**: Header-based quota deduction triggering
+- **Complete Management APIs**: Support for query, refresh, and delta operations on both total and used quotas
+- **Redis Cluster Support**: Compatible with both Redis standalone and cluster modes
 
-## 工作原理
+## How It Works
 
-### 配额计算逻辑
+### Quota Calculation Logic
 ```
-剩余配额 = 配额总数 - 已使用量
+Remaining Quota = Total Quota - Used Quota
 ```
 
-### Redis Key结构
-- `{redis_key_prefix}{user_id}` - 存储用户的配额总数
-- `{redis_used_prefix}{user_id}` - 存储用户的已使用量
-- `{redis_star_prefix}{user_id}` - 存储用户的GitHub关注状态（当启用check_github_star时）
+### Redis Key Structure
+- `{redis_key_prefix}{user_id}` - Stores user's total quota
+- `{redis_used_prefix}{user_id}` - Stores user's used quota
+- `{redis_star_prefix}{user_id}` - Stores user's GitHub star status (when check_github_star is enabled)
 
-### 配额扣减机制
-插件从请求体中提取模型名称，根据 `model_quota_weights` 配置确定扣减额度：
-- 如果模型在 `model_quota_weights` 中配置了权重值，则按权重扣减配额
-- 如果模型未在 `model_quota_weights` 中配置，则扣减额度为 0（不扣减配额）
-- 只有当请求包含指定的请求头和值时，才会真正扣减配额
+### Quota Deduction Mechanism
+When a request contains specified headers and values, the system increments the user's used quota by 1. This mechanism allows flexible control over when quotas are deducted.
 
-## 配置说明
+## Configuration Description
 
-| 名称                    | 数据类型   | 填写要求 | 默认值                 | 描述                           |
-|------------------------|-----------|----------|------------------------|--------------------------------|
-| `redis_key_prefix`     | string    | 选填     | chat_quota:            | 配额总数的redis key前缀         |
-| `redis_used_prefix`    | string    | 选填     | chat_quota_used:       | 已使用量的redis key前缀         |
-| `redis_star_prefix`    | string    | 选填     | chat_quota_star:       | GitHub关注状态的redis key前缀   |
-| `check_github_star`    | boolean   | 选填     | false                  | 是否启用GitHub关注检查          |
-| `token_header`         | string    | 选填     | authorization          | 存储JWT token的请求头名称       |
-| `admin_header`         | string    | 选填     | x-admin-key            | 管理操作验证用的请求头名称       |
-| `admin_key`            | string    | 必填     | -                      | 管理操作验证用的密钥            |
-| `admin_path`           | string    | 选填     | /quota                 | 管理quota请求path前缀           |
-| `deduct_header`        | string    | 选填     | x-quota-identity       | 扣减配额的触发请求头名称        |
-| `deduct_header_value`  | string    | 选填     | true                   | 扣减配额的触发请求头值          |
-| `model_quota_weights`  | object    | 选填     | {}                     | 模型配额权重配置，指定每个模型的扣减额度 |
-| `redis`                | object    | 是       | -                      | redis相关配置                  |
+| Name                   | Data Type | Required Conditions | Default Value       | Description                                    |
+|------------------------|-----------|---------------------|---------------------|------------------------------------------------|
+| `redis_key_prefix`     | string    | Optional           | chat_quota:         | Redis key prefix for total quota              |
+| `redis_used_prefix`    | string    | Optional           | chat_quota_used:    | Redis key prefix for used quota               |
+| `redis_star_prefix`    | string    | Optional           | chat_quota_star:    | Redis key prefix for GitHub star status       |
+| `check_github_star`    | boolean   | Optional           | false               | Whether to enable GitHub star checking        |
+| `token_header`         | string    | Optional           | authorization       | Request header name storing JWT token         |
+| `admin_header`         | string    | Optional           | x-admin-key         | Request header name for admin verification    |
+| `admin_key`            | string    | Required           | -                   | Secret key for admin operation verification   |
+| `admin_path`           | string    | Optional           | /quota              | Prefix for quota management request paths     |
+| `deduct_header`        | string    | Optional           | x-quota-identity    | Header name triggering quota deduction        |
+| `deduct_header_value`  | string    | Optional           | true                | Header value triggering quota deduction       |
+| `redis`                | object    | Yes                | -                   | Redis related configuration                    |
 
-`redis`中每一项的配置字段说明
+Explanation of each configuration field in `redis`
 
-| 配置项       | 类型   | 必填 | 默认值                                                     | 说明                                                                                         |
-| ------------ | ------ | ---- | ---------------------------------------------------------- | ---------------------------                                                                  |
-| service_name | string | 必填 | -                                                          | redis服务名，带服务类型的完整 FQDN 名称，如my-redis.dns，redis.my-ns.svc.cluster.local |
-| service_port | int    | 选填 | 静态服务默认值80；其他服务默认值6379                             | redis服务端口                                                                               |
-| username     | string | 选填 | -                                                          | redis 用户名                                                                                 |
-| password     | string | 选填 | -                                                          | redis 密码                                                                                   |
-| timeout      | int    | 选填 | 1000                                                       | redis连接超时时间，单位毫秒                                                                     |
-| database     | int    | 选填 | 0                                                          | 使用的数据库 ID，例如，配置为1，对应`SELECT 1`                                                    |
+| Configuration Item | Type   | Required | Default Value                                           | Explanation                                                                                             |
+|--------------------|--------|----------|---------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| service_name       | string | Required | -                                                       | Redis service name, full FQDN name with service type, e.g., my-redis.dns, redis.my-ns.svc.cluster.local |
+| service_port       | int    | No       | Default value for static service is 80; others are 6379 | Service port for the redis service                                                                      |
+| username           | string | No       | -                                                       | Redis username                                                                                          |
+| password           | string | No       | -                                                       | Redis password                                                                                          |
+| timeout            | int    | No       | 1000                                                    | Redis connection timeout in milliseconds                                                                |
+| database           | int    | No       | 0                                                       | The database ID used, for example, configured as 1, corresponds to `SELECT 1`.                          |
 
-## 配置示例
+## Configuration Example
 
-### 基本配置
+### Basic Configuration
 ```yaml
 redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
@@ -83,19 +78,14 @@ admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
 admin_path: "/quota"
 deduct_header: "x-quota-identity"
-deduct_header_value: "true"
-model_quota_weights:
-  'gpt-3.5-turbo': 1
-  'gpt-4': 2
-  'gpt-4-turbo': 3
-  'gpt-4o': 4
+deduct_header_value: "user"
 redis:
   service_name: redis-service.default.svc.cluster.local
   service_port: 6379
   timeout: 2000
 ```
 
-### 启用GitHub关注检查的配置
+### Configuration with GitHub Star Check Enabled
 ```yaml
 redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
@@ -107,69 +97,17 @@ admin_key: "your-admin-secret"
 admin_path: "/quota"
 deduct_header: "x-quota-identity"
 deduct_header_value: "user"
-model_quota_weights:
-  'deepseek-chat': 1
 redis:
   service_name: "local-redis.static"
   service_port: 80
   timeout: 2000
 ```
 
-**说明**: 当 `check_github_star` 设置为 `true` 时，用户必须先关注 GitHub 项目才能使用AI服务。系统会检查Redis中键为 `chat_quota_star:{user_id}` 的值是否为 "true"。
+**Note**: When `check_github_star` is set to `true`, users must star the GitHub project before using AI services. The system will check if the value of the Redis key `chat_quota_star:{user_id}` is "true".
 
-### 模型权重配置说明
+## JWT Token Format
 
-`model_quota_weights` 配置项用于指定不同模型的配额扣减权重：
-
-- **键**: 模型名称（如 'gpt-3.5-turbo', 'gpt-4' 等）
-- **值**: 扣减权重（正整数）
-
-示例配置说明：
-- `gpt-3.5-turbo` 每次调用扣减 1 个配额
-- `gpt-4` 每次调用扣减 2 个配额
-- `gpt-4-turbo` 每次调用扣减 3 个配额
-- `gpt-4o` 每次调用扣减 4 个配额
-- 未配置的模型（如 `claude-3`）扣减 0 个配额（不限制）
-
-## 使用示例
-
-以下是请求不同模型时的配额扣减行为：
-
-```bash
-# 请求 gpt-3.5-turbo 模型，扣减 1 个配额
-curl -X POST https://example.com/v1/chat/completions \
-  -H "Authorization: Bearer <jwt-token>" \
-  -H "x-quota-identity: user" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-3.5-turbo",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-
-# 请求 gpt-4 模型，扣减 2 个配额
-curl -X POST https://example.com/v1/chat/completions \
-  -H "Authorization: Bearer <jwt-token>" \
-  -H "x-quota-identity: user" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-
-# 请求未配置的模型，不扣减配额
-curl -X POST https://example.com/v1/chat/completions \
-  -H "Authorization: Bearer <jwt-token>" \
-  -H "x-quota-identity: user" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-3",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-```
-
-## JWT Token 格式
-
-插件期望从指定的请求头中获取JWT token，token解码后应包含用户ID信息。token格式：
+The plugin expects to obtain JWT token from the specified request header. After decoding, the token should contain user ID information. Token format:
 
 ```json
 {
@@ -178,59 +116,62 @@ curl -X POST https://example.com/v1/chat/completions \
 }
 ```
 
-插件会从token的`id`字段提取用户ID作为配额限制的key。
+The plugin will extract the user ID from the `id` field of the token as the key for quota limiting.
 
-## API接口
+## API Reference
 
-### 用户配额检查
+### User Quota Check
 
-**路径**: `/v1/chat/completions`
+**Path**: `/v1/chat/completions`
 
-**方法**: POST
+**Method**: POST
 
-**请求头**:
-- `Authorization`: JWT token，用于用户身份验证
-- `x-quota-identity`: 可选，值为"user"时触发配额扣减
+**Headers**:
+- `Authorization`: JWT token for user authentication
+- `x-quota-identity`: Optional, triggers quota deduction when value is "true"
 
-**行为**:
-1. 从JWT token中提取用户ID
-2. 如果启用了 `check_github_star`，检查用户的GitHub关注状态（`{redis_star_prefix}{user_id}` 必须为 "true"）
-3. 从请求体中提取模型名称
-4. 根据 `model_quota_weights` 配置确定所需配额
-5. 检查用户的剩余配额是否足够（总数 - 已使用量 >= 所需配额）
-6. 如果配额足够且包含扣减触发头，则按模型权重扣减配额
-7. 如果模型未配置权重，则不扣减配额直接放行
+**Behavior**:
+1. Extract user ID from JWT token
+2. If `check_github_star` is enabled, check user's GitHub star status (`{redis_star_prefix}{user_id}` must be "true")
+3. Check user's remaining quota (total - used)
+4. Allow request to proceed if remaining quota > 0
+5. Increment used quota by 1 if deduction trigger header is present
 
-**GitHub关注检查**:
-- 当 `check_github_star` 设置为 `true` 时，会首先检查用户是否关注了GitHub项目
-- 如果Redis中 `{redis_star_prefix}{user_id}` 的值不是 "true"，将返回403错误，提示用户需要关注 https://github.com/zgsm-ai/zgsm 项目
-- 只有通过GitHub关注检查后，才会继续进行配额检查和扣减
+**GitHub Star Check**:
+- When `check_github_star` is set to `true`, the system will first check if the user has starred the GitHub project
+- If the value of `{redis_star_prefix}{user_id}` in Redis is not "true", a 403 error will be returned, prompting the user to star https://github.com/zgsm-ai/zgsm project
+- Only after passing the GitHub star check will the system proceed with quota check and deduction
 
-### 管理接口
+### Management APIs
 
-所有管理接口都需要在请求头中包含管理员认证信息：
+All management APIs require admin authentication header:
 ```
 x-admin-key: your-admin-secret-key
 ```
 
-#### 配额总数管理
+#### Total Quota Management
 
-##### 查询配额总数
+##### Query Total Quota
 ```bash
 curl -H "x-admin-key: your-admin-secret" \
   "https://example.com/v1/chat/completions/quota?user_id=user123"
 ```
 
-**响应示例**:
+**Response Example**:
 ```json
 {
-  "user_id": "user123",
-  "quota": 10000,
-  "type": "total_quota"
+  "code": "ai-gateway.queryquota",
+  "message": "query quota successful",
+  "success": true,
+  "data": {
+    "user_id": "user123",
+    "quota": 10000,
+    "type": "total_quota"
+  }
 }
 ```
 
-##### 刷新配额总数
+##### Refresh Total Quota
 ```bash
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
@@ -239,16 +180,16 @@ curl -X POST \
   "https://example.com/v1/chat/completions/quota/refresh"
 ```
 
-##### 增减配额总数
+##### Delta Total Quota
 ```bash
-# 增加配额
+# Increase quota
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "user_id=user123&value=100" \
   "https://example.com/v1/chat/completions/quota/delta"
 
-# 减少配额
+# Decrease quota
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
@@ -256,24 +197,29 @@ curl -X POST \
   "https://example.com/v1/chat/completions/quota/delta"
 ```
 
-#### 已使用量管理
+#### Used Quota Management
 
-##### 查询已使用量
+##### Query Used Quota
 ```bash
 curl -H "x-admin-key: your-admin-secret" \
   "https://example.com/v1/chat/completions/quota/used?user_id=user123"
 ```
 
-**响应示例**:
+**Response Example**:
 ```json
 {
-  "user_id": "user123",
-  "quota": 2500,
-  "type": "used_quota"
+  "code": "ai-gateway.queryquota",
+  "message": "query quota successful",
+  "success": true,
+  "data": {
+    "user_id": "user123",
+    "quota": 2500,
+    "type": "used_quota"
+  }
 }
 ```
 
-##### 刷新已使用量
+##### Refresh Used Quota
 ```bash
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
@@ -282,16 +228,16 @@ curl -X POST \
   "https://example.com/v1/chat/completions/quota/used/refresh"
 ```
 
-##### 增减已使用量
+##### Delta Used Quota
 ```bash
-# 增加已使用量
+# Increase used quota
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "user_id=user123&value=10" \
   "https://example.com/v1/chat/completions/quota/used/delta"
 
-# 减少已使用量
+# Decrease used quota
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
@@ -299,33 +245,38 @@ curl -X POST \
   "https://example.com/v1/chat/completions/quota/used/delta"
 ```
 
-#### GitHub关注状态管理
+#### GitHub Star Status Management
 
-##### 查询GitHub关注状态
+##### Query GitHub Star Status
 ```bash
 curl -H "x-admin-key: your-admin-secret" \
   "https://example.com/v1/chat/completions/quota/star?user_id=user123"
 ```
 
-**响应示例**:
+**Response Example**:
 ```json
 {
-  "user_id": "user123",
-  "star_value": "true",
-  "type": "star_status"
+  "code": "ai-gateway.querystar",
+  "message": "query star status successful",
+  "success": true,
+  "data": {
+    "user_id": "user123",
+    "star_value": "true",
+    "type": "star_status"
+  }
 }
 ```
 
-##### 设置GitHub关注状态
+##### Set GitHub Star Status
 ```bash
-# 设置为已关注
+# Set as starred
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "user_id=user123&star_value=true" \
   "https://example.com/v1/chat/completions/quota/star/set"
 
-# 设置为未关注
+# Set as not starred
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
@@ -333,13 +284,13 @@ curl -X POST \
   "https://example.com/v1/chat/completions/quota/star/set"
 ```
 
-**参数说明**:
-- `user_id`: 用户ID（必填）
-- `star_value`: 关注状态，只能是 "true" 或 "false"（必填）
+**Parameter Description**:
+- `user_id`: User ID (required)
+- `star_value`: Star status, must be "true" or "false" (required)
 
-## 使用示例
+## Usage Examples
 
-### 正常的AI请求（不扣减配额）
+### Normal AI Request (No Quota Deduction)
 ```bash
 curl "https://example.com/v1/chat/completions" \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
@@ -350,7 +301,7 @@ curl "https://example.com/v1/chat/completions" \
   }'
 ```
 
-### 扣减配额的AI请求
+### AI Request with Quota Deduction
 ```bash
 curl "https://example.com/v1/chat/completions" \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
@@ -362,29 +313,46 @@ curl "https://example.com/v1/chat/completions" \
   }'
 ```
 
-## 错误处理
+## Error Handling
 
-### 常见错误响应
+### Common Error Responses
 
-| 状态码 | 错误代码 | 说明 |
-|--------|----------|------|
-| 401 | `ai-quota.no_token` | 未提供JWT token |
-| 401 | `ai-quota.invalid_token` | JWT token格式无效 |
-| 401 | `ai-quota.token_parse_failed` | JWT token解析失败 |
-| 401 | `ai-quota.no_userid` | JWT token中未找到用户ID |
-| 403 | `ai-quota.unauthorized` | 管理接口认证失败 |
-| 403 | `ai-quota.star_required` | 需要先关注GitHub项目 |
-| 403 | `ai-quota.noquota` | 配额不足 |
-| 400 | `ai-quota.invalid_params` | 请求参数无效 |
-| 503 | `ai-quota.error` | Redis连接错误 |
+| Status Code | Error Code | Description |
+|-------------|------------|-------------|
+| 401 | `ai-gateway.no_token` | JWT token not provided |
+| 401 | `ai-gateway.invalid_token` | Invalid JWT token format |
+| 401 | `ai-gateway.token_parse_failed` | JWT token parsing failed |
+| 401 | `ai-gateway.no_userid` | User ID not found in JWT token |
+| 403 | `ai-gateway.unauthorized` | Management API authentication failed |
+| 403 | `ai-gateway.star_required` | Need to star the GitHub project first |
+| 403 | `ai-gateway.noquota` | Insufficient quota |
+| 400 | `ai-gateway.invalid_params` | Invalid request parameters |
+| 503 | `ai-gateway.error` | Redis connection error |
 
-## 注意事项
+**Error Response Example**:
+```json
+{
+  "code": "ai-gateway.noquota",
+  "message": "Request denied by ai quota check, insufficient quota. Required: 1, Remaining: 0",
+  "success": false
+}
+```
 
-1. **JWT格式要求**: JWT token必须包含用户ID信息，插件会从token的claims中提取`id`字段
-2. **Redis连接**: 确保Redis服务可用，插件依赖Redis存储配额信息
-3. **管理接口安全**: 管理接口的认证密钥需要妥善保管，避免泄露
-4. **配额精度**: 配额计算基于整数，不支持小数
-5. **并发安全**: 插件支持高并发场景下的配额管理
+**Success Response Example**:
+```json
+{
+  "code": "ai-gateway.refreshquota",
+  "message": "refresh quota successful",
+  "success": true
+}
+```
 
-注意：管理操作不需要携带JWT token，只需要在指定的请求头中提供正确的管理密钥即可。
+## Important Notes
 
+1. **JWT Format Requirements**: JWT token must contain user ID information; the plugin extracts the `id` field from token claims
+2. **Redis Connection**: Ensure Redis service availability; the plugin depends on Redis for quota storage
+3. **Management API Security**: Keep admin authentication keys secure to prevent unauthorized access
+4. **Quota Precision**: Quota calculations are integer-based; decimal values are not supported
+5. **Concurrency Safety**: The plugin supports quota management in high-concurrency scenarios
+
+Note: Administrative operations do not require carrying JWT tokens, only need to provide the correct administrative secret key in the specified request header.
