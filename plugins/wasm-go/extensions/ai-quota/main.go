@@ -416,53 +416,65 @@ func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, qu
 
 	// First get total quota
 	config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
-		if err := totalResponse.Error(); err != nil {
-			sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", "Request denied by ai quota check, No quota available", false, nil)
-			return
-		}
-
-		totalQuota := 0
-		if !totalResponse.IsNull() {
-			totalQuota = totalResponse.Integer()
-		}
-
-		if totalQuota <= 0 {
-			sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", "Request denied by ai quota check, No quota available", false, nil)
-			return
-		}
-
-		// Then get used quota
-		config.redisClient.Get(usedKey, func(usedResponse resp.Value) {
-			usedQuota := 0
-			if err := usedResponse.Error(); err == nil && !usedResponse.IsNull() {
-				usedQuota = usedResponse.Integer()
-			}
-
-			remainingQuota := totalQuota - usedQuota
-			log.Debugf("User %s: totalQuota:%d usedQuota:%d remainingQuota:%d requiredQuota:%d", userId, totalQuota, usedQuota, remainingQuota, quotaWeight)
-
-			if remainingQuota < quotaWeight {
-				sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", fmt.Sprintf("Request denied by ai quota check, insufficient quota. Required: %d, Remaining: %d", quotaWeight, remainingQuota), false, nil)
-				return
-			}
-
-			// Check if we need to deduct quota based on header
-			deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.DeductHeader)
-			if err == nil && deductHeaderValue == config.DeductHeaderValue {
-				// Increment used quota by the model's quota weight
-				config.redisClient.IncrBy(usedKey, quotaWeight, func(response resp.Value) {
-					if err := response.Error(); err != nil {
-						log.Errorf("Failed to deduct quota: %v", err)
-					} else {
-						log.Debugf("Successfully deducted %d quota for user %s, model %s", quotaWeight, userId, modelName)
-					}
-					proxywasm.ResumeHttpRequest()
-				})
-			} else {
-				proxywasm.ResumeHttpRequest()
-			}
-		})
+		handleTotalQuotaResponse(ctx, config, usedKey, totalResponse, userId, quotaWeight, modelName, log)
 	})
+}
+
+func handleTotalQuotaResponse(ctx wrapper.HttpContext, config QuotaConfig, usedKey string, totalResponse resp.Value, userId string, quotaWeight int, modelName string, log wrapper.Log) {
+	if err := totalResponse.Error(); err != nil {
+		sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", "Request denied by ai quota check, No quota available", false, nil)
+		return
+	}
+
+	totalQuota := 0
+	if !totalResponse.IsNull() {
+		totalQuota = totalResponse.Integer()
+	}
+
+	if totalQuota <= 0 {
+		sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", "Request denied by ai quota check, No quota available", false, nil)
+		return
+	}
+
+	// Then get used quota
+	config.redisClient.Get(usedKey, func(usedResponse resp.Value) {
+		handleUsedQuotaResponse(ctx, config, usedKey, usedResponse, totalQuota, userId, quotaWeight, modelName, log)
+	})
+}
+
+func handleUsedQuotaResponse(ctx wrapper.HttpContext, config QuotaConfig, usedKey string, usedResponse resp.Value, totalQuota int, userId string, quotaWeight int, modelName string, log wrapper.Log) {
+	usedQuota := 0
+	if err := usedResponse.Error(); err == nil && !usedResponse.IsNull() {
+		usedQuota = usedResponse.Integer()
+	}
+
+	remainingQuota := totalQuota - usedQuota
+	log.Debugf("User %s: totalQuota:%d usedQuota:%d remainingQuota:%d requiredQuota:%d", userId, totalQuota, usedQuota, remainingQuota, quotaWeight)
+
+	if remainingQuota < quotaWeight {
+		sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", fmt.Sprintf("Request denied by ai quota check, insufficient quota. Required: %d, Remaining: %d", quotaWeight, remainingQuota), false, nil)
+		return
+	}
+
+	// Check if we need to deduct quota based on header
+	deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.DeductHeader)
+	if err == nil && deductHeaderValue == config.DeductHeaderValue {
+		// Increment used quota by the model's quota weight
+		config.redisClient.IncrBy(usedKey, quotaWeight, func(response resp.Value) {
+			handleQuotaDeductionResponse(response, quotaWeight, userId, modelName, log)
+		})
+	} else {
+		proxywasm.ResumeHttpRequest()
+	}
+}
+
+func handleQuotaDeductionResponse(response resp.Value, quotaWeight int, userId string, modelName string, log wrapper.Log) {
+	if err := response.Error(); err != nil {
+		log.Errorf("Failed to deduct quota: %v", err)
+	} else {
+		log.Debugf("Successfully deducted %d quota for user %s, model %s", quotaWeight, userId, modelName)
+	}
+	proxywasm.ResumeHttpRequest()
 }
 
 func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool, log wrapper.Log) []byte {

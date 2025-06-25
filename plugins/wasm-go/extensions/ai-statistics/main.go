@@ -76,10 +76,12 @@ const (
 
 // AuthUser struct for parsing user info from JWT token
 type AuthUser struct {
-	ID     string `json:"universal_id"`
-	Name   string `json:"name"`
-	Github string `json:"github"`
-	Phone  string `json:"phone"`
+	ID          string                 `json:"universal_id"`
+	Name        string                 `json:"name"`
+	Github      string                 `json:"github"`
+	Phone       string                 `json:"phone"`
+	PhoneNumber string                 `json:"phone_number"`
+	Properties  map[string]interface{} `json:"properties"`
 }
 
 // TracingSpan is the tracing span configuration.
@@ -219,17 +221,45 @@ func parseUserInfoFromToken(accessToken string) (*AuthUser, error) {
 	return &userInfo, nil
 }
 
-// generateUserName generates user name based on priority: name > github > phone
+// generateUserName generates user name based on priority:
+// 1. oauth_Custom_id + oauth_Custom_username (highest priority)
+// 2. oauth_GitHub_username (second priority)
+// 3. phone (third priority)
+// 4. name (fourth priority)
 func generateUserName(userInfo *AuthUser) string {
-	if userInfo.Name != "" {
-		return userInfo.Name
+	// Priority 1: oauth_Custom_id + oauth_Custom_username
+	if userInfo.Properties != nil {
+		if customID, exists := userInfo.Properties["oauth_Custom_id"]; exists {
+			if customUsername, exists := userInfo.Properties["oauth_Custom_username"]; exists {
+				if customIDStr, ok := customID.(string); ok && customIDStr != "" {
+					if customUsernameStr, ok := customUsername.(string); ok && customUsernameStr != "" {
+						return fmt.Sprintf("%s%s", customUsernameStr, customIDStr)
+					}
+				}
+			}
+		}
+
+		// Priority 2: oauth_GitHub_username
+		if githubUsername, exists := userInfo.Properties["oauth_GitHub_username"]; exists {
+			if githubUsernameStr, ok := githubUsername.(string); ok && githubUsernameStr != "" {
+				return githubUsernameStr
+			}
+		}
 	}
-	if userInfo.Github != "" {
-		return userInfo.Github
+
+	// Priority 3: phone (check both phone_number and phone fields)
+	if userInfo.PhoneNumber != "" {
+		return userInfo.PhoneNumber
 	}
 	if userInfo.Phone != "" {
 		return userInfo.Phone
 	}
+
+	// Priority 4: name
+	if userInfo.Name != "" {
+		return userInfo.Name
+	}
+
 	return "undefined"
 }
 
