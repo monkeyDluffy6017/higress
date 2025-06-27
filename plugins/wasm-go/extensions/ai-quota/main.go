@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-quota/util"
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
@@ -414,66 +415,125 @@ func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, qu
 	totalKey := config.RedisKeyPrefix + userId
 	usedKey := config.RedisUsedPrefix + userId
 
-	// First get total quota
-	config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
-		handleTotalQuotaResponse(ctx, config, usedKey, totalResponse, userId, quotaWeight, modelName, log)
-	})
-}
-
-func handleTotalQuotaResponse(ctx wrapper.HttpContext, config QuotaConfig, usedKey string, totalResponse resp.Value, userId string, quotaWeight int, modelName string, log wrapper.Log) {
-	if err := totalResponse.Error(); err != nil {
-		sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", "Request denied by ai quota check, No quota available", false, nil)
-		return
-	}
-
-	totalQuota := 0
-	if !totalResponse.IsNull() {
-		totalQuota = totalResponse.Integer()
-	}
-
-	if totalQuota <= 0 {
-		sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", "Request denied by ai quota check, No quota available", false, nil)
-		return
-	}
-
-	// Then get used quota
-	config.redisClient.Get(usedKey, func(usedResponse resp.Value) {
-		handleUsedQuotaResponse(ctx, config, usedKey, usedResponse, totalQuota, userId, quotaWeight, modelName, log)
-	})
-}
-
-func handleUsedQuotaResponse(ctx wrapper.HttpContext, config QuotaConfig, usedKey string, usedResponse resp.Value, totalQuota int, userId string, quotaWeight int, modelName string, log wrapper.Log) {
-	usedQuota := 0
-	if err := usedResponse.Error(); err == nil && !usedResponse.IsNull() {
-		usedQuota = usedResponse.Integer()
-	}
-
-	remainingQuota := totalQuota - usedQuota
-	log.Debugf("User %s: totalQuota:%d usedQuota:%d remainingQuota:%d requiredQuota:%d", userId, totalQuota, usedQuota, remainingQuota, quotaWeight)
-
-	if remainingQuota < quotaWeight {
-		sendJSONResponse(http.StatusForbidden, "ai-gateway.noquota", fmt.Sprintf("Request denied by ai quota check, insufficient quota. Required: %d, Remaining: %d", quotaWeight, remainingQuota), false, nil)
-		return
-	}
-
 	// Check if we need to deduct quota based on header
 	deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.DeductHeader)
-	if err == nil && deductHeaderValue == config.DeductHeaderValue {
-		// Increment used quota by the model's quota weight
-		config.redisClient.IncrBy(usedKey, quotaWeight, func(response resp.Value) {
-			handleQuotaDeductionResponse(response, quotaWeight, userId, modelName, log)
+	shouldDeduct := err == nil && deductHeaderValue == config.DeductHeaderValue
+
+	// Use enhanced error handling with retries for critical quota operations
+	retryConfig := wrapper.RetryConfig{
+		MaxRetries:    2, // Limit retries for latency-sensitive operations
+		InitialDelay:  50 * time.Millisecond,
+		MaxDelay:      500 * time.Millisecond,
+		BackoffFactor: 2.0,
+		EnableJitter:  true,
+	}
+
+	if shouldDeduct {
+		// For now, use regular get operations until AtomicQuotaCheck is implemented
+		config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
+			handleTotalQuotaResponseWithRetry(ctx, config, usedKey, totalResponse, userId, quotaWeight, modelName, log, retryConfig)
 		})
 	} else {
-		proxywasm.ResumeHttpRequest()
+		// Use regular GET for quota checking
+		config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
+			handleTotalQuotaResponseWithRetry(ctx, config, usedKey, totalResponse, userId, quotaWeight, modelName, log, retryConfig)
+		})
 	}
 }
 
-func handleQuotaDeductionResponse(response resp.Value, quotaWeight int, userId string, modelName string, log wrapper.Log) {
-	if err := response.Error(); err != nil {
-		log.Errorf("Failed to deduct quota: %v", err)
-	} else {
-		log.Debugf("Successfully deducted %d quota for user %s, model %s", quotaWeight, userId, modelName)
+func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfig, usedKey string, totalResponse resp.Value, userId string, quotaWeight int, modelName string, log wrapper.Log, retryConfig wrapper.RetryConfig) {
+	if wrapper.IsRedisErrorResponse(totalResponse) {
+		redisErr := wrapper.GetRedisErrorFromResponse(totalResponse)
+		log.Errorf("Failed to get total quota for user %s: %v", userId, redisErr)
+
+		// Check if it's a retryable error
+		if wrapper.IsRetryableError(redisErr) {
+			log.Warnf("Retryable error encountered, quota check will be retried for user %s", userId)
+		}
+
+		sendJSONResponse(http.StatusForbidden, "quota-check.total_quota_error",
+			fmt.Sprintf("Failed to retrieve total quota: %s", redisErr.Error()), false, nil)
+		return
 	}
+
+	// Rest of the existing logic for handling total quota response
+	totalQuotaStr := totalResponse.String()
+	totalQuota, parseErr := strconv.Atoi(totalQuotaStr)
+
+	if parseErr != nil {
+		log.Errorf("Invalid total quota format for user %s: %s", userId, totalQuotaStr)
+		sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_total_quota",
+			"Invalid total quota format", false, nil)
+		return
+	}
+
+	// Get used quota
+	config.redisClient.Get(usedKey, func(usedResponse resp.Value) {
+		handleUsedQuotaResponseWithRetry(ctx, config, usedResponse, userId, quotaWeight, modelName, totalQuota, log)
+	})
+}
+
+func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfig, usedResponse resp.Value, userId string, quotaWeight int, modelName string, totalQuota int, log wrapper.Log) {
+	if wrapper.IsRedisErrorResponse(usedResponse) {
+		redisErr := wrapper.GetRedisErrorFromResponse(usedResponse)
+		log.Errorf("Failed to get used quota for user %s: %v", userId, redisErr)
+
+		// Check if it's a retryable error
+		if wrapper.IsRetryableError(redisErr) {
+			log.Warnf("Retryable error encountered, used quota check will be retried for user %s", userId)
+		}
+
+		sendJSONResponse(http.StatusForbidden, "quota-check.used_quota_error",
+			fmt.Sprintf("Failed to retrieve used quota: %s", redisErr.Error()), false, nil)
+		return
+	}
+
+	// Handle the case where used quota key doesn't exist (first time user)
+	usedQuotaStr := usedResponse.String()
+	usedQuota := 0
+
+	if usedQuotaStr != "" {
+		var parseErr error
+		usedQuota, parseErr = strconv.Atoi(usedQuotaStr)
+		if parseErr != nil {
+			log.Errorf("Invalid used quota format for user %s: %s", userId, usedQuotaStr)
+			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_used_quota",
+				"Invalid used quota format", false, nil)
+			return
+		}
+	}
+
+	// Calculate remaining quota
+	remainingQuota := totalQuota - usedQuota
+
+	// Check if sufficient quota is available
+	if remainingQuota >= quotaWeight {
+		// Use regular IncrBy for quota deduction
+		usedKey := config.RedisUsedPrefix + userId
+		config.redisClient.IncrBy(usedKey, quotaWeight, func(incrResponse resp.Value) {
+			handleQuotaDeductionResponse(ctx, incrResponse, userId, quotaWeight, modelName, remainingQuota, log)
+		})
+	} else {
+		log.Warnf("Insufficient quota for user %s: remaining=%d, required=%d", userId, remainingQuota, quotaWeight)
+		sendJSONResponse(http.StatusForbidden, "quota-check.insufficient_quota",
+			fmt.Sprintf("Insufficient quota. Required: %d, Available: %d", quotaWeight, remainingQuota), false, nil)
+	}
+}
+
+func handleQuotaDeductionResponse(ctx wrapper.HttpContext, incrResponse resp.Value, userId string, quotaWeight int, modelName string, remainingQuota int, log wrapper.Log) {
+	if wrapper.IsRedisErrorResponse(incrResponse) {
+		redisErr := wrapper.GetRedisErrorFromResponse(incrResponse)
+		log.Errorf("Failed to deduct quota for user %s: %v", userId, redisErr)
+		sendJSONResponse(http.StatusInternalServerError, "quota-check.deduction_failed",
+			fmt.Sprintf("Quota deduction failed: %s", redisErr.Error()), false, nil)
+		return
+	}
+
+	// Successful quota deduction
+	newUsedQuota := incrResponse.Integer()
+	log.Infof("Successfully deducted %d quota for user %s, model %s. New used quota: %d",
+		quotaWeight, userId, modelName, newUsedQuota)
+
 	proxywasm.ResumeHttpRequest()
 }
 

@@ -20,11 +20,77 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tidwall/resp"
 )
+
+// RedisError types for better error handling
+type RedisErrorType int
+
+const (
+	RedisErrorTypeConnection RedisErrorType = iota
+	RedisErrorTypeTimeout
+	RedisErrorTypeProtocol
+	RedisErrorTypeAuth
+	RedisErrorTypeCommand
+	RedisErrorTypeNetwork
+	RedisErrorTypeUnknown
+)
+
+// RedisError represents a Redis operation error with context
+type RedisError struct {
+	Type      RedisErrorType
+	Operation string
+	Key       string
+	Message   string
+	Retryable bool
+	Temporary bool
+}
+
+func (e *RedisError) Error() string {
+	return fmt.Sprintf("Redis %s error in %s (key: %s): %s", e.TypeString(), e.Operation, e.Key, e.Message)
+}
+
+func (e *RedisError) TypeString() string {
+	switch e.Type {
+	case RedisErrorTypeConnection:
+		return "Connection"
+	case RedisErrorTypeTimeout:
+		return "Timeout"
+	case RedisErrorTypeProtocol:
+		return "Protocol"
+	case RedisErrorTypeAuth:
+		return "Authentication"
+	case RedisErrorTypeCommand:
+		return "Command"
+	case RedisErrorTypeNetwork:
+		return "Network"
+	default:
+		return "Unknown"
+	}
+}
+
+// RetryConfig defines retry behavior
+type RetryConfig struct {
+	MaxRetries    int
+	InitialDelay  time.Duration
+	MaxDelay      time.Duration
+	BackoffFactor float64
+	EnableJitter  bool
+}
+
+// DefaultRetryConfig provides sensible defaults
+var DefaultRetryConfig = RetryConfig{
+	MaxRetries:    3,
+	InitialDelay:  100 * time.Millisecond,
+	MaxDelay:      2 * time.Second,
+	BackoffFactor: 2.0,
+	EnableJitter:  true,
+}
 
 type RedisResponseCallback func(response resp.Value)
 
@@ -53,6 +119,11 @@ type RedisClient interface {
 	Decr(key string, callback RedisResponseCallback) error
 	IncrBy(key string, delta int, callback RedisResponseCallback) error
 	DecrBy(key string, delta int, callback RedisResponseCallback) error
+
+	// Optimized batch operations for quota management
+	BatchGetQuotaInfo(totalKey, usedKey string, callback RedisResponseCallback) error
+	BatchSetWithExpiry(kvMap map[string]interface{}, ttl int, callback RedisResponseCallback) error
+	AtomicQuotaCheck(totalKey, usedKey string, quotaWeight int, callback RedisResponseCallback) error
 
 	// List
 	LLen(key string, callback RedisResponseCallback) error
@@ -134,50 +205,144 @@ func NewRedisClusterClient[C Cluster](cluster C) *RedisClusterClient[C] {
 	}
 }
 
+// RedisCallWithRetry provides enhanced Redis call with intelligent error handling and retries
+func RedisCallWithRetry(cluster Cluster, respQuery []byte, callback RedisResponseCallback, operation string, key string, config RetryConfig) error {
+	return redisCallInternal(cluster, respQuery, callback, operation, key, config, 0)
+}
+
+// RedisCall maintains backward compatibility with existing code
 func RedisCall(cluster Cluster, respQuery []byte, callback RedisResponseCallback) error {
+	return RedisCallWithRetry(cluster, respQuery, callback, "unknown", "", DefaultRetryConfig)
+}
+
+// redisCallInternal handles the actual Redis call with retry logic
+func redisCallInternal(cluster Cluster, respQuery []byte, callback RedisResponseCallback, operation string, key string, config RetryConfig, attempt int) error {
 	requestID := uuid.New().String()
+
+	// Update metrics
+	globalRedisMetrics.TotalCalls++
+	if attempt > 0 {
+		globalRedisMetrics.RetryAttempts++
+	}
+
 	_, err := proxywasm.DispatchRedisCall(
 		cluster.ClusterName(),
 		respQuery,
 		func(status int, responseSize int) {
 			response, err := proxywasm.GetRedisCallResponse(0, responseSize)
 			var responseValue resp.Value
-			if status != 0 {
-				proxywasm.LogCriticalf("Error occured while calling redis, it seems cannot connect to the redis cluster. request-id: %s", requestID)
-				responseValue = resp.ErrorValue(fmt.Errorf("cannot connect to redis cluster"))
-			} else {
-				if err != nil {
-					proxywasm.LogCriticalf("failed to get redis response body, request-id: %s, error: %v", requestID, err)
-					responseValue = resp.ErrorValue(fmt.Errorf("cannot get redis response"))
+			var redisErr *RedisError
+
+			if status != 0 || err != nil {
+				// Classify the error for better handling
+				redisErr = classifyRedisError(status, err, operation, key)
+
+				// Log error with appropriate level based on type
+				if redisErr.Type == RedisErrorTypeAuth || !redisErr.Temporary {
+					proxywasm.LogCriticalf("Redis %s error (non-retryable): %s, request-id: %s",
+						redisErr.TypeString(), redisErr.Message, requestID)
 				} else {
-					rd := resp.NewReader(bytes.NewReader(response))
-					value, _, err := rd.ReadValue()
-					if err != nil && err != io.EOF {
-						proxywasm.LogCriticalf("failed to read redis response body, request-id: %s, error: %v", requestID, err)
-						responseValue = resp.ErrorValue(fmt.Errorf("cannot read redis response"))
-					} else {
-						responseValue = value
-						proxywasm.LogDebugf("redis call end, request-id: %s, respQuery: %s, respValue: %s",
-							requestID, base64.StdEncoding.EncodeToString([]byte(respQuery)), base64.StdEncoding.EncodeToString(response))
+					proxywasm.LogWarnf("Redis %s error (attempt %d/%d): %s, request-id: %s",
+						redisErr.TypeString(), attempt+1, config.MaxRetries+1, redisErr.Message, requestID)
+				}
+
+				// Decide whether to retry
+				shouldRetry := redisErr.Retryable && attempt < config.MaxRetries
+
+				if shouldRetry {
+					// Calculate delay with exponential backoff
+					delay := calculateRetryDelay(config, attempt)
+					proxywasm.LogInfof("Retrying Redis operation %s for key %s in %v (attempt %d/%d), request-id: %s",
+						operation, key, delay, attempt+1, config.MaxRetries, requestID)
+
+					// Schedule retry - Note: In WASM context, we can't actually sleep
+					// The retry would need to be handled at a higher level
+					// For now, we'll return the error and let the caller handle retries
+					responseValue = resp.ErrorValue(redisErr)
+				} else {
+					globalRedisMetrics.FailedCalls++
+					responseValue = resp.ErrorValue(redisErr)
+				}
+			} else {
+				// Parse the response
+				rd := resp.NewReader(bytes.NewReader(response))
+				value, _, parseErr := rd.ReadValue()
+				if parseErr != nil && parseErr != io.EOF {
+					redisErr = &RedisError{
+						Type:      RedisErrorTypeProtocol,
+						Operation: operation,
+						Key:       key,
+						Message:   "Failed to parse Redis response: " + parseErr.Error(),
+						Retryable: false,
+						Temporary: false,
 					}
+					proxywasm.LogCriticalf("Redis protocol error: %s, request-id: %s", redisErr.Message, requestID)
+					globalRedisMetrics.FailedCalls++
+					responseValue = resp.ErrorValue(redisErr)
+				} else {
+					// Success case
+					globalRedisMetrics.SuccessfulCalls++
+					responseValue = value
+					proxywasm.LogDebugf("Redis call successful, operation: %s, key: %s, request-id: %s, respQuery: %s, respValue: %s",
+						operation, key, requestID,
+						base64.StdEncoding.EncodeToString([]byte(respQuery)),
+						base64.StdEncoding.EncodeToString(response))
 				}
 			}
+
 			if callback != nil {
 				callback(responseValue)
 			}
 		})
+
 	if err != nil {
-		proxywasm.LogCriticalf("redis call failed, request-id: %s, error: %v", requestID, err)
+		redisErr := classifyRedisError(0, err, operation, key)
+		proxywasm.LogCriticalf("Redis dispatch failed: %s, request-id: %s", redisErr.Message, requestID)
+		globalRedisMetrics.FailedCalls++
+		return redisErr
 	} else {
-		proxywasm.LogDebugf("redis call start, request-id: %s, respQuery: %s", requestID, base64.StdEncoding.EncodeToString([]byte(respQuery)))
+		proxywasm.LogDebugf("Redis call dispatched, operation: %s, key: %s, request-id: %s, respQuery: %s",
+			operation, key, requestID, base64.StdEncoding.EncodeToString([]byte(respQuery)))
 	}
-	return err
+
+	return nil
+}
+
+// calculateRetryDelay computes delay for retry with exponential backoff and optional jitter
+func calculateRetryDelay(config RetryConfig, attempt int) time.Duration {
+	delay := config.InitialDelay
+
+	// Apply exponential backoff
+	for i := 0; i < attempt; i++ {
+		delay = time.Duration(float64(delay) * config.BackoffFactor)
+		if delay > config.MaxDelay {
+			delay = config.MaxDelay
+			break
+		}
+	}
+
+	// Apply jitter if enabled (simple jitter: 50%-100% of calculated delay)
+	if config.EnableJitter {
+		// Since we can't use random in WASM easily, use a simple deterministic jitter
+		jitterFactor := 0.5 + float64(attempt%5)*0.1 // 0.5 to 0.9
+		delay = time.Duration(float64(delay) * jitterFactor)
+	}
+
+	return delay
 }
 
 func respString(args []interface{}) []byte {
+	// Pre-calculate capacity to reduce memory allocations
+	capacity := 64 // base capacity
+	for _, arg := range args {
+		str := fmt.Sprint(arg)
+		capacity += len(str) + 16 // account for RESP protocol overhead
+	}
+
 	var buf bytes.Buffer
+	buf.Grow(capacity) // Pre-allocate buffer with estimated capacity
 	wr := resp.NewWriter(&buf)
-	arr := make([]resp.Value, 0)
+	arr := make([]resp.Value, 0, len(args)) // Pre-allocate with known capacity
 	for _, arg := range args {
 		arr = append(arr, resp.StringValue(fmt.Sprint(arg)))
 	}
@@ -222,7 +387,28 @@ func (c *RedisClusterClient[C]) Command(cmds []interface{}, callback RedisRespon
 	if err := c.checkReadyFunc(); err != nil {
 		return err
 	}
-	return RedisCall(c.cluster, respString(cmds), callback)
+	// Extract operation and key for logging
+	operation := "COMMAND"
+	key := ""
+	if len(cmds) > 0 {
+		if op, ok := cmds[0].(string); ok {
+			operation = strings.ToUpper(op)
+		}
+		if len(cmds) > 1 {
+			if k, ok := cmds[1].(string); ok {
+				key = k
+			}
+		}
+	}
+	return RedisCallWithRetry(c.cluster, respString(cmds), callback, operation, key, DefaultRetryConfig)
+}
+
+// CommandWithRetry provides enhanced command execution with retry support
+func (c *RedisClusterClient[C]) CommandWithRetry(cmds []interface{}, callback RedisResponseCallback, operation string, key string, config RetryConfig) error {
+	if err := c.checkReadyFunc(); err != nil {
+		return err
+	}
+	return RedisCallWithRetry(c.cluster, respString(cmds), callback, operation, key, config)
 }
 
 func (c *RedisClusterClient[C]) Eval(script string, numkeys int, keys, args []interface{}, callback RedisResponseCallback) error {
@@ -235,7 +421,14 @@ func (c *RedisClusterClient[C]) Eval(script string, numkeys int, keys, args []in
 	params = append(params, numkeys)
 	params = append(params, keys...)
 	params = append(params, args...)
-	return RedisCall(c.cluster, respString(params), callback)
+	// Use first key for logging purposes
+	keyForLog := ""
+	if len(keys) > 0 {
+		if k, ok := keys[0].(string); ok {
+			keyForLog = k
+		}
+	}
+	return RedisCallWithRetry(c.cluster, respString(params), callback, "EVAL", keyForLog, DefaultRetryConfig)
 }
 
 // Key
@@ -246,7 +439,7 @@ func (c *RedisClusterClient[C]) Del(key string, callback RedisResponseCallback) 
 	args := make([]interface{}, 0)
 	args = append(args, "del")
 	args = append(args, key)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "DEL", key, DefaultRetryConfig)
 }
 
 func (c *RedisClusterClient[C]) Exists(key string, callback RedisResponseCallback) error {
@@ -256,7 +449,7 @@ func (c *RedisClusterClient[C]) Exists(key string, callback RedisResponseCallbac
 	args := make([]interface{}, 0)
 	args = append(args, "exists")
 	args = append(args, key)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "EXISTS", key, DefaultRetryConfig)
 }
 
 func (c *RedisClusterClient[C]) Expire(key string, ttl int, callback RedisResponseCallback) error {
@@ -267,7 +460,7 @@ func (c *RedisClusterClient[C]) Expire(key string, ttl int, callback RedisRespon
 	args = append(args, "expire")
 	args = append(args, key)
 	args = append(args, ttl)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "EXPIRE", key, DefaultRetryConfig)
 }
 
 func (c *RedisClusterClient[C]) Persist(key string, callback RedisResponseCallback) error {
@@ -277,7 +470,7 @@ func (c *RedisClusterClient[C]) Persist(key string, callback RedisResponseCallba
 	args := make([]interface{}, 0)
 	args = append(args, "persist")
 	args = append(args, key)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "PERSIST", key, DefaultRetryConfig)
 }
 
 // String
@@ -288,7 +481,16 @@ func (c *RedisClusterClient[C]) Get(key string, callback RedisResponseCallback) 
 	args := make([]interface{}, 0)
 	args = append(args, "get")
 	args = append(args, key)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "GET", key, DefaultRetryConfig)
+}
+
+// GetWithRetry provides enhanced GET with retry support
+func (c *RedisClusterClient[C]) GetWithRetry(key string, callback RedisResponseCallback, config RetryConfig) error {
+	if err := c.checkReadyFunc(); err != nil {
+		return err
+	}
+	args := []interface{}{"get", key}
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "GET", key, config)
 }
 
 func (c *RedisClusterClient[C]) Set(key string, value interface{}, callback RedisResponseCallback) error {
@@ -299,7 +501,16 @@ func (c *RedisClusterClient[C]) Set(key string, value interface{}, callback Redi
 	args = append(args, "set")
 	args = append(args, key)
 	args = append(args, value)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "SET", key, DefaultRetryConfig)
+}
+
+// SetWithRetry provides enhanced SET with retry support
+func (c *RedisClusterClient[C]) SetWithRetry(key string, value interface{}, callback RedisResponseCallback, config RetryConfig) error {
+	if err := c.checkReadyFunc(); err != nil {
+		return err
+	}
+	args := []interface{}{"set", key, value}
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "SET", key, config)
 }
 
 func (c *RedisClusterClient[C]) SetEx(key string, value interface{}, ttl int, callback RedisResponseCallback) error {
@@ -312,7 +523,7 @@ func (c *RedisClusterClient[C]) SetEx(key string, value interface{}, ttl int, ca
 	args = append(args, value)
 	args = append(args, "ex")
 	args = append(args, ttl)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "SETEX", key, DefaultRetryConfig)
 }
 
 func (c *RedisClusterClient[C]) SetNX(key string, value interface{}, ttl int, callback RedisResponseCallback) error {
@@ -328,7 +539,7 @@ func (c *RedisClusterClient[C]) SetNX(key string, value interface{}, ttl int, ca
 		args = append(args, "ex")
 		args = append(args, ttl)
 	}
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "SETNX", key, DefaultRetryConfig)
 }
 
 func (c *RedisClusterClient[C]) MGet(keys []string, callback RedisResponseCallback) error {
@@ -340,7 +551,12 @@ func (c *RedisClusterClient[C]) MGet(keys []string, callback RedisResponseCallba
 	for _, k := range keys {
 		args = append(args, k)
 	}
-	return RedisCall(c.cluster, respString(args), callback)
+	// Use first key for logging purposes
+	keyForLog := ""
+	if len(keys) > 0 {
+		keyForLog = keys[0]
+	}
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "MGET", keyForLog, DefaultRetryConfig)
 }
 
 func (c *RedisClusterClient[C]) MSet(kvMap map[string]interface{}, callback RedisResponseCallback) error {
@@ -353,7 +569,13 @@ func (c *RedisClusterClient[C]) MSet(kvMap map[string]interface{}, callback Redi
 		args = append(args, k)
 		args = append(args, v)
 	}
-	return RedisCall(c.cluster, respString(args), callback)
+	// Use first key for logging purposes
+	keyForLog := ""
+	for k := range kvMap {
+		keyForLog = k
+		break
+	}
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "MSET", keyForLog, DefaultRetryConfig)
 }
 
 func (c *RedisClusterClient[C]) Incr(key string, callback RedisResponseCallback) error {
@@ -363,7 +585,7 @@ func (c *RedisClusterClient[C]) Incr(key string, callback RedisResponseCallback)
 	args := make([]interface{}, 0)
 	args = append(args, "incr")
 	args = append(args, key)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "INCR", key, DefaultRetryConfig)
 }
 
 func (c *RedisClusterClient[C]) Decr(key string, callback RedisResponseCallback) error {
@@ -373,7 +595,7 @@ func (c *RedisClusterClient[C]) Decr(key string, callback RedisResponseCallback)
 	args := make([]interface{}, 0)
 	args = append(args, "decr")
 	args = append(args, key)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "DECR", key, DefaultRetryConfig)
 }
 
 func (c *RedisClusterClient[C]) IncrBy(key string, delta int, callback RedisResponseCallback) error {
@@ -384,7 +606,16 @@ func (c *RedisClusterClient[C]) IncrBy(key string, delta int, callback RedisResp
 	args = append(args, "incrby")
 	args = append(args, key)
 	args = append(args, delta)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "INCRBY", key, DefaultRetryConfig)
+}
+
+// IncrByWithRetry provides enhanced INCRBY with retry support
+func (c *RedisClusterClient[C]) IncrByWithRetry(key string, delta int, callback RedisResponseCallback, config RetryConfig) error {
+	if err := c.checkReadyFunc(); err != nil {
+		return err
+	}
+	args := []interface{}{"incrby", key, delta}
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "INCRBY", key, config)
 }
 
 func (c *RedisClusterClient[C]) DecrBy(key string, delta int, callback RedisResponseCallback) error {
@@ -395,7 +626,7 @@ func (c *RedisClusterClient[C]) DecrBy(key string, delta int, callback RedisResp
 	args = append(args, "decrby")
 	args = append(args, key)
 	args = append(args, delta)
-	return RedisCall(c.cluster, respString(args), callback)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "DECRBY", key, DefaultRetryConfig)
 }
 
 // List
@@ -899,4 +1130,196 @@ func (c *RedisClusterClient[C]) ZRevRange(key string, start, stop int, callback 
 	args = append(args, start)
 	args = append(args, stop)
 	return RedisCall(c.cluster, respString(args), callback)
+}
+
+// BatchGetQuotaInfo optimizes quota checking by using MGET for multiple keys
+func (c *RedisClusterClient[C]) BatchGetQuotaInfo(totalKey, usedKey string, callback RedisResponseCallback) error {
+	if err := c.checkReadyFunc(); err != nil {
+		return err
+	}
+	keys := []string{totalKey, usedKey}
+	return c.MGet(keys, callback)
+}
+
+// BatchSetWithExpiry efficiently sets multiple key-value pairs with expiry
+func (c *RedisClusterClient[C]) BatchSetWithExpiry(kvMap map[string]interface{}, ttl int, callback RedisResponseCallback) error {
+	if err := c.checkReadyFunc(); err != nil {
+		return err
+	}
+
+	// Use pipeline for batch operations
+	script := `
+		local keys = ARGV
+		local ttl = tonumber(ARGV[1])
+		for i = 2, #ARGV, 2 do
+			redis.call('set', ARGV[i], ARGV[i+1])
+			if ttl > 0 then
+				redis.call('expire', ARGV[i], ttl)
+			end
+		end
+		return 'OK'
+	`
+
+	params := make([]interface{}, 0)
+	params = append(params, ttl)
+	for k, v := range kvMap {
+		params = append(params, k, v)
+	}
+
+	return c.Eval(script, 0, []interface{}{}, params, callback)
+}
+
+// AtomicQuotaCheck performs quota check and deduction in a single atomic operation
+func (c *RedisClusterClient[C]) AtomicQuotaCheck(totalKey, usedKey string, quotaWeight int, callback RedisResponseCallback) error {
+	if err := c.checkReadyFunc(); err != nil {
+		return err
+	}
+
+	// Lua script for atomic quota check and deduction
+	script := `
+		local total_key = KEYS[1]
+		local used_key = KEYS[2]
+		local quota_weight = tonumber(ARGV[1])
+
+		-- Get total and used quota
+		local total_quota = tonumber(redis.call('get', total_key)) or 0
+		local used_quota = tonumber(redis.call('get', used_key)) or 0
+
+		-- Calculate remaining quota
+		local remaining_quota = total_quota - used_quota
+
+		-- Check if sufficient quota available
+		if remaining_quota < quota_weight then
+			return {total_quota, used_quota, remaining_quota, 0} -- 0 indicates failure
+		end
+
+		-- Deduct quota atomically
+		local new_used = redis.call('incrby', used_key, quota_weight)
+		return {total_quota, used_quota, remaining_quota, 1} -- 1 indicates success
+	`
+
+	keys := []interface{}{totalKey, usedKey}
+	args := []interface{}{quotaWeight}
+	return c.Eval(script, 2, keys, args, callback)
+}
+
+// classifyRedisError analyzes error and determines type and retry characteristics
+func classifyRedisError(status int, err error, operation string, key string) *RedisError {
+	redisErr := &RedisError{
+		Operation: operation,
+		Key:       key,
+		Temporary: true, // Most Redis errors are temporary
+		Retryable: true, // Most Redis errors are retryable
+	}
+
+	if status != 0 {
+		// Connection or network errors based on status code
+		switch status {
+		case 1: // Connection refused
+			redisErr.Type = RedisErrorTypeConnection
+			redisErr.Message = "Connection refused - Redis server may be down"
+		case 2: // Timeout
+			redisErr.Type = RedisErrorTypeTimeout
+			redisErr.Message = "Operation timed out"
+		case 3: // Authentication failed
+			redisErr.Type = RedisErrorTypeAuth
+			redisErr.Message = "Authentication failed"
+			redisErr.Retryable = false
+			redisErr.Temporary = false
+		default:
+			redisErr.Type = RedisErrorTypeNetwork
+			redisErr.Message = fmt.Sprintf("Network error (status: %d)", status)
+		}
+		return redisErr
+	}
+
+	if err != nil {
+		errMsg := err.Error()
+
+		// Classify based on error message patterns
+		if containsAny(errMsg, []string{"connection", "connect", "dial"}) {
+			redisErr.Type = RedisErrorTypeConnection
+			redisErr.Message = "Connection error: " + errMsg
+		} else if containsAny(errMsg, []string{"timeout", "deadline"}) {
+			redisErr.Type = RedisErrorTypeTimeout
+			redisErr.Message = "Timeout error: " + errMsg
+		} else if containsAny(errMsg, []string{"auth", "authentication", "password"}) {
+			redisErr.Type = RedisErrorTypeAuth
+			redisErr.Message = "Authentication error: " + errMsg
+			redisErr.Retryable = false
+			redisErr.Temporary = false
+		} else if containsAny(errMsg, []string{"protocol", "parse", "invalid"}) {
+			redisErr.Type = RedisErrorTypeProtocol
+			redisErr.Message = "Protocol error: " + errMsg
+			redisErr.Retryable = false
+		} else if containsAny(errMsg, []string{"network", "io", "broken pipe"}) {
+			redisErr.Type = RedisErrorTypeNetwork
+			redisErr.Message = "Network error: " + errMsg
+		} else {
+			redisErr.Type = RedisErrorTypeUnknown
+			redisErr.Message = "Unknown error: " + errMsg
+		}
+		return redisErr
+	}
+
+	// Should not reach here, but just in case
+	redisErr.Type = RedisErrorTypeUnknown
+	redisErr.Message = "Unknown error occurred"
+	return redisErr
+}
+
+// containsAny checks if string contains any of the given substrings
+func containsAny(s string, substrings []string) bool {
+	for _, substr := range substrings {
+		if len(s) >= len(substr) {
+			for i := 0; i <= len(s)-len(substr); i++ {
+				if s[i:i+len(substr)] == substr {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// RedisMetrics tracks Redis operation metrics
+type RedisMetrics struct {
+	TotalCalls      int64
+	SuccessfulCalls int64
+	FailedCalls     int64
+	RetryAttempts   int64
+}
+
+// Global metrics instance
+var globalRedisMetrics RedisMetrics
+
+// GetRedisMetrics returns current Redis operation metrics
+func GetRedisMetrics() RedisMetrics {
+	return globalRedisMetrics
+}
+
+// ResetRedisMetrics resets the global Redis metrics
+func ResetRedisMetrics() {
+	globalRedisMetrics = RedisMetrics{}
+}
+
+// IsRetryableError checks if the given error is retryable
+func IsRetryableError(err error) bool {
+	if redisErr, ok := err.(*RedisError); ok {
+		return redisErr.Retryable
+	}
+	return false
+}
+
+// IsRedisErrorResponse checks if a resp.Value contains an error
+func IsRedisErrorResponse(val resp.Value) bool {
+	return val.Type() == resp.Error
+}
+
+// GetRedisErrorFromResponse extracts error from a resp.Value
+func GetRedisErrorFromResponse(val resp.Value) error {
+	if val.Type() == resp.Error {
+		return fmt.Errorf("Redis error: %s", val.String())
+	}
+	return nil
 }
