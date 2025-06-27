@@ -367,6 +367,36 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 }
 
 func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []byte, log wrapper.Log) types.Action {
+	// Get user ID from context first
+	userId, ok := ctx.GetContext("userId").(string)
+	if !ok {
+		sendJSONResponse(http.StatusUnauthorized, "ai-gateway.no_userid", "Request denied by ai quota check. No user ID found.", false, nil)
+		return types.ActionContinue
+	}
+
+	// Check GitHub star status first if enabled
+	if config.CheckGithubStar {
+		log.Debugf("GitHub star check is enabled, checking star status for user: %s", userId)
+		starKey := config.RedisStarPrefix + userId
+		config.redisClient.Get(starKey, func(starResponse resp.Value) {
+			if err := starResponse.Error(); err != nil || starResponse.IsNull() || starResponse.String() != "true" {
+				log.Debugf("User %s has not starred the project", userId)
+				sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", "Please star the project first: https://github.com/zgsm-ai/zgsm", false, nil)
+				return
+			}
+			log.Debugf("User %s has starred the project, proceeding with quota check", userId)
+			// Star check passed, continue with quota logic
+			processQuotaLogic(ctx, config, body, userId, log)
+		})
+		return types.ActionPause
+	}
+
+	// If GitHub star check is disabled, proceed directly with quota logic
+	log.Debugf("GitHub star check is disabled, proceeding with quota check")
+	return processQuotaLogic(ctx, config, body, userId, log)
+}
+
+func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte, userId string, log wrapper.Log) types.Action {
 	// Extract model from request body
 	modelName := gjson.GetBytes(body, "model").String()
 	log.Debugf("Extracted model name: %s", modelName)
@@ -382,31 +412,11 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 	// If quota weight is 0, no deduction needed, allow request to continue
 	if quotaWeight == 0 {
 		log.Debugf("Model %s has zero quota weight, skipping quota check", modelName)
+		proxywasm.ResumeHttpRequest()
 		return types.ActionContinue
 	}
 
-	// Get user ID from context
-	userId, ok := ctx.GetContext("userId").(string)
-	if !ok {
-		sendJSONResponse(http.StatusUnauthorized, "ai-gateway.no_userid", "Request denied by ai quota check. No user ID found.", false, nil)
-		return types.ActionContinue
-	}
-
-	// Check GitHub star status if enabled
-	if config.CheckGithubStar {
-		starKey := config.RedisStarPrefix + userId
-		config.redisClient.Get(starKey, func(starResponse resp.Value) {
-			if err := starResponse.Error(); err != nil || starResponse.IsNull() || starResponse.String() != "true" {
-				sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", "Please star the project first: https://github.com/zgsm-ai/zgsm", false, nil)
-				return
-			}
-			// Continue with quota check
-			doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
-		})
-		return types.ActionPause
-	}
-
-	// Check and deduct quota directly if GitHub star check is disabled
+	// Check and deduct quota
 	doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
 	return types.ActionPause
 }
