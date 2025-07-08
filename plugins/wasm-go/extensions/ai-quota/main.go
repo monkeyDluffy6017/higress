@@ -21,6 +21,17 @@ import (
 
 const (
 	pluginName = "ai-quota"
+	wildcard   = "*"
+)
+
+// Provider types for AI services
+const (
+	ProviderTypeOpenAI   = "openai"
+	ProviderTypeAzure    = "azure"
+	ProviderTypeQwen     = "qwen"
+	ProviderTypeMoonshot = "moonshot"
+	ProviderTypeClaude   = "claude"
+	ProviderTypeGemini   = "gemini"
 )
 
 // ResponseData 统一响应结构体
@@ -29,6 +40,20 @@ type ResponseData struct {
 	Message string `json:"message"`
 	Success bool   `json:"success"`
 	Data    any    `json:"data,omitempty"`
+}
+
+// ModelInfo represents a model in the models list response
+type ModelInfo struct {
+	Id      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// ModelsResponse represents the /ai-gateway/api/v1/models response
+type ModelsResponse struct {
+	Object string      `json:"object"`
+	Data   []ModelInfo `json:"data"`
 }
 
 // sendJSONResponse 发送JSON格式的响应
@@ -83,21 +108,29 @@ func main() {
 	)
 }
 
+// ProviderConfig contains provider type and model mapping configuration
+type ProviderConfig struct {
+	Type         string            `yaml:"type"`         // Provider type (openai, qwen, claude, etc.)
+	ModelMapping map[string]string `yaml:"modelMapping"` // Model name mapping
+}
+
 type QuotaConfig struct {
-	redisInfo         RedisInfo           `yaml:"redis"`
-	RedisKeyPrefix    string              `yaml:"redis_key_prefix"`
-	RedisUsedPrefix   string              `yaml:"redis_used_prefix"`
-	RedisStarPrefix   string              `yaml:"redis_star_prefix"`
-	CheckGithubStar   bool                `yaml:"check_github_star"`
-	TokenHeader       string              `yaml:"token_header"`
-	AdminHeader       string              `yaml:"admin_header"`
-	AdminKey          string              `yaml:"admin_key"`
-	AdminPath         string              `yaml:"admin_path"`
-	DeductHeader      string              `yaml:"deduct_header"`
-	DeductHeaderValue string              `yaml:"deduct_header_value"`
-	ModelQuotaWeights map[string]int      `yaml:"model_quota_weights"`
-	redisClient       wrapper.RedisClient `yaml:"-"`
-	starCache         map[string]bool     `yaml:"-"` // Simple star status cache
+	redisInfo         RedisInfo      `yaml:"redis"`
+	RedisKeyPrefix    string         `yaml:"redis_key_prefix"`
+	RedisUsedPrefix   string         `yaml:"redis_used_prefix"`
+	RedisStarPrefix   string         `yaml:"redis_star_prefix"`
+	CheckGithubStar   bool           `yaml:"check_github_star"`
+	TokenHeader       string         `yaml:"token_header"`
+	AdminHeader       string         `yaml:"admin_header"`
+	AdminKey          string         `yaml:"admin_key"`
+	AdminPath         string         `yaml:"admin_path"`
+	DeductHeader      string         `yaml:"deduct_header"`
+	DeductHeaderValue string         `yaml:"deduct_header_value"`
+	ModelQuotaWeights map[string]int `yaml:"model_quota_weights"`
+	// Provider configuration for /ai-gateway/api/v1/models endpoint
+	Provider    ProviderConfig      `yaml:"provider"` // Provider configuration
+	redisClient wrapper.RedisClient `yaml:"-"`
+	starCache   map[string]bool     `yaml:"-"` // Simple star status cache
 }
 
 type Consumer struct {
@@ -159,6 +192,31 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 			config.ModelQuotaWeights[key.String()] = int(value.Int())
 			return true
 		})
+	}
+
+	// Parse provider configuration
+	providerConfig := json.Get("provider")
+	if providerConfig.Exists() {
+		// Parse provider type
+		providerType := providerConfig.Get("type").String()
+		if providerType == "" {
+			providerType = ProviderTypeOpenAI // Default to OpenAI
+		}
+		config.Provider.Type = providerType
+
+		// Parse model mapping
+		config.Provider.ModelMapping = make(map[string]string)
+		modelMapping := providerConfig.Get("modelMapping")
+		if modelMapping.Exists() {
+			modelMapping.ForEach(func(key, value gjson.Result) bool {
+				config.Provider.ModelMapping[key.String()] = value.String()
+				return true
+			})
+		}
+	} else {
+		// Default provider configuration
+		config.Provider.Type = ProviderTypeOpenAI
+		config.Provider.ModelMapping = make(map[string]string)
 	}
 
 	// Redis
@@ -254,6 +312,35 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 
 	rawPath := context.Path()
 	path, _ := url.Parse(rawPath)
+
+	// Handle /ai-gateway/api/v1/models request locally first
+	if path.Path == "/ai-gateway/api/v1/models" {
+		log.Debugf("[onHttpRequestHeaders] handling /ai-gateway/api/v1/models request locally")
+		context.DontReadRequestBody()
+
+		// Generate models response based on modelMapping configuration
+		responseBody, err := config.BuildModelsResponse()
+		if err != nil {
+			log.Errorf("failed to build models response: %v", err)
+			_ = sendJSONResponse(500, "ai-quota.build_models_failed", "Failed to build models response", false, nil)
+			return types.ActionContinue
+		}
+
+		// Send HTTP response directly
+		headers := [][2]string{
+			{"content-type", "application/json"},
+		}
+		err = proxywasm.SendHttpResponse(200, headers, responseBody, -1)
+		if err != nil {
+			log.Errorf("failed to send response: %v", err)
+			_ = sendJSONResponse(500, "ai-quota.send_models_response_failed", "Failed to send models response", false, nil)
+			return types.ActionContinue
+		}
+
+		log.Debugf("[onHttpRequestHeaders] models response sent: %s", string(responseBody))
+		return types.ActionContinue
+	}
+
 	chatMode, adminMode := getOperationMode(path.Path, config.AdminPath, log)
 	context.SetContext("chatMode", chatMode)
 	context.SetContext("adminMode", adminMode)
@@ -505,15 +592,30 @@ func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConf
 		return
 	}
 
-	// Rest of the existing logic for handling total quota response
+	// Handle the case where total quota key doesn't exist or is empty - default to 0
 	totalQuotaStr := totalResponse.String()
-	totalQuota, parseErr := strconv.Atoi(totalQuotaStr)
+	totalQuota := 0 // Default value for users without allocated quota
+	var parseErr error
 
-	if parseErr != nil {
-		log.Errorf("Invalid total quota format for user %s: %s", userId, totalQuotaStr)
-		sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_total_quota",
-			"Invalid total quota format", false, nil)
-		return
+	if totalQuotaStr != "" {
+		totalQuota, parseErr = strconv.Atoi(totalQuotaStr)
+		if parseErr != nil {
+			log.Errorf("Invalid total quota format for user %s: %s", userId, totalQuotaStr)
+			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_total_quota",
+				"Invalid total quota format", false, nil)
+			return
+		}
+
+		// Validate that total quota is non-negative
+		if totalQuota < 0 {
+			log.Errorf("Invalid total quota value for user %s: %d (cannot be negative)", userId, totalQuota)
+			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_total_quota",
+				"Invalid total quota value", false, nil)
+			return
+		}
+	} else {
+		// Key doesn't exist or is empty, log for monitoring
+		log.Infof("No total quota found for user %s (key does not exist or is empty), defaulting to 0", userId)
 	}
 
 	// Get used quota
@@ -537,9 +639,9 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 		return
 	}
 
-	// Handle the case where used quota key doesn't exist (first time user)
+	// Handle the case where used quota key doesn't exist or is empty - default to 0
 	usedQuotaStr := usedResponse.String()
-	usedQuota := 0
+	usedQuota := 0 // Default value for new users
 
 	if usedQuotaStr != "" {
 		var parseErr error
@@ -550,10 +652,32 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 				"Invalid used quota format", false, nil)
 			return
 		}
+
+		// Validate that used quota is non-negative
+		if usedQuota < 0 {
+			log.Errorf("Invalid used quota value for user %s: %d (cannot be negative)", userId, usedQuota)
+			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_used_quota",
+				"Invalid used quota value", false, nil)
+			return
+		}
+
+		// Additional sanity check: used quota shouldn't exceed total quota by a large margin
+		// (Allow some tolerance for concurrent operations)
+		if usedQuota > totalQuota+quotaWeight {
+			log.Warnf("Used quota (%d) significantly exceeds total quota (%d) for user %s. This may indicate data inconsistency.",
+				usedQuota, totalQuota, userId)
+		}
+	} else {
+		// Key doesn't exist or is empty, log for monitoring
+		log.Infof("No used quota found for user %s (key does not exist or is empty), defaulting to 0", userId)
 	}
 
 	// Calculate remaining quota
 	remainingQuota := totalQuota - usedQuota
+
+	// Log quota status for debugging
+	log.Debugf("Quota status for user %s: total=%d, used=%d, remaining=%d, required=%d",
+		userId, totalQuota, usedQuota, remainingQuota, quotaWeight)
 
 	// Check if sufficient quota is available
 	if remainingQuota >= quotaWeight {
@@ -578,10 +702,28 @@ func handleQuotaDeductionResponse(ctx wrapper.HttpContext, incrResponse resp.Val
 		return
 	}
 
-	// Successful quota deduction
+	// Validate the response from Redis IncrBy operation
 	newUsedQuota := incrResponse.Integer()
-	log.Infof("Successfully deducted %d quota for user %s, model %s. New used quota: %d",
-		quotaWeight, userId, modelName, newUsedQuota)
+
+	// Sanity check: the new used quota should be reasonable
+	if newUsedQuota < quotaWeight {
+		log.Errorf("Unexpected used quota after deduction for user %s: got %d, expected at least %d",
+			userId, newUsedQuota, quotaWeight)
+		sendJSONResponse(http.StatusInternalServerError, "quota-check.deduction_inconsistent",
+			"Quota deduction resulted in inconsistent state", false, nil)
+		return
+	}
+
+	// Calculate what the previous used quota should have been
+	expectedPreviousUsed := newUsedQuota - quotaWeight
+
+	// Log quota deduction details for audit and debugging
+	log.Infof("Successfully deducted %d quota for user %s, model %s. Previous used: %d, New used: %d",
+		quotaWeight, userId, modelName, expectedPreviousUsed, newUsedQuota)
+
+	// Additional debug information
+	log.Debugf("Quota deduction details for user %s: deducted=%d, new_used=%d, expected_previous=%d",
+		userId, quotaWeight, newUsedQuota, expectedPreviousUsed)
 
 	proxywasm.ResumeHttpRequest()
 }
@@ -704,8 +846,12 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 	}
 
 	err := config.redisClient.Get(redisKey, func(response resp.Value) {
-		if err := response.Error(); err != nil {
-			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
+		// Check for Redis errors first
+		if wrapper.IsRedisErrorResponse(response) {
+			redisErr := wrapper.GetRedisErrorFromResponse(response)
+			log.Errorf("Failed to query %s for user %s: %v", responseType, userId, redisErr)
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.redis_error",
+				fmt.Sprintf("Redis error: %s", redisErr.Error()), false, nil)
 			return
 		}
 
@@ -713,7 +859,15 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 			// Handle star status query (string value)
 			starValue := "false"
 			if !response.IsNull() {
-				starValue = response.String()
+				starValueFromRedis := response.String()
+				// Validate star value format
+				if starValueFromRedis == "true" || starValueFromRedis == "false" {
+					starValue = starValueFromRedis
+				} else {
+					log.Warnf("Invalid star status value for user %s: %s, defaulting to false", userId, starValueFromRedis)
+				}
+			} else {
+				log.Debugf("No star status found for user %s (key does not exist), defaulting to false", userId)
 			}
 
 			// Only cache true status
@@ -735,8 +889,30 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 			// Handle quota query (integer value)
 			quota := 0
 			if !response.IsNull() {
-				quota = response.Integer()
+				// Validate that the response can be converted to integer
+				quotaStr := response.String()
+				if quotaStr != "" {
+					var parseErr error
+					quota, parseErr = strconv.Atoi(quotaStr)
+					if parseErr != nil {
+						log.Errorf("Invalid %s format for user %s: %s", responseType, userId, quotaStr)
+						sendJSONResponse(http.StatusInternalServerError, "ai-gateway.invalid_quota_format",
+							fmt.Sprintf("Invalid %s format", responseType), false, nil)
+						return
+					}
+
+					// Validate that quota is non-negative
+					if quota < 0 {
+						log.Errorf("Invalid %s value for user %s: %d (cannot be negative)", responseType, userId, quota)
+						sendJSONResponse(http.StatusInternalServerError, "ai-gateway.invalid_quota_value",
+							fmt.Sprintf("Invalid %s value", responseType), false, nil)
+						return
+					}
+				}
+			} else {
+				log.Debugf("No %s found for user %s (key does not exist or is empty), defaulting to 0", responseType, userId)
 			}
+
 			data := map[string]interface{}{
 				"user_id": userId,
 				"quota":   quota,
@@ -938,4 +1114,77 @@ func (config *QuotaConfig) setStarCache(userId string, hasStar bool) {
 // deleteStarCache removes user star status from cache
 func (config *QuotaConfig) deleteStarCache(userId string) {
 	delete(config.starCache, userId)
+}
+
+// BuildModelsResponse creates an OpenAI-compatible models list response based on modelMapping
+func (config *QuotaConfig) BuildModelsResponse() ([]byte, error) {
+	// Initialize with empty slice instead of nil slice to ensure JSON serialization returns [] instead of null
+	models := make([]ModelInfo, 0)
+
+	// If modelMapping is empty, return an empty models list
+	if len(config.Provider.ModelMapping) == 0 {
+		response := ModelsResponse{
+			Object: "list",
+			Data:   models, // Use the same empty slice for consistency
+		}
+		return json.Marshal(response)
+	}
+
+	// Extract model names from modelMapping keys
+	for modelName, modelValue := range config.Provider.ModelMapping {
+		// Skip wildcard entries
+		if modelName == wildcard {
+			continue
+		}
+
+		// Skip prefix matching patterns (ending with *)
+		if strings.HasSuffix(modelName, wildcard) {
+			continue
+		}
+
+		// Skip models mapped to empty strings (which means "keep original model name" but causes issues)
+		// When a model is mapped to empty string, it should be treated as not configured properly
+		if modelValue == "" {
+			continue
+		}
+
+		// Determine the owner based on provider type
+		owner := config.getOwnerByProvider()
+
+		models = append(models, ModelInfo{
+			Id:      modelName,
+			Object:  "model",
+			Created: 1686935002, // Fixed timestamp as requested
+			OwnedBy: owner,
+		})
+	}
+
+	// Always return the same models slice (empty or with content)
+	// This ensures consistent JSON response: [] instead of null
+	response := ModelsResponse{
+		Object: "list",
+		Data:   models,
+	}
+
+	return json.Marshal(response)
+}
+
+// getOwnerByProvider returns the owner name based on provider type
+func (config *QuotaConfig) getOwnerByProvider() string {
+	switch config.Provider.Type {
+	case ProviderTypeOpenAI:
+		return "openai"
+	case ProviderTypeAzure:
+		return "openai-internal"
+	case ProviderTypeQwen:
+		return "alibaba"
+	case ProviderTypeMoonshot:
+		return "moonshot"
+	case ProviderTypeClaude:
+		return "anthropic"
+	case ProviderTypeGemini:
+		return "google"
+	default:
+		return config.Provider.Type // Use provider type as owner for unknown types
+	}
 }

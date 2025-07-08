@@ -22,6 +22,8 @@ Plugin execution priority: `750`
 - **Flexible Quota Deduction**: Header-based quota deduction triggering
 - **Complete Management APIs**: Support for query, refresh, and delta operations on both total and used quotas
 - **Redis Cluster Support**: Compatible with both Redis standalone and cluster modes
+- **Model Mapping Support**: Support for model name mapping and `/ai-gateway/api/v1/models` API endpoint
+- **Multiple AI Providers**: Support for model list generation from various AI service providers
 
 ## How It Works
 
@@ -52,6 +54,10 @@ When a request contains specified headers and values, the system increments the 
 | `admin_path`           | string    | Optional           | /quota              | Prefix for quota management request paths     |
 | `deduct_header`        | string    | Optional           | x-quota-identity    | Header name triggering quota deduction        |
 | `deduct_header_value`  | string    | Optional           | true                | Header value triggering quota deduction       |
+| `model_quota_weights`  | object    | Optional           | {}                  | Model quota weight configuration              |
+| `provider`             | object    | Optional           | {type: "openai", modelMapping: {}} | Provider configuration for model mapping |
+| `provider.type`        | string    | Optional           | openai              | AI service provider type: openai, azure, qwen, moonshot, claude, gemini |
+| `provider.modelMapping`| object    | Optional           | {}                  | Model name mapping table for mapping request model names to target AI provider models |
 | `redis`                | object    | Yes                | -                   | Redis related configuration                    |
 
 Explanation of each configuration field in `redis`
@@ -79,6 +85,11 @@ admin_key: "your-admin-secret"
 admin_path: "/quota"
 deduct_header: "x-quota-identity"
 deduct_header_value: "user"
+model_quota_weights:
+  'gpt-3.5-turbo': 1
+  'gpt-4': 2
+  'gpt-4-turbo': 3
+  'gpt-4o': 4
 redis:
   service_name: redis-service.default.svc.cluster.local
   service_port: 6379
@@ -104,6 +115,62 @@ redis:
 ```
 
 **Note**: When `check_github_star` is set to `true`, users must star the GitHub project before using AI services. The system will check if the value of the Redis key `chat_quota_star:{user_id}` is "true".
+
+### Configuration with Model Mapping
+
+#### Qwen (Alibaba) Provider Configuration
+```yaml
+redis_key_prefix: "chat_quota:"
+redis_used_prefix: "chat_quota_used:"
+token_header: "authorization"
+admin_header: "x-admin-key"
+admin_key: "your-admin-secret"
+admin_path: "/quota"
+deduct_header: "x-quota-identity"
+deduct_header_value: "user"
+model_quota_weights:
+  'gpt-3.5-turbo': 1
+  'gpt-4': 5
+  'gpt-4-turbo': 10
+  'gpt-4o': 15
+# Provider Configuration with Model Mapping
+provider:
+  type: "qwen"
+  modelMapping:
+    'gpt-3.5-turbo': "qwen-plus"
+    'gpt-4': "qwen-max"
+    'gpt-4-turbo': "qwen-max"
+    'gpt-4o': "qwen-max"
+    'text-embedding-v1': "text-embedding-v1"
+    'gpt-4-*': "qwen-max"  # Prefix matching, won't appear in model list
+    '*': "qwen-turbo"      # Wildcard default model, won't appear in model list
+redis:
+  service_name: redis-service.default.svc.cluster.local
+  service_port: 6379
+  timeout: 2000
+```
+
+#### OpenAI Provider Configuration
+```yaml
+redis_key_prefix: "chat_quota:"
+redis_used_prefix: "chat_quota_used:"
+token_header: "authorization"
+admin_header: "x-admin-key"
+admin_key: "your-admin-secret"
+admin_path: "/quota"
+# OpenAI provider configuration
+provider:
+  type: "openai"
+  modelMapping:
+    'gpt-3.5-turbo': "gpt-3.5-turbo"
+    'gpt-4': "gpt-4"
+    'gpt-4-turbo': "gpt-4-turbo"
+    'gpt-4o': "gpt-4o"
+    '*': "gpt-3.5-turbo"  # Default model
+redis:
+  service_name: redis-service.default.svc.cluster.local
+  service_port: 6379
+```
 
 ## JWT Token Format
 
@@ -244,6 +311,76 @@ curl -X POST \
   -d "user_id=user123&value=-5" \
   "https://example.com/v1/chat/completions/quota/used/delta"
 ```
+
+### Model List Endpoint
+
+#### Get Available Models
+
+**Path**: `/ai-gateway/api/v1/models`
+
+**Method**: GET
+
+**Description**: This endpoint returns a list of available models based on `modelMapping` configuration, compatible with OpenAI API format.
+
+**Request Example**:
+```bash
+curl -X GET "http://your-domain/ai-gateway/api/v1/models" \
+  -H "Content-Type: application/json"
+```
+
+**Response Examples**:
+
+**With specific model mapping configured**:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-3.5-turbo",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "alibaba"
+    },
+    {
+      "id": "gpt-4",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "alibaba"
+    },
+    {
+      "id": "gpt-4-turbo",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "alibaba"
+    }
+  ]
+}
+```
+
+**Without modelMapping configured**:
+```json
+{
+  "object": "list",
+  "data": []
+}
+```
+
+**Owner Field Mapping**:
+
+| Provider Type | owned_by Value |
+|---------------|----------------|
+| openai | openai |
+| azure | openai-internal |
+| qwen | alibaba |
+| moonshot | moonshot |
+| claude | anthropic |
+| gemini | google |
+| others | provider type name |
+
+**Important Notes**:
+1. **Empty string mappings are skipped**: If a model is mapped to an empty string (e.g., `"*": ""`), it will be skipped and not returned in the model list.
+2. **Empty modelMapping**: If `modelMapping` is not configured or is empty, this endpoint will return an empty model list.
+3. **Wildcards and prefix matching**: Wildcard `*` and prefix matching patterns (e.g., `gpt-4-*`) will not appear in the model list.
 
 #### GitHub Star Status Management
 

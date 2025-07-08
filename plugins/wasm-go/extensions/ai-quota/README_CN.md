@@ -23,6 +23,8 @@ description: AI 配额管理插件配置参考
 - **完整的管理接口**：支持配额总数和已使用量的查询、刷新、增减操作
 - **Redis集群支持**：兼容Redis单机和集群模式
 - **GitHub关注检查**：可选的GitHub项目关注状态验证
+- **模型映射支持**：支持模型名称映射和 `/ai-gateway/api/v1/models` API 端点
+- **多AI服务提供商**：支持多种AI服务提供商的模型列表生成
 
 ## 工作原理
 
@@ -57,6 +59,9 @@ description: AI 配额管理插件配置参考
 | `deduct_header`        | string    | 选填     | x-quota-identity       | 扣减配额的触发请求头名称        |
 | `deduct_header_value`  | string    | 选填     | true                   | 扣减配额的触发请求头值          |
 | `model_quota_weights`  | object    | 选填     | {}                     | 模型配额权重配置，指定每个模型的扣减额度 |
+| `provider`             | object    | 选填     | {type: "openai", modelMapping: {}} | 提供商配置，包含类型和模型映射设置 |
+| `provider.type`        | string    | 选填     | openai                 | AI服务提供商类型，支持：openai, azure, qwen, moonshot, claude, gemini |
+| `provider.modelMapping`| object    | 选填     | {}                     | 模型名称映射表，用于将请求中的模型名称映射为目标AI服务商支持的模型名称 |
 | `redis`                | object    | 是       | -                      | redis相关配置                  |
 
 `redis`中每一项的配置字段说明
@@ -113,6 +118,62 @@ redis:
   service_name: "local-redis.static"
   service_port: 80
   timeout: 2000
+```
+
+### 带模型映射的配置示例
+
+#### 通义千问配置
+```yaml
+redis_key_prefix: "chat_quota:"
+redis_used_prefix: "chat_quota_used:"
+token_header: "authorization"
+admin_header: "x-admin-key"
+admin_key: "your-admin-secret"
+admin_path: "/quota"
+deduct_header: "x-quota-identity"
+deduct_header_value: "user"
+model_quota_weights:
+  'gpt-3.5-turbo': 1
+  'gpt-4': 5
+  'gpt-4-turbo': 10
+  'gpt-4o': 15
+# 提供商配置（包含模型映射）
+provider:
+  type: "qwen"
+  modelMapping:
+    'gpt-3.5-turbo': "qwen-plus"
+    'gpt-4': "qwen-max"
+    'gpt-4-turbo': "qwen-max"
+    'gpt-4o': "qwen-max"
+    'text-embedding-v1': "text-embedding-v1"
+    'gpt-4-*': "qwen-max"  # 前缀匹配，不会在模型列表中显示
+    '*': "qwen-turbo"      # 通配符默认模型，不会在模型列表中显示
+redis:
+  service_name: redis-service.default.svc.cluster.local
+  service_port: 6379
+  timeout: 2000
+```
+
+#### OpenAI 配置
+```yaml
+redis_key_prefix: "chat_quota:"
+redis_used_prefix: "chat_quota_used:"
+token_header: "authorization"
+admin_header: "x-admin-key"
+admin_key: "your-admin-secret"
+admin_path: "/quota"
+# OpenAI 提供商配置
+provider:
+  type: "openai"
+  modelMapping:
+    'gpt-3.5-turbo': "gpt-3.5-turbo"
+    'gpt-4': "gpt-4"
+    'gpt-4-turbo': "gpt-4-turbo"
+    'gpt-4o': "gpt-4o"
+    '*': "gpt-3.5-turbo"  # 默认模型
+redis:
+  service_name: redis-service.default.svc.cluster.local
+  service_port: 6379
 ```
 
 **说明**: 当 `check_github_star` 设置为 `true` 时，用户必须先关注 GitHub 项目才能使用AI服务。系统会检查Redis中键为 `chat_quota_star:{user_id}` 的值是否为 "true"。
@@ -308,6 +369,76 @@ curl -X POST \
   -d "user_id=user123&value=-5" \
   "https://example.com/v1/chat/completions/quota/used/delta"
 ```
+
+### 模型列表端点
+
+#### 获取可用模型列表
+
+**路径**: `/ai-gateway/api/v1/models`
+
+**方法**: GET
+
+**说明**: 该端点返回基于 `modelMapping` 配置的可用模型列表，兼容 OpenAI API 格式。
+
+**请求示例**:
+```bash
+curl -X GET "http://your-domain/ai-gateway/api/v1/models" \
+  -H "Content-Type: application/json"
+```
+
+**响应示例**:
+
+**配置了具体模型映射的情况**:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-3.5-turbo",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "alibaba"
+    },
+    {
+      "id": "gpt-4",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "alibaba"
+    },
+    {
+      "id": "gpt-4-turbo",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "alibaba"
+    }
+  ]
+}
+```
+
+**未配置 modelMapping 的情况**:
+```json
+{
+  "object": "list",
+  "data": []
+}
+```
+
+**所有者（owned_by）字段说明**:
+
+| 提供商类型 | owned_by 值 |
+|----------|-------------|
+| openai | openai |
+| azure | openai-internal |
+| qwen | alibaba |
+| moonshot | moonshot |
+| claude | anthropic |
+| gemini | google |
+| 其他 | 提供商类型名称 |
+
+**重要注意事项**:
+1. **空字符串映射会被跳过**：如果将模型映射为空字符串（如 `"*": ""`），该映射将被跳过，不会在模型列表中返回。
+2. **空的 modelMapping**：如果不配置 `modelMapping` 或配置为空，该接口将返回空的模型列表。
+3. **通配符和前缀匹配**：通配符 `*` 和前缀匹配模式（如 `gpt-4-*`）不会在模型列表中显示。
 
 #### GitHub关注状态管理
 
