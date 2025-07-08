@@ -23,6 +23,7 @@ description: AI 配额管理插件配置参考
 - **完整的管理接口**：支持配额总数和已使用量的查询、刷新、增减操作
 - **Redis集群支持**：兼容Redis单机和集群模式
 - **GitHub关注检查**：可选的GitHub项目关注状态验证
+- **模型列表展示**：支持通过 `/ai-gateway/api/v1/models` 端点展示可配置provider的可用模型列表
 
 ## 工作原理
 
@@ -57,6 +58,8 @@ description: AI 配额管理插件配置参考
 | `deduct_header`        | string    | 选填     | x-quota-identity       | 扣减配额的触发请求头名称        |
 | `deduct_header_value`  | string    | 选填     | true                   | 扣减配额的触发请求头值          |
 | `model_quota_weights`  | object    | 选填     | {}                     | 模型配额权重配置，指定每个模型的扣减额度 |
+| `provider`             | object    | 选填     | -                      | 单provider配置，用于模型列表展示 |
+| `providers`            | array     | 选填     | -                      | 多provider配置，用于模型列表展示 |
 | `redis`                | object    | 是       | -                      | redis相关配置                  |
 
 `redis`中每一项的配置字段说明
@@ -89,6 +92,13 @@ model_quota_weights:
   'gpt-4': 2
   'gpt-4-turbo': 3
   'gpt-4o': 4
+# 单provider配置，用于模型列表展示
+provider:
+  type: "openai"
+  models:
+    - "gpt-4"
+    - "gpt-3.5-turbo"
+    - "text-embedding-3-large"
 redis:
   service_name: redis-service.default.svc.cluster.local
   service_port: 6379
@@ -109,6 +119,18 @@ deduct_header: "x-quota-identity"
 deduct_header_value: "user"
 model_quota_weights:
   'deepseek-chat': 1
+# 多provider配置，用于模型列表展示
+providers:
+  - id: openai-provider
+    type: openai
+    models:
+      - "gpt-4"
+      - "gpt-3.5-turbo"
+  - id: deepseek-provider
+    type: deepseek
+    models:
+      - "deepseek-r1"
+      - "deepseek-chat"
 redis:
   service_name: "local-redis.static"
   service_port: 80
@@ -205,6 +227,40 @@ curl -X POST https://example.com/v1/chat/completions \
 - 当 `check_github_star` 设置为 `true` 时，会首先检查用户是否关注了GitHub项目
 - 如果Redis中 `{redis_star_prefix}{user_id}` 的值不是 "true"，将返回403错误，提示用户需要关注 https://github.com/zgsm-ai/zgsm 项目
 - 只有通过GitHub关注检查后，才会继续进行配额检查和扣减
+
+### 模型列表接口
+
+**路径**: `/ai-gateway/api/v1/models`
+
+**方法**: GET
+
+**描述**: 返回所有配置的provider的可用模型列表组合。此端点不需要身份验证，由插件本地处理。
+
+**响应示例**:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-4",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "openai"
+    },
+    {
+      "id": "deepseek-r1",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "unknown"
+    }
+  ]
+}
+```
+
+**说明**:
+- 在多provider模式下，如果多个provider定义了相同的模型名称，第一个provider的配置优先
+- `owned_by` 字段会根据provider类型自动设置（openai → "openai", qwen → "alibaba" 等）
+- 此端点由插件本地处理，不会转发请求到上游服务
 
 ### 管理接口
 
@@ -420,4 +476,3 @@ curl "https://example.com/v1/chat/completions" \
 5. **并发安全**: 插件支持高并发场景下的配额管理
 
 注意：管理操作不需要携带JWT token，只需要在指定的请求头中提供正确的管理密钥即可。
-

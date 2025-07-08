@@ -1,8 +1,6 @@
 package config
 
 import (
-	"encoding/json"
-
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/provider"
 	"github.com/tidwall/gjson"
 )
@@ -140,48 +138,4 @@ func (c *PluginConfig) GetProviderForModel(modelName string) (*provider.Provider
 	}
 
 	return nil, nil
-}
-
-// BuildCombinedModelsResponse builds a models response that combines all configured providers
-func (c *PluginConfig) BuildCombinedModelsResponse() ([]byte, error) {
-	// For legacy single provider configuration
-	if c.activeProviderConfig != nil {
-		return c.activeProviderConfig.BuildModelsResponse()
-	}
-
-	// For multi-provider configuration, combine all model mappings
-	if len(c.providerConfigs) == 0 {
-		return []byte(`{"object":"list","data":[]}`), nil
-	}
-
-	// Collect all unique models from all providers (first provider wins for duplicates)
-	modelMap := make(map[string]provider.ModelInfo)
-
-	for _, providerConfig := range c.providerConfigs {
-		models, err := providerConfig.GetModelList()
-		if err != nil {
-			continue
-		}
-
-		// Add models that don't already exist (first provider priority)
-		for _, model := range models {
-			if _, exists := modelMap[model.Id]; !exists {
-				modelMap[model.Id] = model
-			}
-		}
-	}
-
-	// Convert map to slice
-	var models []provider.ModelInfo
-	for _, model := range modelMap {
-		models = append(models, model)
-	}
-
-	// Build response
-	response := provider.ModelsResponse{
-		Object: "list",
-		Data:   models,
-	}
-
-	return json.Marshal(response)
 }

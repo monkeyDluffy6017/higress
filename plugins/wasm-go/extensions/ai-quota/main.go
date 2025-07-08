@@ -21,6 +21,17 @@ import (
 
 const (
 	pluginName = "ai-quota"
+	wildcard   = "*"
+)
+
+// Provider types for AI services
+const (
+	ProviderTypeOpenAI   = "openai"
+	ProviderTypeAzure    = "azure"
+	ProviderTypeQwen     = "qwen"
+	ProviderTypeMoonshot = "moonshot"
+	ProviderTypeClaude   = "claude"
+	ProviderTypeGemini   = "gemini"
 )
 
 // ResponseData 统一响应结构体
@@ -29,6 +40,20 @@ type ResponseData struct {
 	Message string `json:"message"`
 	Success bool   `json:"success"`
 	Data    any    `json:"data,omitempty"`
+}
+
+// ModelInfo represents a model in the models list response
+type ModelInfo struct {
+	Id      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// ModelsResponse represents the /ai-gateway/api/v1/models response
+type ModelsResponse struct {
+	Object string      `json:"object"`
+	Data   []ModelInfo `json:"data"`
 }
 
 // sendJSONResponse 发送JSON格式的响应
@@ -83,21 +108,100 @@ func main() {
 	)
 }
 
+// ProviderConfig contains provider type and model list configuration
+type ProviderConfig struct {
+	Id     string   `yaml:"id"`     // Provider ID for identification
+	Type   string   `yaml:"type"`   // Provider type (openai, qwen, claude, etc.)
+	Models []string `yaml:"models"` // List of supported model IDs
+}
+
+// GetId returns the provider ID
+func (c *ProviderConfig) GetId() string {
+	return c.Id
+}
+
+// GetType returns the provider type
+func (c *ProviderConfig) GetType() string {
+	return c.Type
+}
+
+// GetModelList returns the list of models available for this provider
+func (c *ProviderConfig) GetModelList() ([]ModelInfo, error) {
+	var models []ModelInfo
+	owner := c.getOwnerByProviderType()
+
+	// Use Models array to build model list
+	for _, modelId := range c.Models {
+		if modelId == "" {
+			continue // Skip empty model IDs
+		}
+		models = append(models, ModelInfo{
+			Id:      modelId,
+			Object:  "model",
+			Created: 1686935002,
+			OwnedBy: owner,
+		})
+	}
+
+	return models, nil
+}
+
+// getOwnerByProviderType returns the owner name based on provider type
+func (c *ProviderConfig) getOwnerByProviderType() string {
+	switch c.Type {
+	case ProviderTypeOpenAI:
+		return "openai"
+	case ProviderTypeAzure:
+		return "microsoft"
+	case ProviderTypeQwen:
+		return "alibaba"
+	case ProviderTypeMoonshot:
+		return "moonshot"
+	case ProviderTypeClaude:
+		return "anthropic"
+	case ProviderTypeGemini:
+		return "google"
+	default:
+		return "unknown"
+	}
+}
+
+// BuildModelsResponse creates a models list response for a single provider
+func (c *ProviderConfig) BuildModelsResponse() ([]byte, error) {
+	models, err := c.GetModelList()
+	if err != nil {
+		return nil, err
+	}
+
+	response := ModelsResponse{
+		Object: "list",
+		Data:   models,
+	}
+
+	return json.Marshal(response)
+}
+
 type QuotaConfig struct {
-	redisInfo         RedisInfo           `yaml:"redis"`
-	RedisKeyPrefix    string              `yaml:"redis_key_prefix"`
-	RedisUsedPrefix   string              `yaml:"redis_used_prefix"`
-	RedisStarPrefix   string              `yaml:"redis_star_prefix"`
-	CheckGithubStar   bool                `yaml:"check_github_star"`
-	TokenHeader       string              `yaml:"token_header"`
-	AdminHeader       string              `yaml:"admin_header"`
-	AdminKey          string              `yaml:"admin_key"`
-	AdminPath         string              `yaml:"admin_path"`
-	DeductHeader      string              `yaml:"deduct_header"`
-	DeductHeaderValue string              `yaml:"deduct_header_value"`
-	ModelQuotaWeights map[string]int      `yaml:"model_quota_weights"`
-	redisClient       wrapper.RedisClient `yaml:"-"`
-	starCache         map[string]bool     `yaml:"-"` // Simple star status cache
+	redisInfo         RedisInfo      `yaml:"redis"`
+	RedisKeyPrefix    string         `yaml:"redis_key_prefix"`
+	RedisUsedPrefix   string         `yaml:"redis_used_prefix"`
+	RedisStarPrefix   string         `yaml:"redis_star_prefix"`
+	CheckGithubStar   bool           `yaml:"check_github_star"`
+	TokenHeader       string         `yaml:"token_header"`
+	AdminHeader       string         `yaml:"admin_header"`
+	AdminKey          string         `yaml:"admin_key"`
+	AdminPath         string         `yaml:"admin_path"`
+	DeductHeader      string         `yaml:"deduct_header"`
+	DeductHeaderValue string         `yaml:"deduct_header_value"`
+	ModelQuotaWeights map[string]int `yaml:"model_quota_weights"`
+
+	// Provider configuration for /ai-gateway/api/v1/models endpoint
+	Provider  ProviderConfig   `yaml:"provider"`  // Single provider configuration (legacy support)
+	Providers []ProviderConfig `yaml:"providers"` // Multi-provider configuration (new format)
+
+	redisClient     wrapper.RedisClient `yaml:"-"`
+	starCache       map[string]bool     `yaml:"-"` // Simple star status cache
+	providerConfigs []ProviderConfig    `yaml:"-"` // All configured providers for models endpoint
 }
 
 type Consumer struct {
@@ -160,6 +264,79 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 			return true
 		})
 	}
+
+	// Parse provider configuration - support both single provider and multi-provider modes
+	// Process providers array configuration first
+	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
+		config.Providers = make([]ProviderConfig, 0)
+		for _, providerJson := range providersJson.Array() {
+			providerConfig := ProviderConfig{}
+
+			// Parse provider ID (required for multi-provider)
+			providerConfig.Id = providerJson.Get("id").String()
+			if providerConfig.Id == "" {
+				log.Warnf("Provider ID is required for multi-provider configuration, skipping provider")
+				continue
+			}
+
+			// Parse provider type
+			providerType := providerJson.Get("type").String()
+			if providerType == "" {
+				providerType = ProviderTypeOpenAI // Default to OpenAI
+			}
+			providerConfig.Type = providerType
+
+			// Parse models array (new format, preferred)
+			if modelsJson := providerJson.Get("models"); modelsJson.Exists() && modelsJson.IsArray() {
+				providerConfig.Models = make([]string, 0)
+				for _, modelJson := range modelsJson.Array() {
+					modelId := modelJson.String()
+					if modelId != "" {
+						providerConfig.Models = append(providerConfig.Models, modelId)
+					}
+				}
+			}
+
+			config.Providers = append(config.Providers, providerConfig)
+		}
+
+		// Reset legacy provider config for pure multi-provider mode
+		config.Provider = ProviderConfig{}
+		return nil
+	}
+
+	// Process legacy single provider configuration
+	if providerConfig := json.Get("provider"); providerConfig.Exists() && providerConfig.IsObject() {
+		// Legacy single provider configuration
+		config.Provider.Id = "default" // Set default ID for legacy mode
+
+		// Parse provider type
+		providerType := providerConfig.Get("type").String()
+		if providerType == "" {
+			providerType = ProviderTypeOpenAI // Default to OpenAI
+		}
+		config.Provider.Type = providerType
+
+		// Parse models array (new format, preferred)
+		if modelsJson := providerConfig.Get("models"); modelsJson.Exists() && modelsJson.IsArray() {
+			config.Provider.Models = make([]string, 0)
+			for _, modelJson := range modelsJson.Array() {
+				modelId := modelJson.String()
+				if modelId != "" {
+					config.Provider.Models = append(config.Provider.Models, modelId)
+				}
+			}
+		}
+
+		// Clear multi-provider array for legacy mode
+		config.Providers = nil
+		return nil
+	}
+
+	// If no provider configuration is found, set defaults
+	config.Provider.Id = "default"
+	config.Provider.Type = ProviderTypeOpenAI
+	config.Provider.Models = make([]string, 0)
 
 	// Redis
 	config.RedisKeyPrefix = json.Get("redis_key_prefix").String()
@@ -254,6 +431,35 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 
 	rawPath := context.Path()
 	path, _ := url.Parse(rawPath)
+
+	// Handle /ai-gateway/api/v1/models request locally first
+	if path.Path == "/ai-gateway/api/v1/models" {
+		log.Debugf("[onHttpRequestHeaders] handling /ai-gateway/api/v1/models request locally")
+		context.DontReadRequestBody()
+
+		// Generate models response based on configured providers (supports both single and multi-provider)
+		responseBody, err := config.BuildCombinedModelsResponse()
+		if err != nil {
+			log.Errorf("failed to build models response: %v", err)
+			_ = sendJSONResponse(500, "ai-quota.build_models_failed", "Failed to build models response", false, nil)
+			return types.ActionContinue
+		}
+
+		// Send HTTP response directly
+		headers := [][2]string{
+			{"content-type", "application/json"},
+		}
+		err = proxywasm.SendHttpResponse(200, headers, responseBody, -1)
+		if err != nil {
+			log.Errorf("failed to send response: %v", err)
+			_ = sendJSONResponse(500, "ai-quota.send_models_response_failed", "Failed to send models response", false, nil)
+			return types.ActionContinue
+		}
+
+		log.Debugf("[onHttpRequestHeaders] models response sent: %s", string(responseBody))
+		return types.ActionContinue
+	}
+
 	chatMode, adminMode := getOperationMode(path.Path, config.AdminPath, log)
 	context.SetContext("chatMode", chatMode)
 	context.SetContext("adminMode", adminMode)
@@ -505,15 +711,30 @@ func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConf
 		return
 	}
 
-	// Rest of the existing logic for handling total quota response
+	// Handle the case where total quota key doesn't exist or is empty - default to 0
 	totalQuotaStr := totalResponse.String()
-	totalQuota, parseErr := strconv.Atoi(totalQuotaStr)
+	totalQuota := 0 // Default value for users without allocated quota
+	var parseErr error
 
-	if parseErr != nil {
-		log.Errorf("Invalid total quota format for user %s: %s", userId, totalQuotaStr)
-		sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_total_quota",
-			"Invalid total quota format", false, nil)
-		return
+	if totalQuotaStr != "" {
+		totalQuota, parseErr = strconv.Atoi(totalQuotaStr)
+		if parseErr != nil {
+			log.Errorf("Invalid total quota format for user %s: %s", userId, totalQuotaStr)
+			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_total_quota",
+				"Invalid total quota format", false, nil)
+			return
+		}
+
+		// Validate that total quota is non-negative
+		if totalQuota < 0 {
+			log.Errorf("Invalid total quota value for user %s: %d (cannot be negative)", userId, totalQuota)
+			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_total_quota",
+				"Invalid total quota value", false, nil)
+			return
+		}
+	} else {
+		// Key doesn't exist or is empty, log for monitoring
+		log.Infof("No total quota found for user %s (key does not exist or is empty), defaulting to 0", userId)
 	}
 
 	// Get used quota
@@ -537,9 +758,9 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 		return
 	}
 
-	// Handle the case where used quota key doesn't exist (first time user)
+	// Handle the case where used quota key doesn't exist or is empty - default to 0
 	usedQuotaStr := usedResponse.String()
-	usedQuota := 0
+	usedQuota := 0 // Default value for new users
 
 	if usedQuotaStr != "" {
 		var parseErr error
@@ -550,10 +771,32 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 				"Invalid used quota format", false, nil)
 			return
 		}
+
+		// Validate that used quota is non-negative
+		if usedQuota < 0 {
+			log.Errorf("Invalid used quota value for user %s: %d (cannot be negative)", userId, usedQuota)
+			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_used_quota",
+				"Invalid used quota value", false, nil)
+			return
+		}
+
+		// Additional sanity check: used quota shouldn't exceed total quota by a large margin
+		// (Allow some tolerance for concurrent operations)
+		if usedQuota > totalQuota+quotaWeight {
+			log.Warnf("Used quota (%d) significantly exceeds total quota (%d) for user %s. This may indicate data inconsistency.",
+				usedQuota, totalQuota, userId)
+		}
+	} else {
+		// Key doesn't exist or is empty, log for monitoring
+		log.Infof("No used quota found for user %s (key does not exist or is empty), defaulting to 0", userId)
 	}
 
 	// Calculate remaining quota
 	remainingQuota := totalQuota - usedQuota
+
+	// Log quota status for debugging
+	log.Debugf("Quota status for user %s: total=%d, used=%d, remaining=%d, required=%d",
+		userId, totalQuota, usedQuota, remainingQuota, quotaWeight)
 
 	// Check if sufficient quota is available
 	if remainingQuota >= quotaWeight {
@@ -578,10 +821,28 @@ func handleQuotaDeductionResponse(ctx wrapper.HttpContext, incrResponse resp.Val
 		return
 	}
 
-	// Successful quota deduction
+	// Validate the response from Redis IncrBy operation
 	newUsedQuota := incrResponse.Integer()
-	log.Infof("Successfully deducted %d quota for user %s, model %s. New used quota: %d",
-		quotaWeight, userId, modelName, newUsedQuota)
+
+	// Sanity check: the new used quota should be reasonable
+	if newUsedQuota < quotaWeight {
+		log.Errorf("Unexpected used quota after deduction for user %s: got %d, expected at least %d",
+			userId, newUsedQuota, quotaWeight)
+		sendJSONResponse(http.StatusInternalServerError, "quota-check.deduction_inconsistent",
+			"Quota deduction resulted in inconsistent state", false, nil)
+		return
+	}
+
+	// Calculate what the previous used quota should have been
+	expectedPreviousUsed := newUsedQuota - quotaWeight
+
+	// Log quota deduction details for audit and debugging
+	log.Infof("Successfully deducted %d quota for user %s, model %s. Previous used: %d, New used: %d",
+		quotaWeight, userId, modelName, expectedPreviousUsed, newUsedQuota)
+
+	// Additional debug information
+	log.Debugf("Quota deduction details for user %s: deducted=%d, new_used=%d, expected_previous=%d",
+		userId, quotaWeight, newUsedQuota, expectedPreviousUsed)
 
 	proxywasm.ResumeHttpRequest()
 }
@@ -704,8 +965,12 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 	}
 
 	err := config.redisClient.Get(redisKey, func(response resp.Value) {
-		if err := response.Error(); err != nil {
-			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
+		// Check for Redis errors first
+		if wrapper.IsRedisErrorResponse(response) {
+			redisErr := wrapper.GetRedisErrorFromResponse(response)
+			log.Errorf("Failed to query %s for user %s: %v", responseType, userId, redisErr)
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.redis_error",
+				fmt.Sprintf("Redis error: %s", redisErr.Error()), false, nil)
 			return
 		}
 
@@ -713,7 +978,15 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 			// Handle star status query (string value)
 			starValue := "false"
 			if !response.IsNull() {
-				starValue = response.String()
+				starValueFromRedis := response.String()
+				// Validate star value format
+				if starValueFromRedis == "true" || starValueFromRedis == "false" {
+					starValue = starValueFromRedis
+				} else {
+					log.Warnf("Invalid star status value for user %s: %s, defaulting to false", userId, starValueFromRedis)
+				}
+			} else {
+				log.Debugf("No star status found for user %s (key does not exist), defaulting to false", userId)
 			}
 
 			// Only cache true status
@@ -735,8 +1008,30 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 			// Handle quota query (integer value)
 			quota := 0
 			if !response.IsNull() {
-				quota = response.Integer()
+				// Validate that the response can be converted to integer
+				quotaStr := response.String()
+				if quotaStr != "" {
+					var parseErr error
+					quota, parseErr = strconv.Atoi(quotaStr)
+					if parseErr != nil {
+						log.Errorf("Invalid %s format for user %s: %s", responseType, userId, quotaStr)
+						sendJSONResponse(http.StatusInternalServerError, "ai-gateway.invalid_quota_format",
+							fmt.Sprintf("Invalid %s format", responseType), false, nil)
+						return
+					}
+
+					// Validate that quota is non-negative
+					if quota < 0 {
+						log.Errorf("Invalid %s value for user %s: %d (cannot be negative)", responseType, userId, quota)
+						sendJSONResponse(http.StatusInternalServerError, "ai-gateway.invalid_quota_value",
+							fmt.Sprintf("Invalid %s value", responseType), false, nil)
+						return
+					}
+				}
+			} else {
+				log.Debugf("No %s found for user %s (key does not exist or is empty), defaulting to 0", responseType, userId)
 			}
+
 			data := map[string]interface{}{
 				"user_id": userId,
 				"quota":   quota,
@@ -938,4 +1233,48 @@ func (config *QuotaConfig) setStarCache(userId string, hasStar bool) {
 // deleteStarCache removes user star status from cache
 func (config *QuotaConfig) deleteStarCache(userId string) {
 	delete(config.starCache, userId)
+}
+
+// BuildCombinedModelsResponse builds a models response that combines all configured providers
+func (config *QuotaConfig) BuildCombinedModelsResponse() ([]byte, error) {
+	// For single provider configuration
+	if len(config.Providers) == 0 && config.Provider.Id != "" {
+		return config.Provider.BuildModelsResponse()
+	}
+
+	// For multi-provider configuration, combine all model mappings
+	if len(config.Providers) == 0 {
+		return []byte(`{"object":"list","data":[]}`), nil
+	}
+
+	// Collect all unique models from all providers (first provider wins for duplicates)
+	modelMap := make(map[string]ModelInfo)
+
+	for _, providerConfig := range config.Providers {
+		models, err := providerConfig.GetModelList()
+		if err != nil {
+			continue
+		}
+
+		// Add models that don't already exist (first provider priority)
+		for _, model := range models {
+			if _, exists := modelMap[model.Id]; !exists {
+				modelMap[model.Id] = model
+			}
+		}
+	}
+
+	// Convert map to slice
+	var models []ModelInfo
+	for _, model := range modelMap {
+		models = append(models, model)
+	}
+
+	// Build response
+	response := ModelsResponse{
+		Object: "list",
+		Data:   models,
+	}
+
+	return json.Marshal(response)
 }

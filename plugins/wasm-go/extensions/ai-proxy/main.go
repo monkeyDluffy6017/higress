@@ -72,37 +72,9 @@ func parseOverrideRuleConfig(json gjson.Result, global config.PluginConfig, plug
 }
 
 func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConfig) types.Action {
-	// Handle /ai-gateway/api/v1/models request locally first (before model selection)
 	rawPath := ctx.Path()
 	path, _ := url.Parse(rawPath)
 	apiName := getApiName(path.Path)
-
-	if apiName == provider.ApiNameModels {
-		log.Debugf("[onHttpRequestHeader] handling /ai-gateway/api/v1/models request locally")
-		ctx.DontReadRequestBody()
-
-		// Generate models response based on all configured providers
-		responseBody, err := pluginConfig.BuildCombinedModelsResponse()
-		if err != nil {
-			log.Errorf("failed to build models response: %v", err)
-			_ = util.ErrorHandler("ai-proxy.build_models_failed", fmt.Errorf("failed to build models response: %v", err))
-			return types.ActionContinue
-		}
-
-		// Send HTTP response directly
-		headers := [][2]string{
-			{"content-type", "application/json"},
-		}
-		err = proxywasm.SendHttpResponse(200, headers, responseBody, -1)
-		if err != nil {
-			log.Errorf("failed to send response: %v", err)
-			_ = util.ErrorHandler("ai-proxy.send_models_response_failed", fmt.Errorf("failed to send response: %v", err))
-			return types.ActionContinue
-		}
-
-		log.Debugf("[onHttpRequestHeader] models response sent: %s", string(responseBody))
-		return types.ActionContinue
-	}
 
 	// Get model name from request for provider selection
 	if contentType, _ := proxywasm.GetHttpRequestHeader(util.HeaderContentType); contentType != "" && strings.Contains(contentType, util.MimeTypeApplicationJson) {
@@ -499,7 +471,7 @@ func getApiName(path string) provider.ApiName {
 	if util.RegRetrieveFileContentPath.MatchString(path) {
 		return provider.ApiNameRetrieveFileContent
 	}
-	if strings.HasSuffix(path, "/ai-gateway/api/v1/models") {
+	if strings.HasSuffix(path, "/v1/models") {
 		return provider.ApiNameModels
 	}
 	// cohere style

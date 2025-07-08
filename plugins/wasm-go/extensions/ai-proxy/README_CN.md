@@ -15,8 +15,6 @@ description: AI 代理插件配置参考
 
 > 请求路径后缀匹配 `/v1/embeddings` 时，对应文本向量场景，会用 OpenAI 的文本向量协议解析请求 Body，再转换为对应 LLM 厂商的文本向量协议
 
-> 请求路径后缀匹配 `/ai-gateway/api/v1/models` 时，会根据配置的 `modelMapping` 动态生成并返回可用的模型列表，与 OpenAI API 完全兼容
-
 ## 运行属性
 
 插件执行阶段：`默认阶段`
@@ -66,7 +64,6 @@ providers:
 1. **自动模型匹配**：根据请求中的 `model` 字段自动选择合适的provider
 2. **优先级规则**：如果多个provider都支持同一个模型，配置在前面的provider优先
 3. **无需手动切换**：不需要指定 `activeProviderId`，系统自动处理
-4. **模型列表合并**：`/ai-gateway/api/v1/models` 接口返回所有provider的模型列表，重复模型以第一个provider为准
 
 #### 路由示例
 
@@ -101,20 +98,6 @@ providers:
 - 请求 `deepseek-chat` → 路由到 `deepseek-provider`
 - 请求 `unknown-model` → 使用第一个provider作为fallback
 
-**模型列表API返回：**
-```json
-{
-  "object": "list",
-  "data": [
-    {"id": "gpt-4", "owned_by": "openai"},
-    {"id": "text-embedding-3-large", "owned_by": "openai"},
-    {"id": "qwen-plus", "owned_by": "alibaba"},
-    {"id": "text-embedding-v1", "owned_by": "alibaba"},
-    {"id": "deepseek-chat", "owned_by": "deepseek"}
-  ]
-}
-```
-
 #### 错误的配置示例（会导致状态污染）
 
 ```yaml
@@ -136,7 +119,7 @@ provider:  # 这会覆盖上面的配置
 | `type`           | string          | 必填     | -      | AI 服务提供商名称                                                                                                                                                                                                                                |
 | `apiTokens`      | array of string | 非必填   | -      | 用于在访问 AI 服务时进行认证的令牌。如果配置了多个 token，插件会在请求时随机进行选择。部分服务提供商只支持配置一个 token。                                                                                                                                                                     |
 | `timeout`        | number          | 非必填   | -      | 访问 AI 服务的超时时间。单位为毫秒。默认值为 120000，即 2 分钟。此项配置目前仅用于获取上下文信息，并不影响实际转发大模型请求。                                                                                                                                                                    |
-| `modelMapping`   | map of string   | 非必填   | -      | AI 模型映射表，用于将请求中的模型名称映射为服务提供商支持模型名称。<br/>1. 支持前缀匹配。例如用 "gpt-3-\*" 匹配所有名称以"gpt-3-"开头的模型；<br/>2. 支持使用 "\*" 为键来配置通用兜底映射关系；<br/>3. **重要说明**：如果映射的目标名称为空字符串 ""，该模型映射将被跳过，不会在 `/ai-gateway/api/v1/models` 接口中返回。如需保留原模型名称，请明确配置相同的模型名称（如 `"gpt-4": "gpt-4"`）。 |
+| `modelMapping`   | map of string   | 非必填   | -      | AI 模型映射表，用于将请求中的模型名称映射为服务提供商支持模型名称。<br/>1. 支持前缀匹配。例如用 "gpt-3-\*" 匹配所有名称以"gpt-3-"开头的模型；<br/>2. 支持使用 "\*" 为键来配置通用兜底映射关系。 |
 | `protocol`       | string          | 非必填   | -      | 插件对外提供的 API 接口契约。目前支持以下取值：openai（默认值，使用 OpenAI 的接口契约）、original（使用目标服务提供商的原始接口契约）                                                                                                                                                          |
 | `context`        | object          | 非必填   | -      | 配置 AI 对话上下文信息                                                                                                                                                                                                                             |
 | `customSettings` | array of customSetting | 非必填   | -      | 为AI请求指定覆盖或者填充参数                                                                                                                                                                                                                           |
@@ -207,11 +190,7 @@ custom-setting会遵循如下表格，根据`name`和协议来替换对应的字
 
 `modelMapping` 是一个重要的配置项，用于将请求中的模型名称映射为目标AI服务商支持的模型名称。正确配置 `modelMapping` 对于插件的正常运行非常重要。
 
-#### 重要注意事项
 
-1. **空字符串映射会被跳过**：如果将模型映射为空字符串（如 `"*": ""`），该映射将被跳过，不会在 `/ai-gateway/api/v1/models` 接口中返回任何模型。
-2. **空的 modelMapping**：如果不配置 `modelMapping` 或配置为空，`/ai-gateway/api/v1/models` 接口将返回空的模型列表。
-3. **保留原模型名称**：如果需要保留原模型名称，请明确配置相同的模型名称（如 `"gpt-4": "gpt-4"`）。
 
 #### 正确的配置示例
 
@@ -249,7 +228,7 @@ provider:
 provider:
   type: openai
   modelMapping:
-    '*': ""  # 这会导致空的模型列表，可能引起错误
+    '*': ""  # 映射为空字符串可能导致错误
 ```
 
 **✅ 应该这样配置**
@@ -268,7 +247,7 @@ provider:
   type: openai
   apiTokens:
     - "your-openai-api-key"
-  # 不配置 modelMapping 将返回空的模型列表
+  # 不配置 modelMapping
 ```
 
 ### 提供商特有配置
@@ -436,134 +415,7 @@ Dify 所对应的 `type` 为 `dify`。它特有的配置字段如下:
 
 ## 用法示例
 
-### `/ai-gateway/api/v1/models` API 端点
 
-ai-proxy 插件提供了兼容 OpenAI 标准的 `/ai-gateway/api/v1/models` 端点，用于获取当前配置下可用的模型列表。该端点会根据 `modelMapping` 配置动态生成模型列表。
-
-#### 功能说明
-
-- **自动生成模型列表**：基于 `modelMapping` 配置中的键（模型名称）生成可用模型列表
-- **过滤规则**：自动过滤掉通配符（`*`）、前缀匹配模式（如 `gpt-4-*`）和空字符串映射
-- **标准响应格式**：返回符合 OpenAI API 规范的响应格式
-
-#### 请求示例
-
-```bash
-curl -X GET "http://your-domain/ai-gateway/api/v1/models" \
-  -H "Content-Type: application/json"
-```
-
-#### 响应示例
-
-**配置了具体模型映射的情况：**
-
-```yaml
-provider:
-  type: qwen
-  apiTokens:
-    - "your-api-token"
-  modelMapping:
-    'gpt-3.5-turbo': "qwen-plus"
-    'gpt-4': "qwen-max"
-    'gpt-4-turbo': "qwen-max"
-    'text-embedding-v1': "text-embedding-v1"
-    'gpt-4-*': "qwen-max"  # 前缀匹配，不会在模型列表中显示
-    '*': "qwen-turbo"      # 通配符，不会在模型列表中显示
-```
-
-响应：
-
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "gpt-3.5-turbo",
-      "object": "model",
-      "created": 1686935002,
-      "owned_by": "alibaba"
-    },
-    {
-      "id": "gpt-4",
-      "object": "model",
-      "created": 1686935002,
-      "owned_by": "alibaba"
-    },
-    {
-      "id": "gpt-4-turbo",
-      "object": "model",
-      "created": 1686935002,
-      "owned_by": "alibaba"
-    },
-    {
-      "id": "text-embedding-v1",
-      "object": "model",
-      "created": 1686935002,
-      "owned_by": "alibaba"
-    }
-  ]
-}
-```
-
-**未配置 modelMapping 或配置为空的情况：**
-
-```yaml
-provider:
-  type: openai
-  apiTokens:
-    - "your-api-token"
-  # 没有配置 modelMapping
-```
-
-响应：
-
-```json
-{
-  "object": "list",
-  "data": []
-}
-```
-
-**错误配置的情况（所有模型都映射为空字符串）：**
-
-```yaml
-provider:
-  type: openai
-  apiTokens:
-    - "your-api-token"
-  modelMapping:
-    '*': ""  # 错误配置：映射为空字符串
-```
-
-响应：
-
-```json
-{
-  "object": "list",
-  "data": []
-}
-```
-
-#### 所有者（owned_by）字段说明
-
-不同的服务提供商会显示不同的所有者信息：
-
-| 提供商类型 | owned_by 值 |
-|----------|-------------|
-| openai | openai |
-| azure | openai-internal |
-| qwen | alibaba |
-| moonshot | moonshot |
-| claude | anthropic |
-| gemini | google |
-| 其他 | 提供商类型名称 |
-
-#### 使用建议
-
-1. **在集成前调用**：建议在集成 AI 代理服务前先调用 `/ai-gateway/api/v1/models` 端点获取可用模型列表
-2. **动态模型选择**：可以基于返回的模型列表动态选择要使用的模型
-3. **配置验证**：通过该端点可以验证 `modelMapping` 配置是否正确
-4. **客户端兼容性**：该端点与 OpenAI 官方 API 完全兼容，可以直接替换使用
 
 ### 使用 OpenAI 协议代理 Azure OpenAI 服务
 
@@ -729,53 +581,7 @@ URL: http://your-domain/v1/chat/completions
 }
 ```
 
-**模型列表请求示例**
 
-URL: http://your-domain/ai-gateway/api/v1/models
-
-```bash
-curl -X GET "http://your-domain/ai-gateway/api/v1/models"
-```
-
-响应示例：
-
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "gpt-3",
-      "object": "model",
-      "created": 1686935002,
-      "owned_by": "alibaba"
-    },
-    {
-      "id": "gpt-35-turbo",
-      "object": "model",
-      "created": 1686935002,
-      "owned_by": "alibaba"
-    },
-    {
-      "id": "gpt-4-turbo",
-      "object": "model",
-      "created": 1686935002,
-      "owned_by": "alibaba"
-    },
-    {
-      "id": "gpt-4o",
-      "object": "model",
-      "created": 1686935002,
-      "owned_by": "alibaba"
-    },
-    {
-      "id": "text-embedding-v1",
-      "object": "model",
-      "created": 1686935002,
-      "owned_by": "alibaba"
-    }
-  ]
-}
-```
 
 **多模态模型 API 请求示例（适用于 `qwen-vl-plus` 和 `qwen-vl-max` 模型）**
 
@@ -2046,8 +1852,7 @@ curl "http://<YOUR-DOMAIN>/v1/chat/completions" -H "Content-Type: application/js
   ]
 }'
 
-# 获取模型列表
-curl "http://<YOUR-DOMAIN>/ai-gateway/api/v1/models"
+
 ```
 
 ### Docker-Compose 示例
@@ -2176,6 +1981,5 @@ curl "http://localhost:10000/v1/chat/completions"  -H "Content-Type: application
   ]
 }'
 
-# 获取模型列表
-curl "http://localhost:10000/ai-gateway/api/v1/models"
+
 ```

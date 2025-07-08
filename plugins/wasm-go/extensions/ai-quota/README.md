@@ -22,6 +22,7 @@ Plugin execution priority: `750`
 - **Flexible Quota Deduction**: Header-based quota deduction triggering
 - **Complete Management APIs**: Support for query, refresh, and delta operations on both total and used quotas
 - **Redis Cluster Support**: Compatible with both Redis standalone and cluster modes
+- **Model List Display**: Support for displaying available model lists via `/ai-gateway/api/v1/models` endpoint with configurable providers
 
 ## How It Works
 
@@ -52,6 +53,8 @@ When a request contains specified headers and values, the system increments the 
 | `admin_path`           | string    | Optional           | /quota              | Prefix for quota management request paths     |
 | `deduct_header`        | string    | Optional           | x-quota-identity    | Header name triggering quota deduction        |
 | `deduct_header_value`  | string    | Optional           | true                | Header value triggering quota deduction       |
+| `provider`             | object    | Optional           | -                   | Single provider configuration for model lists |
+| `providers`            | array     | Optional           | -                   | Multi-provider configuration for model lists  |
 | `redis`                | object    | Yes                | -                   | Redis related configuration                    |
 
 Explanation of each configuration field in `redis`
@@ -79,6 +82,13 @@ admin_key: "your-admin-secret"
 admin_path: "/quota"
 deduct_header: "x-quota-identity"
 deduct_header_value: "user"
+# Single provider configuration for model list display
+provider:
+  type: "openai"
+  models:
+    - "gpt-4"
+    - "gpt-3.5-turbo"
+    - "text-embedding-3-large"
 redis:
   service_name: redis-service.default.svc.cluster.local
   service_port: 6379
@@ -97,6 +107,18 @@ admin_key: "your-admin-secret"
 admin_path: "/quota"
 deduct_header: "x-quota-identity"
 deduct_header_value: "user"
+# Multi-provider configuration for model list display
+providers:
+  - id: openai-provider
+    type: openai
+    models:
+      - "gpt-4"
+      - "gpt-3.5-turbo"
+  - id: deepseek-provider
+    type: deepseek
+    models:
+      - "deepseek-r1"
+      - "deepseek-chat"
 redis:
   service_name: "local-redis.static"
   service_port: 80
@@ -141,6 +163,40 @@ The plugin will extract the user ID from the `id` field of the token as the key 
 - When `check_github_star` is set to `true`, the system will first check if the user has starred the GitHub project
 - If the value of `{redis_star_prefix}{user_id}` in Redis is not "true", a 403 error will be returned, prompting the user to star https://github.com/zgsm-ai/zgsm project
 - Only after passing the GitHub star check will the system proceed with quota check and deduction
+
+### Model List API
+
+**Path**: `/ai-gateway/api/v1/models`
+
+**Method**: GET
+
+**Description**: Returns a combined list of available models from all configured providers. This endpoint does not require authentication and is handled locally by the plugin.
+
+**Response Example**:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-4",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "openai"
+    },
+    {
+      "id": "deepseek-r1",
+      "object": "model",
+      "created": 1686935002,
+      "owned_by": "unknown"
+    }
+  ]
+}
+```
+
+**Notes**:
+- In multi-provider mode, if multiple providers define the same model name, the first provider's configuration takes precedence
+- The `owned_by` field is automatically set based on the provider type (openai → "openai", qwen → "alibaba", etc.)
+- This endpoint is handled locally and does not forward requests to upstream services
 
 ### Management APIs
 
