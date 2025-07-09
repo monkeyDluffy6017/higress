@@ -667,32 +667,32 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 }
 
 func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, quotaWeight int, modelName string, log wrapper.Log) {
-	totalKey := config.RedisKeyPrefix + userId
-	usedKey := config.RedisUsedPrefix + userId
-
 	// Check if we need to deduct quota based on header
 	deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.DeductHeader)
 	shouldDeduct := err == nil && deductHeaderValue == config.DeductHeaderValue
 
-	// Use enhanced error handling with retries for critical quota operations
-	retryConfig := wrapper.RetryConfig{
-		MaxRetries:    2, // Limit retries for latency-sensitive operations
-		InitialDelay:  50 * time.Millisecond,
-		MaxDelay:      500 * time.Millisecond,
-		BackoffFactor: 2.0,
-		EnableJitter:  true,
-	}
-
 	if shouldDeduct {
-		// For now, use regular get operations until AtomicQuotaCheck is implemented
+		// Need to deduct quota: perform full quota check and deduction
+		totalKey := config.RedisKeyPrefix + userId
+		usedKey := config.RedisUsedPrefix + userId
+
+		// Use enhanced error handling with retries for critical quota operations
+		retryConfig := wrapper.RetryConfig{
+			MaxRetries:    2, // Limit retries for latency-sensitive operations
+			InitialDelay:  50 * time.Millisecond,
+			MaxDelay:      500 * time.Millisecond,
+			BackoffFactor: 2.0,
+			EnableJitter:  true,
+		}
+
 		config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
 			handleTotalQuotaResponseWithRetry(ctx, config, usedKey, totalResponse, userId, quotaWeight, modelName, log, retryConfig)
 		})
 	} else {
-		// Use regular GET for quota checking
-		config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
-			handleTotalQuotaResponseWithRetry(ctx, config, usedKey, totalResponse, userId, quotaWeight, modelName, log, retryConfig)
-		})
+		// No quota deduction needed: allow request to continue without Redis queries
+		log.Debugf("Quota deduction not required for user %s (header: %s != %s), allowing request",
+			userId, deductHeaderValue, config.DeductHeaderValue)
+		proxywasm.ResumeHttpRequest()
 	}
 }
 
@@ -714,27 +714,22 @@ func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConf
 	// Handle the case where total quota key doesn't exist or is empty - default to 0
 	totalQuotaStr := totalResponse.String()
 	totalQuota := 0 // Default value for users without allocated quota
-	var parseErr error
 
 	if totalQuotaStr != "" {
+		var parseErr error
 		totalQuota, parseErr = strconv.Atoi(totalQuotaStr)
 		if parseErr != nil {
-			log.Errorf("Invalid total quota format for user %s: %s", userId, totalQuotaStr)
-			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_total_quota",
-				"Invalid total quota format", false, nil)
-			return
+			log.Warnf("Invalid total quota format for user %s: %s", userId, totalQuotaStr)
+			totalQuota = 0 // Default to 0 on parse error
 		}
 
 		// Validate that total quota is non-negative
 		if totalQuota < 0 {
-			log.Errorf("Invalid total quota value for user %s: %d (cannot be negative)", userId, totalQuota)
-			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_total_quota",
-				"Invalid total quota value", false, nil)
-			return
+			log.Warnf("Invalid total quota value for user %s: %d (cannot be negative)", userId, totalQuota)
+			totalQuota = 0 // Default to 0 on parse error
 		}
 	} else {
-		// Key doesn't exist or is empty, log for monitoring
-		log.Infof("No total quota found for user %s (key does not exist or is empty), defaulting to 0", userId)
+		log.Debugf("No quota data found for user %s in Redis, defaulting to 0", userId)
 	}
 
 	// Get used quota
@@ -760,24 +755,20 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 
 	// Handle the case where used quota key doesn't exist or is empty - default to 0
 	usedQuotaStr := usedResponse.String()
-	usedQuota := 0 // Default value for new users
+	usedQuota := 0 // Default used quota to 0 if no data in Redis
 
 	if usedQuotaStr != "" {
 		var parseErr error
 		usedQuota, parseErr = strconv.Atoi(usedQuotaStr)
 		if parseErr != nil {
-			log.Errorf("Invalid used quota format for user %s: %s", userId, usedQuotaStr)
-			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_used_quota",
-				"Invalid used quota format", false, nil)
-			return
+			log.Warnf("Invalid used quota format for user %s: %s, defaulting to 0", userId, usedQuotaStr)
+			usedQuota = 0 // Default to 0 on parse error
 		}
 
 		// Validate that used quota is non-negative
 		if usedQuota < 0 {
-			log.Errorf("Invalid used quota value for user %s: %d (cannot be negative)", userId, usedQuota)
-			sendJSONResponse(http.StatusInternalServerError, "quota-check.invalid_used_quota",
-				"Invalid used quota value", false, nil)
-			return
+			log.Warnf("Invalid used quota value for user %s: %d (cannot be negative)", userId, usedQuota)
+			usedQuota = 0 // Default to 0 on parse error
 		}
 
 		// Additional sanity check: used quota shouldn't exceed total quota by a large margin
@@ -787,8 +778,7 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 				usedQuota, totalQuota, userId)
 		}
 	} else {
-		// Key doesn't exist or is empty, log for monitoring
-		log.Infof("No used quota found for user %s (key does not exist or is empty), defaulting to 0", userId)
+		log.Debugf("No used quota data found for user %s in Redis, defaulting to 0", userId)
 	}
 
 	// Calculate remaining quota
