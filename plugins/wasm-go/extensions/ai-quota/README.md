@@ -412,3 +412,152 @@ curl "https://example.com/v1/chat/completions" \
 5. **Concurrency Safety**: The plugin supports quota management in high-concurrency scenarios
 
 Note: Administrative operations do not require carrying JWT tokens, only need to provide the correct administrative secret key in the specified request header.
+
+## Configuration
+
+This plugin supports the following configuration:
+
+```yaml
+redis:
+  service_name: redis-service
+  service_port: 6379
+  username: ""
+  password: "your_password"
+  timeout: 2000
+  database: 0
+
+redis_key_prefix: "chat_quota:"
+redis_used_prefix: "chat_quota_used:"
+redis_star_prefix: "github_star:"
+check_github_star: true
+
+# New: Model Permission Management
+restricted_models:
+  - "gpt-4"
+  - "gpt-4-32k"
+  - "claude-3-opus"
+  - "deepseek-v3"
+
+permission_management:
+  redis_permission_prefix: "model_perm:"
+  admin_permission_path: "/model-permission"
+
+token_header: "authorization"
+admin_header: "x-admin-key"
+admin_key: "your-admin-secret"
+admin_path: "/quota"
+deduct_header: "x-quota-deduct"
+deduct_header_value: "true"
+
+model_quota_weights:
+  "gpt-4": 10
+  "gpt-3.5-turbo": 1
+  "claude-3-5-sonnet-latest": 5
+
+provider:
+  id: "openai"
+  type: "openai"
+  models:
+    - "gpt-4"
+    - "gpt-3.5-turbo"
+```
+
+## Features
+
+### Core Quota Management
+- **Quota tracking**: Real-time quota consumption tracking
+- **Deduction control**: Smart quota deduction with header-based control
+- **Multi-model support**: Different quota weights for different models
+- **Star requirement**: Optional GitHub star requirement for access
+
+### Model Permission Management (New)
+- **Restricted models**: Define models that require special permissions
+- **User permissions**: Grant specific users access to restricted models
+- **Memory caching**: In-memory permission cache for high performance
+- **JWT integration**: Extract user information from JWT tokens
+
+## Permission Management
+
+### User Permission Management
+
+The plugin now supports fine-grained model access control based on user permissions.
+
+#### Setting User Permissions
+
+```bash
+curl -X POST "http://your-gateway/model-permission/set" \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "employee_number=85054712&models=[\"gpt-4\",\"claude-3-opus\"]"
+```
+
+#### How It Works
+
+1. **Token Extraction**: The plugin extracts user information from JWT tokens in request headers
+2. **Employee Number**: Parses employee number from the user's full name (format: "Username (EmployeeNumber)")
+3. **Permission Check**: For restricted models, checks if the user has permission
+4. **Caching**: Permissions are cached in memory for performance
+5. **Redis Storage**: Permission data is stored in Redis with prefix `model_perm:`
+
+### /ai-gateway/api/v1/models Endpoint
+
+When handling `/ai-gateway/api/v1/models` requests:
+
+- **Without Token**: Returns only unrestricted models
+- **With Valid Token**: Returns unrestricted models + user's allowed restricted models
+- **Permission-based Filtering**: Automatically filters the model list based on user permissions
+
+## Administrative Interface
+
+### Quota Management (Existing)
+
+- `GET /v1/chat/completions/quota?user_id={user_id}`: Query user quota
+- `POST /v1/chat/completions/quota/refresh`: Refresh user quota
+- `POST /v1/chat/completions/quota/delta`: Modify user quota
+
+### Permission Management (New)
+
+- `POST /model-permission/set`: Set user model permissions
+  - Parameters: `employee_number`, `models` (JSON array)
+- `GET /model-permission?employee_number={employee_number}`: Query user permissions
+
+## Configuration Details
+
+### restricted_models
+List of models that require special permissions. Users without explicit permission cannot access these models.
+
+### permission_management
+- `redis_permission_prefix`: Redis key prefix for storing permissions (default: "model_perm:")
+- `admin_permission_path`: URL path for permission management API (default: "/model-permission")
+
+## JWT Token Format
+
+The plugin expects JWT tokens with user information in this format:
+
+```json
+{
+  "universal_id": "user-uuid",
+  "username": "johndoe",
+  "employeeNumber": "85054712",
+  "fullName": "John Doe (85054712)"
+}
+```
+
+## Security Features
+
+- **Admin Authentication**: All administrative operations require valid admin keys
+- **Token Validation**: JWT tokens are parsed and validated
+- **Permission Hierarchy**: Clear separation between unrestricted and restricted models
+- **Audit Trail**: All permission operations are logged
+
+## Error Handling
+
+The plugin returns standardized error responses:
+
+```json
+{
+  "code": "ai-quota.model_permission_denied",
+  "message": "You don't have permission to use model gpt-4",
+  "success": false
+}
+```

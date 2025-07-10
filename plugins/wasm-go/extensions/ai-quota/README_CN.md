@@ -24,6 +24,10 @@ description: AI 配额管理插件配置参考
 - **Redis集群支持**：兼容Redis单机和集群模式
 - **GitHub关注检查**：可选的GitHub项目关注状态验证
 - **模型列表展示**：支持通过 `/ai-gateway/api/v1/models` 端点展示可配置provider的可用模型列表
+- **模型权限管理**（新增）：支持基于用户身份的细粒度模型访问控制
+- **受限模型配置**：可配置需要特殊权限的模型列表
+- **内存权限缓存**：高性能的权限验证，支持内存缓存
+- **权限管理接口**：提供权限设置和查询的管理接口
 
 ## 工作原理
 
@@ -58,6 +62,8 @@ description: AI 配额管理插件配置参考
 | `deduct_header`        | string    | 选填     | x-quota-identity       | 扣减配额的触发请求头名称        |
 | `deduct_header_value`  | string    | 选填     | true                   | 扣减配额的触发请求头值          |
 | `model_quota_weights`  | object    | 选填     | {}                     | 模型配额权重配置，指定每个模型的扣减额度 |
+| `restricted_models`    | array     | 选填     | []                     | 需要权限控制的模型列表（新增）       |
+| `permission_management`| object    | 选填     | -                      | 权限管理配置（新增）                |
 | `provider`             | object    | 选填     | -                      | 单provider配置，用于模型列表展示 |
 | `providers`            | array     | 选填     | -                      | 多provider配置，用于模型列表展示 |
 | `redis`                | object    | 是       | -                      | redis相关配置                  |
@@ -92,6 +98,15 @@ model_quota_weights:
   'gpt-4': 2
   'gpt-4-turbo': 3
   'gpt-4o': 4
+# 权限管理配置（新增）
+restricted_models:
+  - "gpt-4"
+  - "gpt-4-turbo"
+  - "claude-3-opus"
+  - "deepseek-v3"
+permission_management:
+  redis_permission_prefix: "model_perm:"
+  admin_permission_path: "/model-permission"
 # 单provider配置，用于模型列表展示
 provider:
   type: "openai"
@@ -201,6 +216,67 @@ curl -X POST https://example.com/v1/chat/completions \
 ```
 
 插件会从token的`id`字段提取用户ID作为配额限制的key。
+
+**权限管理中的员工号提取（新增）**：
+
+插件现在支持从JWT token的name字段中提取员工号。支持的格式：
+- `Username (EmployeeNumber)` - 如 `张三 (85054712)`
+- `EmployeeNumber` - 如 `85054712`
+
+提取的员工号将用于权限验证。
+
+## 权限管理API（新增）
+
+### 设置用户权限
+```bash
+curl -X POST "https://example.com/model-permission/set" \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "employee_number=85054712&models=[\"gpt-4\",\"claude-3-opus\"]"
+```
+
+### 查询用户权限
+```bash
+curl -X GET "https://example.com/model-permission/query?employee_number=85054712" \
+  -H "x-admin-key: your-admin-secret"
+```
+
+### 权限验证工作流程
+
+1. **请求 `/ai-gateway/api/v1/models`**：
+   - 获取所有可用模型列表
+   - 根据用户权限过滤受限模型
+   - 返回用户可访问的模型列表
+
+2. **普通AI请求**：
+   - 从JWT token解析员工号
+   - 检查请求的模型是否在受限模型列表中
+   - 如果是受限模型，验证用户权限
+   - 允许或拒绝请求
+
+### 权限验证示例
+
+```bash
+# 有权限的用户访问受限模型
+curl -X POST https://example.com/v1/chat/completions \
+  -H "Authorization: Bearer <jwt-token-with-permission>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+# 返回：正常响应
+
+# 无权限的用户访问受限模型
+curl -X POST https://example.com/v1/chat/completions \
+  -H "Authorization: Bearer <jwt-token-without-permission>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+# 返回：403 Forbidden - 无权限访问此模型
+```
 
 ## API接口
 

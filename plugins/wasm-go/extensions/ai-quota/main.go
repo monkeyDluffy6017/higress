@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"sync"
+
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-quota/util"
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
 	"github.com/go-jose/go-jose/v3/jwt"
@@ -82,20 +84,25 @@ const (
 type AdminMode string
 
 const (
+	AdminModeNone        AdminMode = "none"
 	AdminModeRefresh     AdminMode = "refresh"
-	AdminModeQuery       AdminMode = "query"
 	AdminModeDelta       AdminMode = "delta"
-	AdminModeUsedQuery   AdminMode = "used_query"
+	AdminModeQuery       AdminMode = "query"
 	AdminModeUsedRefresh AdminMode = "used_refresh"
 	AdminModeUsedDelta   AdminMode = "used_delta"
-	AdminModeStarQuery   AdminMode = "star_query"
+	AdminModeUsedQuery   AdminMode = "used_query"
 	AdminModeStarSet     AdminMode = "star_set"
-	AdminModeNone        AdminMode = "none"
+	AdminModeStarQuery   AdminMode = "star_query"
+	AdminModePermSet     AdminMode = "permission_set"
+	AdminModePermQuery   AdminMode = "permission_query"
 )
 
 // AuthUser struct for parsing user info from JWT
 type AuthUser struct {
-	ID string `json:"universal_id"`
+	ID             string `json:"universal_id"`
+	Username       string `json:"username"`
+	EmployeeNumber string `json:"employeeNumber"`
+	FullName       string `json:"fullName"`
 }
 
 func main() {
@@ -199,9 +206,161 @@ type QuotaConfig struct {
 	Provider  ProviderConfig   `yaml:"provider"`  // Single provider configuration (legacy support)
 	Providers []ProviderConfig `yaml:"providers"` // Multi-provider configuration (new format)
 
-	redisClient     wrapper.RedisClient `yaml:"-"`
-	starCache       map[string]bool     `yaml:"-"` // Simple star status cache
-	providerConfigs []ProviderConfig    `yaml:"-"` // All configured providers for models endpoint
+	// Permission management configuration
+	RestrictedModels     []string                   `yaml:"restricted_models"`
+	PermissionManagement PermissionManagementConfig `yaml:"permission_management"`
+
+	redisClient       wrapper.RedisClient `yaml:"-"`
+	starCache         map[string]bool     `yaml:"-"` // Simple star status cache
+	providerConfigs   []ProviderConfig    `yaml:"-"` // All configured providers for models endpoint
+	permissionChecker *PermissionChecker  `yaml:"-"` // Permission checker instance
+}
+
+// PermissionManagementConfig configuration for permission management
+type PermissionManagementConfig struct {
+	RedisPermissionPrefix string `yaml:"redis_permission_prefix"`
+	AdminPermissionPath   string `yaml:"admin_permission_path"`
+}
+
+// PermissionChecker handles model permission checking
+type PermissionChecker struct {
+	restrictedModels []string
+	memoryCache      map[string][]string // employee_number -> allowed_models
+	mu               sync.RWMutex
+	redisClient      wrapper.RedisClient
+	redisPermPrefix  string
+}
+
+// NewPermissionChecker creates a new permission checker
+func NewPermissionChecker(restrictedModels []string, redisClient wrapper.RedisClient, redisPermPrefix string) *PermissionChecker {
+	return &PermissionChecker{
+		restrictedModels: restrictedModels,
+		memoryCache:      make(map[string][]string),
+		redisClient:      redisClient,
+		redisPermPrefix:  redisPermPrefix,
+	}
+}
+
+// CheckModelPermission checks if a user has permission to access a model
+func (p *PermissionChecker) CheckModelPermission(employeeNumber, modelName string, log wrapper.Log) bool {
+	log.Debugf("[PermissionChecker.CheckModelPermission] Checking permission for employee: %s, model: %s", employeeNumber, modelName)
+
+	// 1. Check if model is restricted
+	if !p.isRestrictedModel(modelName, log) {
+		log.Debugf("[PermissionChecker.CheckModelPermission] Model %s is not restricted, allowing access", modelName)
+		return true // Not restricted, allow access
+	}
+
+	log.Debugf("[PermissionChecker.CheckModelPermission] Model %s is restricted, checking user permissions", modelName)
+
+	// 2. Get user's allowed models
+	allowedModels := p.getUserAllowedModels(employeeNumber)
+	log.Debugf("[PermissionChecker.CheckModelPermission] Employee %s allowed models: %v", employeeNumber, allowedModels)
+
+	// 3. Check if model is allowed
+	isAllowed := p.isModelAllowed(modelName, allowedModels, log)
+	log.Debugf("[PermissionChecker.CheckModelPermission] Final permission result for employee %s and model %s: %t", employeeNumber, modelName, isAllowed)
+
+	return isAllowed
+}
+
+// isRestrictedModel checks if a model is in the restricted list
+func (p *PermissionChecker) isRestrictedModel(modelName string, log wrapper.Log) bool {
+	log.Debugf("[PermissionChecker.isRestrictedModel] Checking model: %s against restricted list: %v", modelName, p.restrictedModels)
+
+	for _, restricted := range p.restrictedModels {
+		if modelName == restricted {
+			log.Debugf("[PermissionChecker.isRestrictedModel] Model %s IS RESTRICTED", modelName)
+			return true
+		}
+	}
+
+	log.Debugf("[PermissionChecker.isRestrictedModel] Model %s is NOT RESTRICTED", modelName)
+	return false
+}
+
+// isModelAllowed checks if a model is in the allowed list
+func (p *PermissionChecker) isModelAllowed(modelName string, allowedModels []string, log wrapper.Log) bool {
+	log.Debugf("[PermissionChecker.isModelAllowed] Checking if model %s is in allowed list: %v", modelName, allowedModels)
+
+	for _, allowed := range allowedModels {
+		if modelName == allowed {
+			log.Debugf("[PermissionChecker.isModelAllowed] Model %s IS ALLOWED", modelName)
+			return true
+		}
+	}
+
+	log.Debugf("[PermissionChecker.isModelAllowed] Model %s is NOT in allowed list", modelName)
+	return false
+}
+
+// getUserAllowedModels gets user's allowed models from cache or Redis
+func (p *PermissionChecker) getUserAllowedModels(employeeNumber string) []string {
+	// Check memory cache first
+	p.mu.RLock()
+	if models, exists := p.memoryCache[employeeNumber]; exists {
+		p.mu.RUnlock()
+		return models
+	}
+	p.mu.RUnlock()
+
+	// Cache miss, get from Redis
+	models := p.getFromRedis(employeeNumber)
+
+	// Update memory cache (never expires)
+	p.updateMemoryCache(employeeNumber, models)
+
+	return models
+}
+
+// getFromRedis gets allowed models from Redis
+func (p *PermissionChecker) getFromRedis(employeeNumber string) []string {
+	key := p.redisPermPrefix + employeeNumber
+	var models []string
+
+	p.redisClient.Get(key, func(response resp.Value) {
+		if err := response.Error(); err != nil {
+			// Redis error, return empty permissions
+			return
+		}
+
+		if !response.IsNull() {
+			data := response.String()
+			json.Unmarshal([]byte(data), &models)
+		}
+	})
+
+	return models
+}
+
+// updateMemoryCache updates the memory cache
+func (p *PermissionChecker) updateMemoryCache(employeeNumber string, models []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.memoryCache[employeeNumber] = models
+}
+
+// SetUserPermission sets user's allowed models in Redis and cache
+func (p *PermissionChecker) SetUserPermission(employeeNumber string, models []string) error {
+	// Update Redis
+	key := p.redisPermPrefix + employeeNumber
+	data, _ := json.Marshal(models)
+
+	var err error
+	p.redisClient.Set(key, string(data), func(response resp.Value) {
+		if response.Error() != nil {
+			err = response.Error()
+		}
+	})
+
+	if err != nil {
+		return err
+	}
+
+	// Update memory cache
+	p.updateMemoryCache(employeeNumber, models)
+
+	return nil
 }
 
 type Consumer struct {
@@ -265,80 +424,7 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		})
 	}
 
-	// Parse provider configuration - support both single provider and multi-provider modes
-	// Process providers array configuration first
-	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
-		config.Providers = make([]ProviderConfig, 0)
-		for _, providerJson := range providersJson.Array() {
-			providerConfig := ProviderConfig{}
-
-			// Parse provider ID (required for multi-provider)
-			providerConfig.Id = providerJson.Get("id").String()
-			if providerConfig.Id == "" {
-				log.Warnf("Provider ID is required for multi-provider configuration, skipping provider")
-				continue
-			}
-
-			// Parse provider type
-			providerType := providerJson.Get("type").String()
-			if providerType == "" {
-				providerType = ProviderTypeOpenAI // Default to OpenAI
-			}
-			providerConfig.Type = providerType
-
-			// Parse models array (new format, preferred)
-			if modelsJson := providerJson.Get("models"); modelsJson.Exists() && modelsJson.IsArray() {
-				providerConfig.Models = make([]string, 0)
-				for _, modelJson := range modelsJson.Array() {
-					modelId := modelJson.String()
-					if modelId != "" {
-						providerConfig.Models = append(providerConfig.Models, modelId)
-					}
-				}
-			}
-
-			config.Providers = append(config.Providers, providerConfig)
-		}
-
-		// Reset legacy provider config for pure multi-provider mode
-		config.Provider = ProviderConfig{}
-		return nil
-	}
-
-	// Process legacy single provider configuration
-	if providerConfig := json.Get("provider"); providerConfig.Exists() && providerConfig.IsObject() {
-		// Legacy single provider configuration
-		config.Provider.Id = "default" // Set default ID for legacy mode
-
-		// Parse provider type
-		providerType := providerConfig.Get("type").String()
-		if providerType == "" {
-			providerType = ProviderTypeOpenAI // Default to OpenAI
-		}
-		config.Provider.Type = providerType
-
-		// Parse models array (new format, preferred)
-		if modelsJson := providerConfig.Get("models"); modelsJson.Exists() && modelsJson.IsArray() {
-			config.Provider.Models = make([]string, 0)
-			for _, modelJson := range modelsJson.Array() {
-				modelId := modelJson.String()
-				if modelId != "" {
-					config.Provider.Models = append(config.Provider.Models, modelId)
-				}
-			}
-		}
-
-		// Clear multi-provider array for legacy mode
-		config.Providers = nil
-		return nil
-	}
-
-	// If no provider configuration is found, set defaults
-	config.Provider.Id = "default"
-	config.Provider.Type = ProviderTypeOpenAI
-	config.Provider.Models = make([]string, 0)
-
-	// Redis
+	// Redis configuration - must be parsed before permission checker initialization
 	config.RedisKeyPrefix = json.Get("redis_key_prefix").String()
 	if config.RedisKeyPrefix == "" {
 		config.RedisKeyPrefix = "chat_quota:"
@@ -394,7 +480,135 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		Port: int64(servicePort),
 	})
 
+	// Parse permission management configuration BEFORE provider configuration
+	config.RestrictedModels = make([]string, 0)
+	if restrictedModelsJson := json.Get("restricted_models"); restrictedModelsJson.Exists() && restrictedModelsJson.IsArray() {
+		log.Debugf("[parseConfig] Found restricted_models in config")
+		for _, modelJson := range restrictedModelsJson.Array() {
+			modelName := modelJson.String()
+			if modelName != "" {
+				config.RestrictedModels = append(config.RestrictedModels, modelName)
+				log.Debugf("[parseConfig] Added restricted model: %s", modelName)
+			}
+		}
+	} else {
+		log.Debugf("[parseConfig] No restricted_models found in config")
+	}
+	log.Debugf("[parseConfig] Final restricted models list: %v", config.RestrictedModels)
+
+	// Parse permission management configuration
+	permConfig := json.Get("permission_management")
+	config.PermissionManagement.RedisPermissionPrefix = permConfig.Get("redis_permission_prefix").String()
+	if config.PermissionManagement.RedisPermissionPrefix == "" {
+		config.PermissionManagement.RedisPermissionPrefix = "model_perm:"
+	}
+	log.Debugf("[parseConfig] Redis permission prefix: %s", config.PermissionManagement.RedisPermissionPrefix)
+
+	config.PermissionManagement.AdminPermissionPath = permConfig.Get("admin_permission_path").String()
+	if config.PermissionManagement.AdminPermissionPath == "" {
+		config.PermissionManagement.AdminPermissionPath = "/model-permission"
+	}
+	log.Debugf("[parseConfig] Admin permission path: %s", config.PermissionManagement.AdminPermissionPath)
+
+	// Initialize permission checker
+	log.Debugf("[parseConfig] Initializing permission checker with restricted models: %v", config.RestrictedModels)
+	config.permissionChecker = NewPermissionChecker(
+		config.RestrictedModels,
+		config.redisClient,
+		config.PermissionManagement.RedisPermissionPrefix,
+	)
+	log.Debugf("[parseConfig] Permission checker initialized successfully: %t", config.permissionChecker != nil)
+
+	// Parse provider configuration - support both single provider and multi-provider modes
+	// Process providers array configuration first
+	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
+		config.Providers = make([]ProviderConfig, 0)
+		for _, providerJson := range providersJson.Array() {
+			providerConfig := ProviderConfig{}
+
+			// Parse provider ID (required for multi-provider)
+			providerConfig.Id = providerJson.Get("id").String()
+			if providerConfig.Id == "" {
+				log.Warnf("Provider ID is required for multi-provider configuration, skipping provider")
+				continue
+			}
+
+			// Parse provider type
+			providerType := providerJson.Get("type").String()
+			if providerType == "" {
+				providerType = ProviderTypeOpenAI // Default to OpenAI
+			}
+			providerConfig.Type = providerType
+
+			// Parse models array (new format, preferred)
+			if modelsJson := providerJson.Get("models"); modelsJson.Exists() && modelsJson.IsArray() {
+				providerConfig.Models = make([]string, 0)
+				for _, modelJson := range modelsJson.Array() {
+					modelId := modelJson.String()
+					if modelId != "" {
+						providerConfig.Models = append(providerConfig.Models, modelId)
+					}
+				}
+			}
+
+			config.Providers = append(config.Providers, providerConfig)
+		}
+
+		// Reset legacy provider config for pure multi-provider mode
+		config.Provider = ProviderConfig{}
+		return config.redisClient.Init(username, password, int64(timeout), wrapper.WithDataBase(database))
+	}
+
+	// Process legacy single provider configuration
+	if providerConfig := json.Get("provider"); providerConfig.Exists() && providerConfig.IsObject() {
+		// Legacy single provider configuration
+		config.Provider.Id = "default" // Set default ID for legacy mode
+
+		// Parse provider type
+		providerType := providerConfig.Get("type").String()
+		if providerType == "" {
+			providerType = ProviderTypeOpenAI // Default to OpenAI
+		}
+		config.Provider.Type = providerType
+
+		// Parse models array (new format, preferred)
+		if modelsJson := providerConfig.Get("models"); modelsJson.Exists() && modelsJson.IsArray() {
+			config.Provider.Models = make([]string, 0)
+			for _, modelJson := range modelsJson.Array() {
+				modelId := modelJson.String()
+				if modelId != "" {
+					config.Provider.Models = append(config.Provider.Models, modelId)
+				}
+			}
+		}
+
+		// Clear multi-provider array for legacy mode
+		config.Providers = nil
+		return config.redisClient.Init(username, password, int64(timeout), wrapper.WithDataBase(database))
+	}
+
+	// If no provider configuration is found, set defaults
+	config.Provider.Id = "default"
+	config.Provider.Type = ProviderTypeOpenAI
+	config.Provider.Models = make([]string, 0)
+
 	return config.redisClient.Init(username, password, int64(timeout), wrapper.WithDataBase(database))
+}
+
+// parseEmployeeNumberFromFullName extracts employee number from full name
+// FullName format: "Username (EmployeeNumber)"
+func parseEmployeeNumberFromFullName(fullName string) string {
+	// Find the last occurrence of '(' and ')'
+	start := strings.LastIndex(fullName, "(")
+	end := strings.LastIndex(fullName, ")")
+
+	if start == -1 || end == -1 || start >= end {
+		return ""
+	}
+
+	// Extract employee number
+	employeeNumber := strings.TrimSpace(fullName[start+1 : end])
+	return employeeNumber
 }
 
 // parseUserInfoFromToken parses user info from JWT token
@@ -423,6 +637,11 @@ func parseUserInfoFromToken(accessToken string) (*AuthUser, error) {
 		return nil, fmt.Errorf("failed to deserialize user info: %w", err)
 	}
 
+	// Extract employee number from full name
+	if userInfo.FullName != "" && userInfo.EmployeeNumber == "" {
+		userInfo.EmployeeNumber = parseEmployeeNumberFromFullName(userInfo.FullName)
+	}
+
 	return &userInfo, nil
 }
 
@@ -435,10 +654,47 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 	// Handle /ai-gateway/api/v1/models request locally first
 	if path.Path == "/ai-gateway/api/v1/models" {
 		log.Debugf("[onHttpRequestHeaders] handling /ai-gateway/api/v1/models request locally")
+		log.Debugf("[onHttpRequestHeaders] Restricted models config: %v", config.RestrictedModels)
+		log.Debugf("[onHttpRequestHeaders] PermissionChecker available: %t", config.permissionChecker != nil)
 		context.DontReadRequestBody()
 
-		// Generate models response based on configured providers (supports both single and multi-provider)
-		responseBody, err := config.BuildCombinedModelsResponse()
+		// Get user's allowed models if token exists
+		var allowedModels []string
+		tokenHeader, err := proxywasm.GetHttpRequestHeader(config.TokenHeader)
+		log.Debugf("[onHttpRequestHeaders] Token header retrieval - err: %v, header present: %t", err, tokenHeader != "")
+
+		if err == nil && tokenHeader != "" {
+			// Extract token
+			token := extractTokenFromHeader(tokenHeader)
+			log.Debugf("[onHttpRequestHeaders] Extracted token length: %d", len(token))
+
+			if token != "" {
+				// Parse token to get employee number
+				userInfo, err := parseUserInfoFromToken(token)
+				log.Debugf("[onHttpRequestHeaders] Token parsing result - err: %v", err)
+
+				if err == nil && userInfo.EmployeeNumber != "" {
+					log.Debugf("[onHttpRequestHeaders] Employee number extracted: %s", userInfo.EmployeeNumber)
+
+					// Get user's allowed models (only if permissionChecker is available)
+					if config.permissionChecker != nil {
+						allowedModels = config.permissionChecker.getUserAllowedModels(userInfo.EmployeeNumber)
+						log.Debugf("[onHttpRequestHeaders] user %s has allowed models: %v", userInfo.EmployeeNumber, allowedModels)
+					} else {
+						log.Debugf("[onHttpRequestHeaders] permissionChecker is nil, no user-specific filtering")
+					}
+				} else {
+					log.Debugf("[onHttpRequestHeaders] Failed to extract employee number - userInfo: %+v, err: %v", userInfo, err)
+				}
+			} else {
+				log.Debugf("[onHttpRequestHeaders] Empty token after extraction")
+			}
+		} else {
+			log.Debugf("[onHttpRequestHeaders] No token header found, proceeding without user-specific filtering")
+		}
+
+		// Generate filtered models response
+		responseBody, err := config.BuildFilteredModelsResponse(allowedModels, log)
 		if err != nil {
 			log.Errorf("failed to build models response: %v", err)
 			_ = sendJSONResponse(500, "ai-quota.build_models_failed", "Failed to build models response", false, nil)
@@ -571,6 +827,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 	if adminMode == AdminModeStarSet {
 		return setStarStatus(ctx, config, string(body), log)
 	}
+	if adminMode == AdminModePermSet {
+		return setUserPermission(ctx, config, string(body), log)
+	}
 
 	return types.ActionContinue
 }
@@ -642,9 +901,62 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 }
 
 func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte, userId string, log wrapper.Log) types.Action {
+	log.Debugf("[processQuotaLogic] Starting quota logic for user: %s", userId)
+	log.Debugf("[processQuotaLogic] Request body: %s", string(body))
+	log.Debugf("[processQuotaLogic] Restricted models count: %d", len(config.RestrictedModels))
+	log.Debugf("[processQuotaLogic] Restricted models: %v", config.RestrictedModels)
+	log.Debugf("[processQuotaLogic] PermissionChecker available: %t", config.permissionChecker != nil)
+
 	// Extract model from request body
 	modelName := gjson.GetBytes(body, "model").String()
-	log.Debugf("Extracted model name: %s", modelName)
+	log.Debugf("[processQuotaLogic] Extracted model name: %s", modelName)
+
+	// Check model permission first
+	if len(config.RestrictedModels) > 0 && config.permissionChecker != nil {
+		log.Debugf("[processQuotaLogic] Starting permission check for model: %s", modelName)
+
+		// Check if the model is in restricted list
+		isRestricted := config.permissionChecker.isRestrictedModel(modelName, log)
+		if isRestricted {
+			// Get employee number from token
+			tokenHeader, err := proxywasm.GetHttpRequestHeader(config.TokenHeader)
+			log.Debugf("[processQuotaLogic] Token header retrieval result - err: %v, header present: %t", err, tokenHeader != "")
+
+			if err != nil || tokenHeader == "" {
+				log.Warnf("[processQuotaLogic] No token found for restricted model %s - BLOCKING REQUEST", modelName)
+				sendJSONResponse(http.StatusUnauthorized, "ai-quota.no_token_restricted_model",
+					fmt.Sprintf("Token required to access restricted model %s", modelName), false, nil)
+				return types.ActionContinue
+			}
+
+			token := extractTokenFromHeader(tokenHeader)
+			if token == "" {
+				log.Warnf("[processQuotaLogic] Empty token for restricted model %s - BLOCKING REQUEST", modelName)
+				sendJSONResponse(http.StatusUnauthorized, "ai-quota.invalid_token_restricted_model",
+					fmt.Sprintf("Valid token required to access restricted model %s", modelName), false, nil)
+				return types.ActionContinue
+			}
+
+			userInfo, err := parseUserInfoFromToken(token)
+			if err != nil || userInfo.EmployeeNumber == "" {
+				log.Warnf("[processQuotaLogic] Failed to parse employee number from token for restricted model %s - BLOCKING REQUEST", modelName)
+				sendJSONResponse(http.StatusUnauthorized, "ai-quota.invalid_employee_number",
+					fmt.Sprintf("Valid employee information required to access restricted model %s", modelName), false, nil)
+				return types.ActionContinue
+			}
+
+			// Check if user has permission to use this model
+			hasPermission := config.permissionChecker.CheckModelPermission(userInfo.EmployeeNumber, modelName, log)
+			if !hasPermission {
+				log.Warnf("[processQuotaLogic] User %s does not have permission to use restricted model %s - BLOCKING REQUEST", userInfo.EmployeeNumber, modelName)
+				sendJSONResponse(http.StatusForbidden, "ai-quota.model_permission_denied",
+					fmt.Sprintf("You don't have permission to use model %s", modelName), false, nil)
+				return types.ActionContinue
+			}
+		}
+	} else {
+		log.Debugf("[processQuotaLogic] Skipping permission check - restrictedModels: %d, permissionChecker: %t", len(config.RestrictedModels), config.permissionChecker != nil)
+	}
 
 	// Get quota weight for this model, default to 0 if not configured
 	quotaWeight := 0
@@ -876,6 +1188,15 @@ func getOperationMode(path string, adminPath string, log wrapper.Log) (ChatMode,
 	if strings.HasSuffix(path, fullAdminPath) {
 		return ChatModeAdmin, AdminModeQuery
 	}
+
+	// Check for permission management path
+	if strings.HasSuffix(path, "/model-permission/set") {
+		return ChatModeAdmin, AdminModePermSet
+	}
+	if strings.HasSuffix(path, "/model-permission") {
+		return ChatModeAdmin, AdminModePermQuery
+	}
+
 	if strings.HasSuffix(path, "/v1/chat/completions") {
 		return ChatModeCompletion, AdminModeNone
 	}
@@ -1199,6 +1520,54 @@ func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log
 	return types.ActionPause
 }
 
+func setUserPermission(ctx wrapper.HttpContext, config QuotaConfig, body string, log wrapper.Log) types.Action {
+	queryValues, _ := url.ParseQuery(body)
+	values := make(map[string]string)
+	for k, v := range queryValues {
+		if len(v) > 0 {
+			values[k] = v[0]
+		}
+	}
+
+	employeeNumber := values["employee_number"]
+	modelsParam := values["models"]
+	if employeeNumber == "" {
+		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		return types.ActionContinue
+	}
+
+	// Parse models list
+	var models []string
+	if modelsParam != "" {
+		if err := json.Unmarshal([]byte(modelsParam), &models); err != nil {
+			// Try to parse as comma-separated string
+			models = strings.Split(modelsParam, ",")
+			for i, model := range models {
+				models[i] = strings.TrimSpace(model)
+			}
+		}
+	}
+
+	log.Debugf("Setting permission for employee %s with models: %v", employeeNumber, models)
+
+	// Set user permission
+	if config.permissionChecker != nil {
+		err := config.permissionChecker.SetUserPermission(employeeNumber, models)
+		if err != nil {
+			log.Errorf("Failed to set user permission for employee %s: %v", employeeNumber, err)
+			sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", fmt.Sprintf("Failed to set user permission: %v", err), false, nil)
+			return types.ActionContinue
+		}
+	}
+
+	data := map[string]interface{}{
+		"employee_number": employeeNumber,
+		"models":          models,
+	}
+	sendJSONResponse(http.StatusOK, "ai-quota.setpermission", "set user permission successful", true, data)
+	return types.ActionContinue
+}
+
 // checkStarCache checks if user star status is cached
 func (config *QuotaConfig) checkStarCache(userId string) (bool, bool) {
 	hasStar, exists := config.starCache[userId]
@@ -1267,4 +1636,82 @@ func (config *QuotaConfig) BuildCombinedModelsResponse() ([]byte, error) {
 	}
 
 	return json.Marshal(response)
+}
+
+// BuildFilteredModelsResponse builds a filtered models response based on user permissions
+func (config *QuotaConfig) BuildFilteredModelsResponse(allowedModels []string, log wrapper.Log) ([]byte, error) {
+	log.Debugf("[BuildFilteredModelsResponse] Starting model filtering process")
+	log.Debugf("[BuildFilteredModelsResponse] User allowed models: %v", allowedModels)
+	log.Debugf("[BuildFilteredModelsResponse] Restricted models config: %v", config.RestrictedModels)
+	log.Debugf("[BuildFilteredModelsResponse] PermissionChecker available: %t", config.permissionChecker != nil)
+
+	// First get all available models
+	allModelsData, err := config.BuildCombinedModelsResponse()
+	if err != nil {
+		log.Errorf("[BuildFilteredModelsResponse] Failed to build combined models response: %v", err)
+		return nil, err
+	}
+
+	// Parse all models
+	var allModelsResponse ModelsResponse
+	if err := json.Unmarshal(allModelsData, &allModelsResponse); err != nil {
+		log.Errorf("[BuildFilteredModelsResponse] Failed to unmarshal models response: %v", err)
+		return nil, err
+	}
+
+	log.Debugf("[BuildFilteredModelsResponse] Total available models before filtering: %d", len(allModelsResponse.Data))
+	for i, model := range allModelsResponse.Data {
+		log.Debugf("[BuildFilteredModelsResponse] Model[%d]: %s", i, model.Id)
+	}
+
+	// Filter models based on permissions
+	var filteredModels []ModelInfo
+	for _, model := range allModelsResponse.Data {
+		log.Debugf("[BuildFilteredModelsResponse] Processing model: %s", model.Id)
+
+		// Check if model is restricted (only if permissionChecker is available)
+		if config.permissionChecker != nil && config.permissionChecker.isRestrictedModel(model.Id, log) {
+			log.Debugf("[BuildFilteredModelsResponse] Model %s is RESTRICTED", model.Id)
+
+			// Model is restricted, check if user has permission
+			if allowedModels == nil || len(allowedModels) == 0 {
+				log.Debugf("[BuildFilteredModelsResponse] No user permissions found, SKIPPING restricted model: %s", model.Id)
+				continue
+			}
+
+			// Check if model is in allowed list
+			if config.permissionChecker != nil && !config.permissionChecker.isModelAllowed(model.Id, allowedModels, log) {
+				log.Debugf("[BuildFilteredModelsResponse] Model %s not in user's allowed list, SKIPPING", model.Id)
+				continue
+			}
+
+			log.Debugf("[BuildFilteredModelsResponse] Model %s is restricted but user has permission, INCLUDING", model.Id)
+		} else {
+			log.Debugf("[BuildFilteredModelsResponse] Model %s is NOT RESTRICTED, INCLUDING", model.Id)
+		}
+
+		// Model is not restricted or user has permission, include it
+		filteredModels = append(filteredModels, model)
+		log.Debugf("[BuildFilteredModelsResponse] Added model to final list: %s", model.Id)
+	}
+
+	log.Debugf("[BuildFilteredModelsResponse] Final filtered models count: %d", len(filteredModels))
+	for i, model := range filteredModels {
+		log.Debugf("[BuildFilteredModelsResponse] Final[%d]: %s", i, model.Id)
+	}
+
+	// Build filtered response
+	response := ModelsResponse{
+		Object: "list",
+		Data:   filteredModels,
+	}
+
+	responseData, err := json.Marshal(response)
+	if err != nil {
+		log.Errorf("[BuildFilteredModelsResponse] Failed to marshal final response: %v", err)
+		return nil, err
+	}
+
+	log.Debugf("[BuildFilteredModelsResponse] Final response: %s", string(responseData))
+	return responseData, nil
 }
