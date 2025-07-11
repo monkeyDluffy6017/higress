@@ -101,7 +101,7 @@ const (
 type AuthUser struct {
 	ID             string `json:"universal_id"`
 	Username       string `json:"username"`
-	EmployeeNumber string `json:"employeeNumber"`
+	EmployeeNumber string `json:"id"`
 	FullName       string `json:"fullName"`
 }
 
@@ -241,27 +241,29 @@ func NewPermissionChecker(restrictedModels []string, redisClient wrapper.RedisCl
 	}
 }
 
-// CheckModelPermission checks if a user has permission to access a model
-func (p *PermissionChecker) CheckModelPermission(employeeNumber, modelName string, log wrapper.Log) bool {
+// CheckModelPermission checks if a user has permission to access a model (async)
+func (p *PermissionChecker) CheckModelPermission(employeeNumber, modelName string, log wrapper.Log, callback func(bool)) {
 	log.Debugf("[PermissionChecker.CheckModelPermission] Checking permission for employee: %s, model: %s", employeeNumber, modelName)
 
 	// 1. Check if model is restricted
 	if !p.isRestrictedModel(modelName, log) {
 		log.Debugf("[PermissionChecker.CheckModelPermission] Model %s is not restricted, allowing access", modelName)
-		return true // Not restricted, allow access
+		callback(true) // Not restricted, allow access
+		return
 	}
 
 	log.Debugf("[PermissionChecker.CheckModelPermission] Model %s is restricted, checking user permissions", modelName)
 
-	// 2. Get user's allowed models
-	allowedModels := p.getUserAllowedModels(employeeNumber)
-	log.Debugf("[PermissionChecker.CheckModelPermission] Employee %s allowed models: %v", employeeNumber, allowedModels)
+	// 2. Get user's allowed models (async)
+	p.getUserAllowedModels(employeeNumber, func(allowedModels []string) {
+		log.Debugf("[PermissionChecker.CheckModelPermission] Employee %s allowed models: %v", employeeNumber, allowedModels)
 
-	// 3. Check if model is allowed
-	isAllowed := p.isModelAllowed(modelName, allowedModels, log)
-	log.Debugf("[PermissionChecker.CheckModelPermission] Final permission result for employee %s and model %s: %t", employeeNumber, modelName, isAllowed)
+		// 3. Check if model is allowed
+		isAllowed := p.isModelAllowed(modelName, allowedModels, log)
+		log.Debugf("[PermissionChecker.CheckModelPermission] Final permission result for employee %s and model %s: %t", employeeNumber, modelName, isAllowed)
 
-	return isAllowed
+		callback(isAllowed)
+	})
 }
 
 // isRestrictedModel checks if a model is in the restricted list
@@ -294,43 +296,47 @@ func (p *PermissionChecker) isModelAllowed(modelName string, allowedModels []str
 	return false
 }
 
-// getUserAllowedModels gets user's allowed models from cache or Redis
-func (p *PermissionChecker) getUserAllowedModels(employeeNumber string) []string {
+// getUserAllowedModels gets user's allowed models with callback
+func (p *PermissionChecker) getUserAllowedModels(employeeNumber string, callback func([]string)) {
 	// Check memory cache first
 	p.mu.RLock()
 	if models, exists := p.memoryCache[employeeNumber]; exists {
 		p.mu.RUnlock()
-		return models
+		callback(models)
+		return
 	}
 	p.mu.RUnlock()
 
 	// Cache miss, get from Redis
-	models := p.getFromRedis(employeeNumber)
-
-	// Update memory cache (never expires)
-	p.updateMemoryCache(employeeNumber, models)
-
-	return models
+	p.getFromRedis(employeeNumber, callback)
 }
 
-// getFromRedis gets allowed models from Redis
-func (p *PermissionChecker) getFromRedis(employeeNumber string) []string {
+// getFromRedis gets allowed models from Redis (async, non-blocking)
+func (p *PermissionChecker) getFromRedis(employeeNumber string, callback func([]string)) {
 	key := p.redisPermPrefix + employeeNumber
-	var models []string
 
+	// Start async Redis operation without blocking
 	p.redisClient.Get(key, func(response resp.Value) {
 		if err := response.Error(); err != nil {
-			// Redis error, return empty permissions
+			// Redis error, keep cache empty
+			callback(nil) // Call callback with nil on error
 			return
 		}
 
 		if !response.IsNull() {
 			data := response.String()
-			json.Unmarshal([]byte(data), &models)
+			var loadedModels []string
+			if json.Unmarshal([]byte(data), &loadedModels) == nil {
+				// Update memory cache with loaded data
+				p.updateMemoryCache(employeeNumber, loadedModels)
+				callback(loadedModels) // Call callback with loaded data
+			} else {
+				callback(nil) // Call callback with nil on parse error
+			}
+		} else {
+			callback(nil) // Call callback with nil if key not found
 		}
 	})
-
-	return models
 }
 
 // updateMemoryCache updates the memory cache
@@ -341,26 +347,23 @@ func (p *PermissionChecker) updateMemoryCache(employeeNumber string, models []st
 }
 
 // SetUserPermission sets user's allowed models in Redis and cache
-func (p *PermissionChecker) SetUserPermission(employeeNumber string, models []string) error {
+func (p *PermissionChecker) SetUserPermission(employeeNumber string, models []string, callback func(error)) {
 	// Update Redis
 	key := p.redisPermPrefix + employeeNumber
 	data, _ := json.Marshal(models)
 
-	var err error
 	p.redisClient.Set(key, string(data), func(response resp.Value) {
-		if response.Error() != nil {
-			err = response.Error()
+		// Update memory cache regardless of Redis result
+		p.updateMemoryCache(employeeNumber, models)
+
+		// Call the callback with the result
+		if callback != nil {
+			callback(response.Error())
 		}
 	})
 
-	if err != nil {
-		return err
-	}
-
-	// Update memory cache
+	// Always update memory cache immediately for consistency
 	p.updateMemoryCache(employeeNumber, models)
-
-	return nil
 }
 
 type Consumer struct {
@@ -595,22 +598,6 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 	return config.redisClient.Init(username, password, int64(timeout), wrapper.WithDataBase(database))
 }
 
-// parseEmployeeNumberFromFullName extracts employee number from full name
-// FullName format: "Username (EmployeeNumber)"
-func parseEmployeeNumberFromFullName(fullName string) string {
-	// Find the last occurrence of '(' and ')'
-	start := strings.LastIndex(fullName, "(")
-	end := strings.LastIndex(fullName, ")")
-
-	if start == -1 || end == -1 || start >= end {
-		return ""
-	}
-
-	// Extract employee number
-	employeeNumber := strings.TrimSpace(fullName[start+1 : end])
-	return employeeNumber
-}
-
 // parseUserInfoFromToken parses user info from JWT token
 func parseUserInfoFromToken(accessToken string) (*AuthUser, error) {
 	// use ParseSigned method to parse JWT token without signature verification
@@ -635,11 +622,6 @@ func parseUserInfoFromToken(accessToken string) (*AuthUser, error) {
 	var userInfo AuthUser
 	if err := json.Unmarshal(jsonBytes, &userInfo); err != nil {
 		return nil, fmt.Errorf("failed to deserialize user info: %w", err)
-	}
-
-	// Extract employee number from full name
-	if userInfo.FullName != "" && userInfo.EmployeeNumber == "" {
-		userInfo.EmployeeNumber = parseEmployeeNumberFromFullName(userInfo.FullName)
 	}
 
 	return &userInfo, nil
@@ -678,8 +660,32 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 
 					// Get user's allowed models (only if permissionChecker is available)
 					if config.permissionChecker != nil {
-						allowedModels = config.permissionChecker.getUserAllowedModels(userInfo.EmployeeNumber)
-						log.Debugf("[onHttpRequestHeaders] user %s has allowed models: %v", userInfo.EmployeeNumber, allowedModels)
+						config.permissionChecker.getUserAllowedModels(userInfo.EmployeeNumber, func(models []string) {
+							allowedModels = models
+							log.Debugf("[onHttpRequestHeaders] user %s has allowed models: %v", userInfo.EmployeeNumber, allowedModels)
+
+							// Generate filtered models response with user permissions
+							responseBody, err := config.BuildFilteredModelsResponse(allowedModels, log)
+							if err != nil {
+								log.Errorf("failed to build models response: %v", err)
+								_ = sendJSONResponse(500, "ai-quota.build_models_failed", "Failed to build models response", false, nil)
+								return
+							}
+
+							// Send HTTP response directly
+							headers := [][2]string{
+								{"content-type", "application/json"},
+							}
+							err = proxywasm.SendHttpResponse(200, headers, responseBody, -1)
+							if err != nil {
+								log.Errorf("failed to send response: %v", err)
+								_ = sendJSONResponse(500, "ai-quota.send_models_response_failed", "Failed to send models response", false, nil)
+								return
+							}
+
+							log.Debugf("[onHttpRequestHeaders] models response sent: %s", string(responseBody))
+						})
+						return types.ActionPause // Wait for async permission loading
 					} else {
 						log.Debugf("[onHttpRequestHeaders] permissionChecker is nil, no user-specific filtering")
 					}
@@ -693,7 +699,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 			log.Debugf("[onHttpRequestHeaders] No token header found, proceeding without user-specific filtering")
 		}
 
-		// Generate filtered models response
+		// Generate filtered models response (without user-specific permissions if no token)
 		responseBody, err := config.BuildFilteredModelsResponse(allowedModels, log)
 		if err != nil {
 			log.Errorf("failed to build models response: %v", err)
@@ -946,35 +952,26 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 			}
 
 			// Check if user has permission to use this model
-			hasPermission := config.permissionChecker.CheckModelPermission(userInfo.EmployeeNumber, modelName, log)
-			if !hasPermission {
-				log.Warnf("[processQuotaLogic] User %s does not have permission to use restricted model %s - BLOCKING REQUEST", userInfo.EmployeeNumber, modelName)
-				sendJSONResponse(http.StatusForbidden, "ai-quota.model_permission_denied",
-					fmt.Sprintf("You don't have permission to use model %s", modelName), false, nil)
-				return types.ActionContinue
-			}
+			config.permissionChecker.CheckModelPermission(userInfo.EmployeeNumber, modelName, log, func(hasPermission bool) {
+				if !hasPermission {
+					log.Warnf("[processQuotaLogic] User %s does not have permission to use restricted model %s - BLOCKING REQUEST", userInfo.EmployeeNumber, modelName)
+					sendJSONResponse(http.StatusForbidden, "ai-quota.model_permission_denied",
+						fmt.Sprintf("You don't have permission to use model %s", modelName), false, nil)
+					return
+				}
+
+				// Permission check passed, continue with quota logic
+				log.Debugf("[processQuotaLogic] Permission check passed for user %s and model %s", userInfo.EmployeeNumber, modelName)
+				continueWithQuotaLogic(ctx, config, body, userId, modelName, log)
+			})
+			return types.ActionPause // Wait for async permission check
 		}
 	} else {
 		log.Debugf("[processQuotaLogic] Skipping permission check - restrictedModels: %d, permissionChecker: %t", len(config.RestrictedModels), config.permissionChecker != nil)
 	}
 
-	// Get quota weight for this model, default to 0 if not configured
-	quotaWeight := 0
-	if weight, exists := config.ModelQuotaWeights[modelName]; exists {
-		quotaWeight = weight
-	}
-
-	log.Debugf("Model %s quota weight: %d", modelName, quotaWeight)
-
-	// If quota weight is 0, no deduction needed, allow request to continue
-	if quotaWeight == 0 {
-		log.Debugf("Model %s has zero quota weight, skipping quota check", modelName)
-		proxywasm.ResumeHttpRequest()
-		return types.ActionContinue
-	}
-
-	// Check and deduct quota
-	doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
+	// Continue with quota logic
+	continueWithQuotaLogic(ctx, config, body, userId, modelName, log)
 	return types.ActionPause
 }
 
@@ -1552,20 +1549,45 @@ func setUserPermission(ctx wrapper.HttpContext, config QuotaConfig, body string,
 
 	// Set user permission
 	if config.permissionChecker != nil {
-		err := config.permissionChecker.SetUserPermission(employeeNumber, models)
-		if err != nil {
-			log.Errorf("Failed to set user permission for employee %s: %v", employeeNumber, err)
-			sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", fmt.Sprintf("Failed to set user permission: %v", err), false, nil)
-			return types.ActionContinue
-		}
+		config.permissionChecker.SetUserPermission(employeeNumber, models, func(err error) {
+			if err != nil {
+				log.Errorf("Failed to set user permission for employee %s: %v", employeeNumber, err)
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", fmt.Sprintf("Failed to set user permission: %v", err), false, nil)
+				return
+			}
+			data := map[string]interface{}{
+				"employee_number": employeeNumber,
+				"models":          models,
+			}
+			sendJSONResponse(http.StatusOK, "ai-quota.setpermission", "set user permission successful", true, data)
+		})
+	} else {
+		log.Errorf("Permission checker not initialized, cannot set user permission for employee %s", employeeNumber)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Permission management not configured.", false, nil)
 	}
 
-	data := map[string]interface{}{
-		"employee_number": employeeNumber,
-		"models":          models,
+	return types.ActionPause
+}
+
+// continueWithQuotaLogic continues with quota checking after permission validation
+func continueWithQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte, userId string, modelName string, log wrapper.Log) {
+	// Get quota weight for this model, default to 0 if not configured
+	quotaWeight := 0
+	if weight, exists := config.ModelQuotaWeights[modelName]; exists {
+		quotaWeight = weight
 	}
-	sendJSONResponse(http.StatusOK, "ai-quota.setpermission", "set user permission successful", true, data)
-	return types.ActionContinue
+
+	log.Debugf("Model %s quota weight: %d", modelName, quotaWeight)
+
+	// If quota weight is 0, no deduction needed, allow request to continue
+	if quotaWeight == 0 {
+		log.Debugf("Model %s has zero quota weight, skipping quota check", modelName)
+		proxywasm.ResumeHttpRequest()
+		return
+	}
+
+	// Check and deduct quota
+	doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
 }
 
 // checkStarCache checks if user star status is cached
