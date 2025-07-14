@@ -51,21 +51,30 @@ description: AI 配额管理插件配置参考
 
 | 名称                    | 数据类型   | 填写要求 | 默认值                 | 描述                           |
 |------------------------|-----------|----------|------------------------|--------------------------------|
-| `redis_key_prefix`     | string    | 选填     | chat_quota:            | 配额总数的redis key前缀         |
-| `redis_used_prefix`    | string    | 选填     | chat_quota_used:       | 已使用量的redis key前缀         |
+| `quota_management`     | object    | 选填     | -                      | 配额管理配置                    |
 | `star_check_management` | object   | 选填     | -                      | GitHub项目关注检查配置          |
 | `token_header`         | string    | 选填     | authorization          | 存储JWT token的请求头名称       |
 | `admin_header`         | string    | 选填     | x-admin-key            | 管理操作验证用的请求头名称       |
 | `admin_key`            | string    | 必填     | -                      | 管理操作验证用的密钥            |
 | `admin_path`           | string    | 选填     | /quota                 | 管理quota请求path前缀           |
-| `deduct_header`        | string    | 选填     | x-quota-identity       | 扣减配额的触发请求头名称        |
-| `deduct_header_value`  | string    | 选填     | true                   | 扣减配额的触发请求头值          |
-| `model_quota_weights`  | object    | 选填     | {}                     | 模型配额权重配置，指定每个模型的扣减额度 |
 | `restricted_models`    | array     | 选填     | []                     | 需要权限控制的模型列表（新增）       |
 | `permission_management`| object    | 选填     | -                      | 权限管理配置（新增）                |
 | `provider`             | object    | 选填     | -                      | 单provider配置，用于模型列表展示 |
 | `providers`            | array     | 选填     | -                      | 多provider配置，用于模型列表展示 |
 | `redis`                | object    | 是       | -                      | redis相关配置                  |
+
+`quota_management`中每一项的配置字段说明
+
+| 配置项                 | 类型       | 必填 | 默认值                 | 说明                           |
+|------------------------|-----------|------|------------------------|--------------------------------|
+| `user_level_enabled`   | boolean   | 选填 | false                  | 是否启用针对单个用户的配额控制    |
+| `deduct_header`        | string    | 选填 | x-quota-identity       | 扣减配额的触发请求头名称        |
+| `deduct_header_value`  | string    | 选填 | user                   | 扣减配额的触发请求头值          |
+| `redis_key_prefix`     | string    | 选填 | chat_quota:            | 配额总数的redis key前缀         |
+| `redis_used_prefix`    | string    | 选填 | chat_quota_used:       | 已使用量的redis key前缀         |
+| `admin_quota_path`     | string    | 选填 | /check-quota           | 配额权限管理接口路径前缀         |
+| `redis_quota_prefix`   | string    | 选填 | quota_check:           | 配额权限的redis key前缀         |
+| `model_quota_weights`  | object    | 选填 | {}                     | 模型配额权重配置，指定每个模型的扣减额度 |
 
 `redis`中每一项的配置字段说明
 
@@ -93,8 +102,19 @@ description: AI 配额管理插件配置参考
 
 ### 基本配置
 ```yaml
-redis_key_prefix: "chat_quota:"
-redis_used_prefix: "chat_quota_used:"
+quota_management:
+  user_level_enabled: false
+  deduct_header: "x-quota-identity"
+  deduct_header_value: "user"
+  redis_key_prefix: "chat_quota:"
+  redis_used_prefix: "chat_quota_used:"
+  admin_quota_path: "/check-quota"
+  redis_quota_prefix: "quota_check:"
+  model_quota_weights:
+    'gpt-3.5-turbo': 1
+    'gpt-4': 2
+    'gpt-4-turbo': 3
+    'gpt-4o': 4
 star_check_management:
   enabled: false
   user_level_enabled: false
@@ -106,13 +126,6 @@ token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
 admin_path: "/quota"
-deduct_header: "x-quota-identity"
-deduct_header_value: "true"
-model_quota_weights:
-  'gpt-3.5-turbo': 1
-  'gpt-4': 2
-  'gpt-4-turbo': 3
-  'gpt-4o': 4
 # 权限管理配置（新增）
 restricted_models:
   - "gpt-4"
@@ -137,8 +150,19 @@ redis:
 
 ### 启用GitHub关注检查的配置
 ```yaml
-redis_key_prefix: "chat_quota:"
-redis_used_prefix: "chat_quota_used:"
+quota_management:
+  user_level_enabled: true
+  deduct_header: "x-quota-identity"
+  deduct_header_value: "user"
+  redis_key_prefix: "chat_quota:"
+  redis_used_prefix: "chat_quota_used:"
+  admin_quota_path: "/check-quota"
+  redis_quota_prefix: "quota_check:"
+  model_quota_weights:
+    'deepseek-chat': 1
+    'deepseek-r1': 3
+    'gpt-4': 10
+    'gpt-3.5-turbo': 2
 star_check_management:
   enabled: true
   user_level_enabled: true
@@ -150,10 +174,6 @@ token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
 admin_path: "/quota"
-deduct_header: "x-quota-identity"
-deduct_header_value: "user"
-model_quota_weights:
-  'deepseek-chat': 1
 # 多provider配置，用于模型列表展示
 providers:
   - id: openai-provider
@@ -173,6 +193,14 @@ redis:
 ```
 
 **说明**: 当 `star_check_management.enabled` 设置为 `true` 时，用户必须先关注指定的 GitHub 项目才能使用AI服务。系统会检查用户的星标项目列表中是否包含 `target_repo` 配置的项目。
+
+### 用户级别配额控制说明
+
+当启用用户级别配额控制时 (`quota_management.user_level_enabled: true`)，系统将为每个用户提供独立的配额控制开关：
+
+- **全局默认**: 默认情况下，所有用户都禁用配额控制
+- **个人控制**: 管理员可以为特定用户启用配额控制，该用户的请求将进行配额检查和扣减
+- **管理接口**: 提供API接口用于查询和设置用户的配额控制状态
 
 ### 模型权重配置说明
 
@@ -338,6 +366,47 @@ curl -X GET "https://example.com/check-star?employee_number=85054712" \
 1. **全局开关检查**: 首先检查 `star_check_management.enabled`
 2. **用户级别控制**: 如果启用了 `user_level_enabled`，检查用户的个人开关
 3. **实际star检查**: 只有当用户的star检查开关为true时，才进行实际的GitHub项目关注检查
+
+## 配额权限管理
+
+当启用用户级别的配额控制时 (`quota_management.user_level_enabled: true`)，可以使用以下接口管理每个用户的配额控制开关。
+
+### 设置用户配额权限
+```bash
+curl -X POST "https://example.com/check-quota/set" \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "employee_number=85054712&enabled=true"
+```
+
+### 查询用户配额权限
+```bash
+curl -X GET "https://example.com/check-quota?employee_number=85054712" \
+  -H "x-admin-key: your-admin-secret"
+```
+
+**参数说明**:
+- `employee_number`: 员工编号（必填）
+- `enabled`: 是否启用该用户的配额控制，true或false（设置接口必填，默认为false）
+
+**响应示例**:
+```json
+{
+  "code": "ai-quota.set_quota_permission",
+  "message": "set quota control permission successful",
+  "success": true,
+  "data": {
+    "employee_number": "85054712",
+    "enabled": true
+  }
+}
+```
+
+### 配额控制工作流程
+
+1. **全局检查**: 检查 `quota_management.user_level_enabled` 是否启用
+2. **用户级别控制**: 如果启用了用户级别控制，检查用户的个人配额控制开关
+3. **配额检查**: 只有当用户的配额控制开关为true时，才进行实际的配额检查和扣减
 
 ## API接口
 

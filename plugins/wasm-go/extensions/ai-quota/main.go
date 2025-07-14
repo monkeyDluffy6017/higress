@@ -97,6 +97,8 @@ const (
 	AdminModePermQuery      AdminMode = "permission_query"
 	AdminModeStargazerSet   AdminMode = "stargazer_set"
 	AdminModeStargazerQuery AdminMode = "stargazer_query"
+	AdminModeQuotaSet       AdminMode = "quota_set"
+	AdminModeQuotaQuery     AdminMode = "quota_query"
 )
 
 // AuthUser struct for parsing user info from JWT
@@ -190,18 +192,27 @@ func (c *ProviderConfig) BuildModelsResponse() ([]byte, error) {
 	return json.Marshal(response)
 }
 
+type QuotaManagementConfig struct {
+	UserLevelEnabled  bool           `yaml:"user_level_enabled"`
+	DeductHeader      string         `yaml:"deduct_header"`
+	DeductHeaderValue string         `yaml:"deduct_header_value"`
+	RedisKeyPrefix    string         `yaml:"redis_key_prefix"`
+	RedisUsedPrefix   string         `yaml:"redis_used_prefix"`
+	AdminQuotaPath    string         `yaml:"admin_quota_path"`
+	RedisQuotaPrefix  string         `yaml:"redis_quota_prefix"`
+	ModelQuotaWeights map[string]int `yaml:"model_quota_weights"`
+}
+
 type QuotaConfig struct {
 	redisInfo           RedisInfo                 `yaml:"redis"`
-	RedisKeyPrefix      string                    `yaml:"redis_key_prefix"`
-	RedisUsedPrefix     string                    `yaml:"redis_used_prefix"`
 	StarCheckManagement StarCheckManagementConfig `yaml:"star_check_management"`
 	TokenHeader         string                    `yaml:"token_header"`
 	AdminHeader         string                    `yaml:"admin_header"`
 	AdminKey            string                    `yaml:"admin_key"`
 	AdminPath           string                    `yaml:"admin_path"`
-	DeductHeader        string                    `yaml:"deduct_header"`
-	DeductHeaderValue   string                    `yaml:"deduct_header_value"`
-	ModelQuotaWeights   map[string]int            `yaml:"model_quota_weights"`
+
+	// Nested quota management configuration
+	QuotaManagement QuotaManagementConfig `yaml:"quota_management"`
 
 	// Provider configuration for /ai-gateway/api/v1/models endpoint
 	Provider  ProviderConfig   `yaml:"provider"`  // Single provider configuration (legacy support)
@@ -216,6 +227,7 @@ type QuotaConfig struct {
 	providerConfigs   []ProviderConfig    `yaml:"-"` // All configured providers for models endpoint
 	permissionChecker *PermissionChecker  `yaml:"-"` // Permission checker instance
 	starCheckChecker  *StarCheckChecker   `yaml:"-"` // Star check permission checker instance
+	quotaChecker      *QuotaChecker       `yaml:"-"` // Quota permission checker instance
 }
 
 // StarCheckManagementConfig configuration for star check management
@@ -458,6 +470,86 @@ func (s *StarCheckChecker) SetStarCheckPermission(employeeNumber string, enabled
 	})
 }
 
+// QuotaChecker manages user-level quota control permissions
+type QuotaChecker struct {
+	memoryCache      map[string]bool // employee_number -> quota_enabled
+	mu               sync.RWMutex
+	redisClient      wrapper.RedisClient
+	redisQuotaPrefix string
+}
+
+func NewQuotaChecker(redisClient wrapper.RedisClient, redisQuotaPrefix string) *QuotaChecker {
+	return &QuotaChecker{
+		memoryCache:      make(map[string]bool),
+		redisClient:      redisClient,
+		redisQuotaPrefix: redisQuotaPrefix,
+	}
+}
+
+func (q *QuotaChecker) CheckQuotaPermission(employeeNumber string, log wrapper.Log, callback func(bool)) {
+	// First check memory cache
+	q.mu.RLock()
+	if enabled, exists := q.memoryCache[employeeNumber]; exists {
+		q.mu.RUnlock()
+		log.Debugf("Quota control permission found in cache for employee %s: %t", employeeNumber, enabled)
+		callback(enabled)
+		return
+	}
+	q.mu.RUnlock()
+
+	// Cache miss, get from Redis
+	q.getFromRedis(employeeNumber, func(enabled bool) {
+		callback(enabled)
+	})
+}
+
+func (q *QuotaChecker) getFromRedis(employeeNumber string, callback func(bool)) {
+	redisKey := q.redisQuotaPrefix + employeeNumber
+	q.redisClient.Get(redisKey, func(response resp.Value) {
+		enabled := false // Default to false (disabled quota control)
+
+		if err := response.Error(); err == nil && !response.IsNull() {
+			// Parse permission value
+			permissionStr := response.String()
+			if permissionStr == "true" || permissionStr == "1" {
+				enabled = true
+			}
+		}
+
+		// Update memory cache
+		q.updateMemoryCache(employeeNumber, enabled)
+		callback(enabled)
+	})
+}
+
+func (q *QuotaChecker) updateMemoryCache(employeeNumber string, enabled bool) {
+	q.mu.Lock()
+	q.memoryCache[employeeNumber] = enabled
+	q.mu.Unlock()
+}
+
+func (q *QuotaChecker) SetQuotaPermission(employeeNumber string, enabled bool, callback func(error)) {
+	// Update memory cache first
+	q.updateMemoryCache(employeeNumber, enabled)
+
+	// Save to Redis
+	redisKey := q.redisQuotaPrefix + employeeNumber
+	var redisValue string
+	if enabled {
+		redisValue = "true"
+	} else {
+		redisValue = "false"
+	}
+
+	q.redisClient.Set(redisKey, redisValue, func(response resp.Value) {
+		if err := response.Error(); err != nil {
+			callback(err)
+			return
+		}
+		callback(nil)
+	})
+}
+
 type Consumer struct {
 	Name       string `yaml:"name"`
 	Credential string `yaml:"credential"`
@@ -498,53 +590,64 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		return errors.New("missing admin_key in config")
 	}
 
-	// deduct header and value
-	config.DeductHeader = json.Get("deduct_header").String()
-	if config.DeductHeader == "" {
-		config.DeductHeader = "x-quota-identity"
+	// Parse quota management configuration
+	quotaManagement := json.Get("quota_management")
+	if !quotaManagement.Exists() {
+		return errors.New("missing quota_management in config")
 	}
 
-	config.DeductHeaderValue = json.Get("deduct_header_value").String()
-	if config.DeductHeaderValue == "" {
-		config.DeductHeaderValue = "user"
+	// Parse user level enabled setting
+	config.QuotaManagement.UserLevelEnabled = quotaManagement.Get("user_level_enabled").Bool()
+
+	// deduct header and value
+	config.QuotaManagement.DeductHeader = quotaManagement.Get("deduct_header").String()
+	if config.QuotaManagement.DeductHeader == "" {
+		config.QuotaManagement.DeductHeader = "x-quota-identity"
+	}
+
+	config.QuotaManagement.DeductHeaderValue = quotaManagement.Get("deduct_header_value").String()
+	if config.QuotaManagement.DeductHeaderValue == "" {
+		config.QuotaManagement.DeductHeaderValue = "user"
+	}
+
+	config.QuotaManagement.RedisKeyPrefix = quotaManagement.Get("redis_key_prefix").String()
+	if config.QuotaManagement.RedisKeyPrefix == "" {
+		config.QuotaManagement.RedisKeyPrefix = "chat_quota:"
+	}
+
+	config.QuotaManagement.RedisUsedPrefix = quotaManagement.Get("redis_used_prefix").String()
+	if config.QuotaManagement.RedisUsedPrefix == "" {
+		config.QuotaManagement.RedisUsedPrefix = "chat_quota_used:"
+	}
+
+	config.QuotaManagement.AdminQuotaPath = quotaManagement.Get("admin_quota_path").String()
+	if config.QuotaManagement.AdminQuotaPath == "" {
+		config.QuotaManagement.AdminQuotaPath = "/check-quota"
+	}
+
+	config.QuotaManagement.RedisQuotaPrefix = quotaManagement.Get("redis_quota_prefix").String()
+	if config.QuotaManagement.RedisQuotaPrefix == "" {
+		config.QuotaManagement.RedisQuotaPrefix = "quota_check:"
 	}
 
 	// Parse model quota weights
-	config.ModelQuotaWeights = make(map[string]int)
-	modelWeights := json.Get("model_quota_weights")
+	config.QuotaManagement.ModelQuotaWeights = make(map[string]int)
+	modelWeights := quotaManagement.Get("model_quota_weights")
 	if modelWeights.Exists() {
 		modelWeights.ForEach(func(key, value gjson.Result) bool {
-			config.ModelQuotaWeights[key.String()] = int(value.Int())
+			config.QuotaManagement.ModelQuotaWeights[key.String()] = int(value.Int())
 			return true
 		})
 	}
 
-	// Redis configuration - must be parsed before permission checker initialization
-	config.RedisKeyPrefix = json.Get("redis_key_prefix").String()
-	if config.RedisKeyPrefix == "" {
-		config.RedisKeyPrefix = "chat_quota:"
-	}
-
-	config.RedisUsedPrefix = json.Get("redis_used_prefix").String()
-	if config.RedisUsedPrefix == "" {
-		config.RedisUsedPrefix = "chat_quota_used:"
-	}
-
 	// Parse star check management configuration
 	starCheckManagement := json.Get("star_check_management")
-	if starCheckManagement.Exists() {
-		config.StarCheckManagement.Enabled = starCheckManagement.Get("enabled").Bool()
-		config.StarCheckManagement.UserLevelEnabled = starCheckManagement.Get("user_level_enabled").Bool()
-		config.StarCheckManagement.RedisStarPrefix = starCheckManagement.Get("redis_star_prefix").String()
-		config.StarCheckManagement.AdminStargazerPath = starCheckManagement.Get("admin_stargazer_path").String()
-		config.StarCheckManagement.RedisStargazerPrefix = starCheckManagement.Get("redis_stargazer_prefix").String()
-		config.StarCheckManagement.TargetRepo = starCheckManagement.Get("target_repo").String()
-	} else {
-		// For backward compatibility, check old check_github_star config
-		config.StarCheckManagement.Enabled = json.Get("check_github_star").Bool()
-		config.StarCheckManagement.RedisStarPrefix = json.Get("redis_star_prefix").String()
-		config.StarCheckManagement.TargetRepo = "zgsm-ai.costrict" // Default value
-	}
+	config.StarCheckManagement.Enabled = starCheckManagement.Get("enabled").Bool()
+	config.StarCheckManagement.UserLevelEnabled = starCheckManagement.Get("user_level_enabled").Bool()
+	config.StarCheckManagement.RedisStarPrefix = starCheckManagement.Get("redis_star_prefix").String()
+	config.StarCheckManagement.AdminStargazerPath = starCheckManagement.Get("admin_stargazer_path").String()
+	config.StarCheckManagement.RedisStargazerPrefix = starCheckManagement.Get("redis_stargazer_prefix").String()
+	config.StarCheckManagement.TargetRepo = starCheckManagement.Get("target_repo").String()
 
 	// Set default values if not specified
 	if config.StarCheckManagement.RedisStarPrefix == "" {
@@ -642,6 +745,16 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 			config.StarCheckManagement.RedisStargazerPrefix,
 		)
 		log.Debugf("[parseConfig] Star check permission checker initialized successfully: %t", config.starCheckChecker != nil)
+	}
+
+	// Initialize quota permission checker if user level is enabled
+	if config.QuotaManagement.UserLevelEnabled {
+		log.Debugf("[parseConfig] Initializing quota permission checker")
+		config.quotaChecker = NewQuotaChecker(
+			config.redisClient,
+			config.QuotaManagement.RedisQuotaPrefix,
+		)
+		log.Debugf("[parseConfig] Quota permission checker initialized successfully: %t", config.quotaChecker != nil)
 	}
 
 	// Parse provider configuration - support both single provider and multi-provider modes
@@ -869,7 +982,11 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		if adminMode == AdminModeStargazerQuery {
 			return queryStarCheckPermission(context, config, path, log)
 		}
-		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta || adminMode == AdminModeUsedRefresh || adminMode == AdminModeUsedDelta || adminMode == AdminModeStarSet || adminMode == AdminModeStargazerSet {
+		// query quota permission
+		if adminMode == AdminModeQuotaQuery {
+			return queryQuotaPermission(context, config, path, log)
+		}
+		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta || adminMode == AdminModeUsedRefresh || adminMode == AdminModeUsedDelta || adminMode == AdminModeStarSet || adminMode == AdminModeStargazerSet || adminMode == AdminModeQuotaSet {
 			context.BufferRequestBody()
 			return types.HeaderStopIteration
 		}
@@ -969,6 +1086,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 	}
 	if adminMode == AdminModeStargazerSet {
 		return setStarCheckPermission(ctx, config, string(body), log)
+	}
+	if adminMode == AdminModeQuotaSet {
+		return setQuotaPermission(ctx, config, string(body), log)
 	}
 
 	return types.ActionContinue
@@ -1094,13 +1214,13 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 
 func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, quotaWeight int, modelName string, log wrapper.Log) {
 	// Check if we need to deduct quota based on header
-	deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.DeductHeader)
-	shouldDeduct := err == nil && deductHeaderValue == config.DeductHeaderValue
+	deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.QuotaManagement.DeductHeader)
+	shouldDeduct := err == nil && deductHeaderValue == config.QuotaManagement.DeductHeaderValue
 
 	if shouldDeduct {
 		// Need to deduct quota: perform full quota check and deduction
-		totalKey := config.RedisKeyPrefix + userId
-		usedKey := config.RedisUsedPrefix + userId
+		totalKey := config.QuotaManagement.RedisKeyPrefix + userId
+		usedKey := config.QuotaManagement.RedisUsedPrefix + userId
 
 		// Use enhanced error handling with retries for critical quota operations
 		retryConfig := wrapper.RetryConfig{
@@ -1117,7 +1237,7 @@ func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, qu
 	} else {
 		// No quota deduction needed: allow request to continue without Redis queries
 		log.Debugf("Quota deduction not required for user %s (header: %s != %s), allowing request",
-			userId, deductHeaderValue, config.DeductHeaderValue)
+			userId, deductHeaderValue, config.QuotaManagement.DeductHeaderValue)
 		proxywasm.ResumeHttpRequest()
 	}
 }
@@ -1217,7 +1337,7 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 	// Check if sufficient quota is available
 	if remainingQuota >= quotaWeight {
 		// Use regular IncrBy for quota deduction
-		usedKey := config.RedisUsedPrefix + userId
+		usedKey := config.QuotaManagement.RedisUsedPrefix + userId
 		config.redisClient.IncrBy(usedKey, quotaWeight, func(incrResponse resp.Value) {
 			handleQuotaDeductionResponse(ctx, incrResponse, userId, quotaWeight, modelName, remainingQuota, log)
 		})
@@ -1319,6 +1439,14 @@ func getOperationMode(path string, adminPath string, log wrapper.Log) (ChatMode,
 		return ChatModeAdmin, AdminModeStargazerQuery
 	}
 
+	// Check for quota permission management paths
+	if strings.HasSuffix(path, "/check-quota/set") {
+		return ChatModeAdmin, AdminModeQuotaSet
+	}
+	if strings.HasSuffix(path, "/check-quota") {
+		return ChatModeAdmin, AdminModeQuotaQuery
+	}
+
 	if strings.HasSuffix(path, "/v1/chat/completions") {
 		return ChatModeCompletion, AdminModeNone
 	}
@@ -1337,8 +1465,8 @@ func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log 
 		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and quota must be integer.", false, nil)
 		return types.ActionContinue
 	}
-	err2 := config.redisClient.Set(config.RedisKeyPrefix+userId, quota, func(response resp.Value) {
-		log.Debugf("Redis set key = %s quota = %d", config.RedisKeyPrefix+userId, quota)
+	err2 := config.redisClient.Set(config.QuotaManagement.RedisKeyPrefix+userId, quota, func(response resp.Value) {
+		log.Debugf("Redis set key = %s quota = %d", config.QuotaManagement.RedisKeyPrefix+userId, quota)
 		if err := response.Error(); err != nil {
 			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
@@ -1383,7 +1511,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 	var redisKey string
 	var responseType string
 	if adminMode == AdminModeUsedQuery {
-		redisKey = config.RedisUsedPrefix + employeeNumber
+		redisKey = config.QuotaManagement.RedisUsedPrefix + employeeNumber
 		responseType = "used_quota"
 	} else if adminMode == AdminModeStarQuery {
 		// Check cache first for star query
@@ -1403,7 +1531,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 		redisKey = config.StarCheckManagement.RedisStarPrefix + employeeNumber
 		responseType = "star_status"
 	} else {
-		redisKey = config.RedisKeyPrefix + employeeNumber
+		redisKey = config.QuotaManagement.RedisKeyPrefix + employeeNumber
 		responseType = "total_quota"
 	}
 
@@ -1500,8 +1628,8 @@ func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wr
 	}
 
 	if value >= 0 {
-		err := config.redisClient.IncrBy(config.RedisKeyPrefix+userId, value, func(response resp.Value) {
-			log.Debugf("Redis Incr key = %s value = %d", config.RedisKeyPrefix+userId, value)
+		err := config.redisClient.IncrBy(config.QuotaManagement.RedisKeyPrefix+userId, value, func(response resp.Value) {
+			log.Debugf("Redis Incr key = %s value = %d", config.QuotaManagement.RedisKeyPrefix+userId, value)
 			if err := response.Error(); err != nil {
 				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 				return
@@ -1513,8 +1641,8 @@ func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wr
 			return types.ActionContinue
 		}
 	} else {
-		err := config.redisClient.DecrBy(config.RedisKeyPrefix+userId, 0-value, func(response resp.Value) {
-			log.Debugf("Redis Decr key = %s value = %d", config.RedisKeyPrefix+userId, 0-value)
+		err := config.redisClient.DecrBy(config.QuotaManagement.RedisKeyPrefix+userId, 0-value, func(response resp.Value) {
+			log.Debugf("Redis Decr key = %s value = %d", config.QuotaManagement.RedisKeyPrefix+userId, 0-value)
 			if err := response.Error(); err != nil {
 				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 				return
@@ -1542,8 +1670,8 @@ func refreshUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, 
 		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and quota must be integer.", false, nil)
 		return types.ActionContinue
 	}
-	err2 := config.redisClient.Set(config.RedisUsedPrefix+userId, quota, func(response resp.Value) {
-		log.Debugf("Redis set key = %s quota = %d", config.RedisUsedPrefix+userId, quota)
+	err2 := config.redisClient.Set(config.QuotaManagement.RedisUsedPrefix+userId, quota, func(response resp.Value) {
+		log.Debugf("Redis set key = %s quota = %d", config.QuotaManagement.RedisUsedPrefix+userId, quota)
 		if err := response.Error(); err != nil {
 			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
@@ -1573,8 +1701,8 @@ func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, lo
 	}
 
 	if value >= 0 {
-		err := config.redisClient.IncrBy(config.RedisUsedPrefix+userId, value, func(response resp.Value) {
-			log.Debugf("Redis Incr key = %s value = %d", config.RedisUsedPrefix+userId, value)
+		err := config.redisClient.IncrBy(config.QuotaManagement.RedisUsedPrefix+userId, value, func(response resp.Value) {
+			log.Debugf("Redis Incr key = %s value = %d", config.QuotaManagement.RedisUsedPrefix+userId, value)
 			if err := response.Error(); err != nil {
 				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 				return
@@ -1586,8 +1714,8 @@ func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, lo
 			return types.ActionContinue
 		}
 	} else {
-		err := config.redisClient.DecrBy(config.RedisUsedPrefix+userId, 0-value, func(response resp.Value) {
-			log.Debugf("Redis Decr key = %s value = %d", config.RedisUsedPrefix+userId, 0-value)
+		err := config.redisClient.DecrBy(config.QuotaManagement.RedisUsedPrefix+userId, 0-value, func(response resp.Value) {
+			log.Debugf("Redis Decr key = %s value = %d", config.QuotaManagement.RedisUsedPrefix+userId, 0-value)
 			if err := response.Error(); err != nil {
 				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 				return
@@ -1851,10 +1979,87 @@ func performStarCheck(ctx wrapper.HttpContext, config QuotaConfig, body []byte, 
 }
 
 // continueWithQuotaLogic continues with quota checking after permission validation
+func setQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, body string, log wrapper.Log) types.Action {
+	queryValues, _ := url.ParseQuery(body)
+	values := make(map[string]string)
+	for k, v := range queryValues {
+		if len(v) > 0 {
+			values[k] = v[0]
+		}
+	}
+
+	employeeNumber := values["employee_number"]
+	enabledParam := values["enabled"]
+	if employeeNumber == "" {
+		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		return types.ActionContinue
+	}
+
+	// Parse enabled parameter
+	enabled := false // Default to false (disabled quota control)
+	if enabledParam == "true" || enabledParam == "1" {
+		enabled = true
+	}
+
+	log.Debugf("Setting quota control permission for employee %s: %t", employeeNumber, enabled)
+
+	// Set user quota control permission
+	if config.quotaChecker != nil {
+		config.quotaChecker.SetQuotaPermission(employeeNumber, enabled, func(err error) {
+			if err != nil {
+				log.Errorf("Failed to set quota control permission for employee %s: %v", employeeNumber, err)
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", fmt.Sprintf("Failed to set quota control permission: %v", err), false, nil)
+				return
+			}
+			data := map[string]interface{}{
+				"employee_number": employeeNumber,
+				"enabled":         enabled,
+			}
+			sendJSONResponse(http.StatusOK, "ai-quota.set_quota_permission", "set quota control permission successful", true, data)
+		})
+	} else {
+		log.Errorf("Quota permission checker not initialized, cannot set permission for employee %s", employeeNumber)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Quota control permission management not configured.", false, nil)
+	}
+
+	return types.ActionPause
+}
+
+func queryQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, log wrapper.Log) types.Action {
+	queryValues := url.Query()
+	values := make(map[string]string, len(queryValues))
+	for k, v := range queryValues {
+		values[k] = v[0]
+	}
+
+	employeeNumber := values["employee_number"]
+	if employeeNumber == "" {
+		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		return types.ActionContinue
+	}
+
+	log.Debugf("Querying quota control permission for employee %s", employeeNumber)
+
+	if config.quotaChecker != nil {
+		config.quotaChecker.CheckQuotaPermission(employeeNumber, log, func(enabled bool) {
+			data := map[string]interface{}{
+				"employee_number": employeeNumber,
+				"enabled":         enabled,
+			}
+			sendJSONResponse(http.StatusOK, "ai-quota.query_quota_permission", "query quota control permission successful", true, data)
+		})
+	} else {
+		log.Errorf("Quota permission checker not initialized, cannot query permission for employee %s", employeeNumber)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Quota control permission management not configured.", false, nil)
+	}
+
+	return types.ActionPause
+}
+
 func continueWithQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte, userId string, modelName string, log wrapper.Log) {
 	// Get quota weight for this model, default to 0 if not configured
 	quotaWeight := 0
-	if weight, exists := config.ModelQuotaWeights[modelName]; exists {
+	if weight, exists := config.QuotaManagement.ModelQuotaWeights[modelName]; exists {
 		quotaWeight = weight
 	}
 
@@ -1867,8 +2072,35 @@ func continueWithQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []
 		return
 	}
 
-	// Check and deduct quota
-	doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
+	// Check if user-level quota control is enabled
+	if config.QuotaManagement.UserLevelEnabled {
+		log.Debugf("User-level quota control is enabled, checking user permission for user: %s", userId)
+
+		if config.quotaChecker != nil {
+			config.quotaChecker.CheckQuotaPermission(userId, log, func(userQuotaEnabled bool) {
+				if !userQuotaEnabled {
+					log.Debugf("User %s has quota control disabled at user level, skipping quota check", userId)
+					// User has quota control disabled, skip quota check and allow request
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+
+				log.Debugf("User %s has quota control enabled at user level, proceeding with quota check", userId)
+				// User has quota control enabled, proceed with normal quota logic
+				doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
+			})
+			return
+		} else {
+			log.Warnf("Quota permission checker not initialized, falling back to global quota check for user: %s", userId)
+			// Fallback to global quota check if checker is not available
+			doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
+			return
+		}
+	} else {
+		log.Debugf("User-level quota control is disabled, using global quota check for user: %s", userId)
+		// User-level control is disabled, use global quota check
+		doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
+	}
 }
 
 // checkStarCache checks if user starred projects are cached and if target repo is starred

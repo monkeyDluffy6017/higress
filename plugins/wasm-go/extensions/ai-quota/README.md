@@ -43,18 +43,28 @@ When a request contains specified headers and values, the system increments the 
 
 | Name                   | Data Type | Required Conditions | Default Value       | Description                                    |
 |------------------------|-----------|---------------------|---------------------|------------------------------------------------|
-| `redis_key_prefix`     | string    | Optional           | chat_quota:         | Redis key prefix for total quota              |
-| `redis_used_prefix`    | string    | Optional           | chat_quota_used:    | Redis key prefix for used quota               |
+| `quota_management`     | object    | Optional           | -                   | Quota management configuration                 |
 | `star_check_management` | object   | Optional           | -                   | GitHub star checking configuration            |
 | `token_header`         | string    | Optional           | authorization       | Request header name storing JWT token         |
 | `admin_header`         | string    | Optional           | x-admin-key         | Request header name for admin verification    |
 | `admin_key`            | string    | Required           | -                   | Secret key for admin operation verification   |
 | `admin_path`           | string    | Optional           | /quota              | Prefix for quota management request paths     |
-| `deduct_header`        | string    | Optional           | x-quota-identity    | Header name triggering quota deduction        |
-| `deduct_header_value`  | string    | Optional           | true                | Header value triggering quota deduction       |
 | `provider`             | object    | Optional           | -                   | Single provider configuration for model lists |
 | `providers`            | array     | Optional           | -                   | Multi-provider configuration for model lists  |
 | `redis`                | object    | Yes                | -                   | Redis related configuration                    |
+
+Explanation of each configuration field in `quota_management`
+
+| Name                   | Data Type | Required Conditions | Default Value       | Description                                    |
+|------------------------|-----------|---------------------|---------------------|------------------------------------------------|
+| `user_level_enabled`   | boolean   | Optional           | false               | Whether to enable user-level quota control    |
+| `deduct_header`        | string    | Optional           | x-quota-identity    | Header name triggering quota deduction        |
+| `deduct_header_value`  | string    | Optional           | user                | Header value triggering quota deduction       |
+| `redis_key_prefix`     | string    | Optional           | chat_quota:         | Redis key prefix for total quota              |
+| `redis_used_prefix`    | string    | Optional           | chat_quota_used:    | Redis key prefix for used quota               |
+| `admin_quota_path`     | string    | Optional           | /check-quota        | Path prefix for quota permission management APIs |
+| `redis_quota_prefix`   | string    | Optional           | quota_check:        | Redis key prefix for quota permissions        |
+| `model_quota_weights`  | object    | Optional           | {}                  | Model quota weight configuration               |
 
 Explanation of each configuration field in `redis`
 
@@ -82,8 +92,16 @@ Explanation of each configuration field in `redis`
 
 ### Basic Configuration
 ```yaml
-redis_key_prefix: "chat_quota:"
-redis_used_prefix: "chat_quota_used:"
+quota_management:
+  user_level_enabled: false
+  deduct_header: "x-quota-identity"
+  deduct_header_value: "user"
+  redis_key_prefix: "chat_quota:"
+  redis_used_prefix: "chat_quota_used:"
+  admin_quota_path: "/check-quota"
+  redis_quota_prefix: "quota_check:"
+  model_quota_weights:
+    model_name: 1
 star_check_management:
   enabled: false
   user_level_enabled: false
@@ -95,8 +113,6 @@ token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
 admin_path: "/quota"
-deduct_header: "x-quota-identity"
-deduct_header_value: "user"
 # Single provider configuration for model list display
 provider:
   type: "openai"
@@ -112,8 +128,19 @@ redis:
 
 ### Configuration with GitHub Star Check Enabled
 ```yaml
-redis_key_prefix: "chat_quota:"
-redis_used_prefix: "chat_quota_used:"
+quota_management:
+  user_level_enabled: true
+  deduct_header: "x-quota-identity"
+  deduct_header_value: "user"
+  redis_key_prefix: "chat_quota:"
+  redis_used_prefix: "chat_quota_used:"
+  admin_quota_path: "/check-quota"
+  redis_quota_prefix: "quota_check:"
+  model_quota_weights:
+    "gpt-4": 10
+    "gpt-3.5-turbo": 1
+    "deepseek-r1": 5
+    "deepseek-chat": 3
 star_check_management:
   enabled: true
   user_level_enabled: true
@@ -125,8 +152,6 @@ token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
 admin_path: "/quota"
-deduct_header: "x-quota-identity"
-deduct_header_value: "user"
 # Multi-provider configuration for model list display
 providers:
   - id: openai-provider
@@ -446,8 +471,19 @@ redis:
   timeout: 2000
   database: 0
 
-redis_key_prefix: "chat_quota:"
-redis_used_prefix: "chat_quota_used:"
+quota_management:
+  user_level_enabled: true
+  deduct_header: "x-quota-deduct"
+  deduct_header_value: "true"
+  redis_key_prefix: "chat_quota:"
+  redis_used_prefix: "chat_quota_used:"
+  admin_quota_path: "/check-quota"
+  redis_quota_prefix: "quota_check:"
+  model_quota_weights:
+    "gpt-4": 10
+    "gpt-3.5-turbo": 1
+    "claude-3-5-sonnet-latest": 5
+
 star_check_management:
   enabled: true
   redis_star_prefix: "github_star:"
@@ -468,13 +504,6 @@ token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
 admin_path: "/quota"
-deduct_header: "x-quota-deduct"
-deduct_header_value: "true"
-
-model_quota_weights:
-  "gpt-4": 10
-  "gpt-3.5-turbo": 1
-  "claude-3-5-sonnet-latest": 5
 
 provider:
   id: "openai"
@@ -572,6 +601,49 @@ curl -X GET "https://example.com/check-star?employee_number=85054712" \
 1. **Global Check**: First checks `star_check_management.enabled`
 2. **User-Level Control**: If `user_level_enabled` is true, checks user's individual setting
 3. **Actual Star Check**: Only performs GitHub star checking when user's star check is enabled
+
+### Quota Permission Management (New)
+
+When user-level quota control is enabled (`quota_management.user_level_enabled: true`), you can use these APIs to manage individual user quota control settings:
+
+- `POST /check-quota/set`: Set user quota control permission
+  - Parameters: `employee_number`, `enabled` (true/false)
+- `GET /check-quota?employee_number={employee_number}`: Query user quota control permission
+
+#### Setting User Quota Permission
+
+```bash
+curl -X POST "https://example.com/check-quota/set" \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "employee_number=85054712&enabled=true"
+```
+
+#### Querying User Quota Permission
+
+```bash
+curl -X GET "https://example.com/check-quota?employee_number=85054712" \
+  -H "x-admin-key: your-admin-secret"
+```
+
+**Response Example**:
+```json
+{
+  "code": "ai-quota.set_quota_permission",
+  "message": "set quota control permission successful",
+  "success": true,
+  "data": {
+    "employee_number": "85054712",
+    "enabled": true
+  }
+}
+```
+
+#### Quota Control Workflow
+
+1. **Global Check**: Checks `quota_management.user_level_enabled`
+2. **User-Level Control**: If enabled, checks user's individual quota control setting
+3. **Quota Check**: Only performs quota checking and deduction when user's quota control is enabled
 
 ## Configuration Details
 

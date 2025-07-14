@@ -8,7 +8,13 @@ spec:
   defaultConfigDisable: true
   matchRules:
   - config:
-      redis_key_prefix: "chat_quota:"
+      quota_management:
+        deduct_header: "x-quota-identity"
+        deduct_header_value: "user"
+        redis_key_prefix: "chat_quota:"
+        redis_used_prefix: "chat_quota_used:"
+        model_quota_weights:
+          model_name: 1
       token_header: "authorization"
       admin_header: "x-admin-key"
       admin_key: "your-admin-secret"
