@@ -84,17 +84,19 @@ const (
 type AdminMode string
 
 const (
-	AdminModeNone        AdminMode = "none"
-	AdminModeRefresh     AdminMode = "refresh"
-	AdminModeDelta       AdminMode = "delta"
-	AdminModeQuery       AdminMode = "query"
-	AdminModeUsedRefresh AdminMode = "used_refresh"
-	AdminModeUsedDelta   AdminMode = "used_delta"
-	AdminModeUsedQuery   AdminMode = "used_query"
-	AdminModeStarSet     AdminMode = "star_set"
-	AdminModeStarQuery   AdminMode = "star_query"
-	AdminModePermSet     AdminMode = "permission_set"
-	AdminModePermQuery   AdminMode = "permission_query"
+	AdminModeNone           AdminMode = "none"
+	AdminModeRefresh        AdminMode = "refresh"
+	AdminModeDelta          AdminMode = "delta"
+	AdminModeQuery          AdminMode = "query"
+	AdminModeUsedRefresh    AdminMode = "used_refresh"
+	AdminModeUsedDelta      AdminMode = "used_delta"
+	AdminModeUsedQuery      AdminMode = "used_query"
+	AdminModeStarSet        AdminMode = "star_set"
+	AdminModeStarQuery      AdminMode = "star_query"
+	AdminModePermSet        AdminMode = "permission_set"
+	AdminModePermQuery      AdminMode = "permission_query"
+	AdminModeStargazerSet   AdminMode = "stargazer_set"
+	AdminModeStargazerQuery AdminMode = "stargazer_query"
 )
 
 // AuthUser struct for parsing user info from JWT
@@ -213,13 +215,17 @@ type QuotaConfig struct {
 	starCache         map[string][]string `yaml:"-"` // Star projects cache (employee_number -> starred projects)
 	providerConfigs   []ProviderConfig    `yaml:"-"` // All configured providers for models endpoint
 	permissionChecker *PermissionChecker  `yaml:"-"` // Permission checker instance
+	starCheckChecker  *StarCheckChecker   `yaml:"-"` // Star check permission checker instance
 }
 
 // StarCheckManagementConfig configuration for star check management
 type StarCheckManagementConfig struct {
-	Enabled         bool   `yaml:"enabled"`
-	RedisStarPrefix string `yaml:"redis_star_prefix"`
-	TargetRepo      string `yaml:"target_repo"`
+	Enabled              bool   `yaml:"enabled"`
+	UserLevelEnabled     bool   `yaml:"user_level_enabled"`
+	RedisStarPrefix      string `yaml:"redis_star_prefix"`
+	AdminStargazerPath   string `yaml:"admin_stargazer_path"`
+	RedisStargazerPrefix string `yaml:"redis_stargazer_prefix"`
+	TargetRepo           string `yaml:"target_repo"`
 }
 
 // PermissionManagementConfig configuration for permission management
@@ -372,6 +378,86 @@ func (p *PermissionChecker) SetUserPermission(employeeNumber string, models []st
 	p.updateMemoryCache(employeeNumber, models)
 }
 
+// StarCheckChecker manages user-level star check permissions
+type StarCheckChecker struct {
+	memoryCache     map[string]bool // employee_number -> star_check_enabled
+	mu              sync.RWMutex
+	redisClient     wrapper.RedisClient
+	redisStarPrefix string
+}
+
+func NewStarCheckChecker(redisClient wrapper.RedisClient, redisStarPrefix string) *StarCheckChecker {
+	return &StarCheckChecker{
+		memoryCache:     make(map[string]bool),
+		redisClient:     redisClient,
+		redisStarPrefix: redisStarPrefix,
+	}
+}
+
+func (s *StarCheckChecker) CheckStarCheckPermission(employeeNumber string, log wrapper.Log, callback func(bool)) {
+	// First check memory cache
+	s.mu.RLock()
+	if enabled, exists := s.memoryCache[employeeNumber]; exists {
+		s.mu.RUnlock()
+		log.Debugf("Star check permission found in cache for employee %s: %t", employeeNumber, enabled)
+		callback(enabled)
+		return
+	}
+	s.mu.RUnlock()
+
+	// Cache miss, get from Redis
+	s.getFromRedis(employeeNumber, func(enabled bool) {
+		callback(enabled)
+	})
+}
+
+func (s *StarCheckChecker) getFromRedis(employeeNumber string, callback func(bool)) {
+	redisKey := s.redisStarPrefix + employeeNumber
+	s.redisClient.Get(redisKey, func(response resp.Value) {
+		enabled := false // Default to false (disabled)
+
+		if err := response.Error(); err == nil && !response.IsNull() {
+			// Parse permission value
+			permissionStr := response.String()
+			if permissionStr == "true" || permissionStr == "1" {
+				enabled = true
+			}
+		}
+
+		// Update memory cache
+		s.updateMemoryCache(employeeNumber, enabled)
+		callback(enabled)
+	})
+}
+
+func (s *StarCheckChecker) updateMemoryCache(employeeNumber string, enabled bool) {
+	s.mu.Lock()
+	s.memoryCache[employeeNumber] = enabled
+	s.mu.Unlock()
+}
+
+func (s *StarCheckChecker) SetStarCheckPermission(employeeNumber string, enabled bool, callback func(error)) {
+	// Update memory cache first
+	s.updateMemoryCache(employeeNumber, enabled)
+
+	// Save to Redis
+	redisKey := s.redisStarPrefix + employeeNumber
+	var redisValue string
+	if enabled {
+		redisValue = "true"
+	} else {
+		redisValue = "false"
+	}
+
+	s.redisClient.Set(redisKey, redisValue, func(response resp.Value) {
+		if err := response.Error(); err != nil {
+			callback(err)
+			return
+		}
+		callback(nil)
+	})
+}
+
 type Consumer struct {
 	Name       string `yaml:"name"`
 	Credential string `yaml:"credential"`
@@ -448,7 +534,10 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 	starCheckManagement := json.Get("star_check_management")
 	if starCheckManagement.Exists() {
 		config.StarCheckManagement.Enabled = starCheckManagement.Get("enabled").Bool()
+		config.StarCheckManagement.UserLevelEnabled = starCheckManagement.Get("user_level_enabled").Bool()
 		config.StarCheckManagement.RedisStarPrefix = starCheckManagement.Get("redis_star_prefix").String()
+		config.StarCheckManagement.AdminStargazerPath = starCheckManagement.Get("admin_stargazer_path").String()
+		config.StarCheckManagement.RedisStargazerPrefix = starCheckManagement.Get("redis_stargazer_prefix").String()
 		config.StarCheckManagement.TargetRepo = starCheckManagement.Get("target_repo").String()
 	} else {
 		// For backward compatibility, check old check_github_star config
@@ -457,9 +546,15 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		config.StarCheckManagement.TargetRepo = "zgsm-ai.costrict" // Default value
 	}
 
-	// Set default value for RedisStarPrefix if not specified
+	// Set default values if not specified
 	if config.StarCheckManagement.RedisStarPrefix == "" {
 		config.StarCheckManagement.RedisStarPrefix = "chat_quota_star:"
+	}
+	if config.StarCheckManagement.AdminStargazerPath == "" {
+		config.StarCheckManagement.AdminStargazerPath = "/check-star"
+	}
+	if config.StarCheckManagement.RedisStargazerPrefix == "" {
+		config.StarCheckManagement.RedisStargazerPrefix = "star_check:"
 	}
 
 	// Initialize star projects cache
@@ -538,6 +633,16 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		config.PermissionManagement.RedisPermissionPrefix,
 	)
 	log.Debugf("[parseConfig] Permission checker initialized successfully: %t", config.permissionChecker != nil)
+
+	// Initialize star check permission checker if user level is enabled
+	if config.StarCheckManagement.UserLevelEnabled {
+		log.Debugf("[parseConfig] Initializing star check permission checker")
+		config.starCheckChecker = NewStarCheckChecker(
+			config.redisClient,
+			config.StarCheckManagement.RedisStargazerPrefix,
+		)
+		log.Debugf("[parseConfig] Star check permission checker initialized successfully: %t", config.starCheckChecker != nil)
+	}
 
 	// Parse provider configuration - support both single provider and multi-provider modes
 	// Process providers array configuration first
@@ -760,7 +865,11 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		if adminMode == AdminModeQuery || adminMode == AdminModeUsedQuery || adminMode == AdminModeStarQuery {
 			return queryQuota(context, config, path, adminMode, log)
 		}
-		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta || adminMode == AdminModeUsedRefresh || adminMode == AdminModeUsedDelta || adminMode == AdminModeStarSet {
+		// query star check permission
+		if adminMode == AdminModeStargazerQuery {
+			return queryStarCheckPermission(context, config, path, log)
+		}
+		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta || adminMode == AdminModeUsedRefresh || adminMode == AdminModeUsedDelta || adminMode == AdminModeStarSet || adminMode == AdminModeStargazerSet {
 			context.BufferRequestBody()
 			return types.HeaderStopIteration
 		}
@@ -858,6 +967,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 	if adminMode == AdminModePermSet {
 		return setUserPermission(ctx, config, string(body), log)
 	}
+	if adminMode == AdminModeStargazerSet {
+		return setStarCheckPermission(ctx, config, string(body), log)
+	}
 
 	return types.ActionContinue
 }
@@ -874,64 +986,36 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 	if config.StarCheckManagement.Enabled {
 		log.Debugf("GitHub star check is enabled, checking star status for user: %s", userId)
 
-		// First check local cache
-		if cached, hasStar := config.checkStarCache(userId); cached {
-			log.Debugf("Star projects found in cache for user %s, target repo starred: %t", userId, hasStar)
-			if hasStar {
-				log.Debugf("User %s has starred the target project (cached), proceeding with quota check", userId)
-				// Star check passed, continue with quota logic
-				processQuotaLogic(ctx, config, body, userId, log)
+		// Check if user-level control is enabled
+		if config.StarCheckManagement.UserLevelEnabled {
+			log.Debugf("User-level star check control is enabled, checking user permission for user: %s", userId)
+
+			if config.starCheckChecker != nil {
+				config.starCheckChecker.CheckStarCheckPermission(userId, log, func(userStarCheckEnabled bool) {
+					if !userStarCheckEnabled {
+						log.Debugf("User %s has star check disabled at user level, proceeding with quota check", userId)
+						// User has star check disabled, skip star check and proceed with quota logic
+						processQuotaLogic(ctx, config, body, userId, log)
+						return
+					}
+
+					log.Debugf("User %s has star check enabled at user level, proceeding with star check", userId)
+					// User has star check enabled, proceed with normal star check logic
+					performStarCheck(ctx, config, body, userId, log)
+				})
+				return types.ActionPause
 			} else {
-				log.Debugf("User %s has not starred the target project (cached)", userId)
-				sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", config.StarCheckManagement.TargetRepo), false, nil)
+				log.Warnf("Star check permission checker not initialized, falling back to global star check for user: %s", userId)
+				// Fallback to global star check if checker is not available
+				performStarCheck(ctx, config, body, userId, log)
+				return types.ActionPause
 			}
+		} else {
+			log.Debugf("User-level star check control is disabled, using global star check for user: %s", userId)
+			// User-level control is disabled, use global star check
+			performStarCheck(ctx, config, body, userId, log)
 			return types.ActionPause
 		}
-
-		// Cache miss, check Redis
-		log.Debugf("Star projects not in cache, checking Redis for user: %s", userId)
-		starKey := config.StarCheckManagement.RedisStarPrefix + userId
-		config.redisClient.Get(starKey, func(starResponse resp.Value) {
-			// Check if there's a Redis error
-			if err := starResponse.Error(); err != nil {
-				log.Warnf("Redis error when checking star status for user %s: %v. Allowing request to pass through.", userId, err)
-				// Redis error - allow request to pass through for better user experience
-				processQuotaLogic(ctx, config, body, userId, log)
-				return
-			}
-
-			// Parse starred projects from Redis
-			var starredProjects []string
-			var hasStar bool = false
-
-			if !starResponse.IsNull() {
-				starredProjectsStr := starResponse.String()
-				if starredProjectsStr != "" {
-					// Parse comma-separated project list
-					starredProjects = strings.Split(starredProjectsStr, ",")
-					for i, project := range starredProjects {
-						starredProjects[i] = strings.TrimSpace(project)
-						if starredProjects[i] == config.StarCheckManagement.TargetRepo {
-							hasStar = true
-						}
-					}
-				}
-			}
-
-			log.Debugf("User %s starred projects from Redis: %v, target repo (%s) starred: %t", userId, starredProjects, config.StarCheckManagement.TargetRepo, hasStar)
-
-			// Cache the starred projects
-			config.setStarCache(userId, starredProjects)
-			log.Debugf("Cached starred projects for user %s: %v", userId, starredProjects)
-
-			if hasStar {
-				// Star check passed, continue with quota logic
-				processQuotaLogic(ctx, config, body, userId, log)
-			} else {
-				sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", config.StarCheckManagement.TargetRepo), false, nil)
-			}
-		})
-		return types.ActionPause
 	}
 
 	// If GitHub star check is disabled, proceed directly with quota logic
@@ -1225,6 +1309,14 @@ func getOperationMode(path string, adminPath string, log wrapper.Log) (ChatMode,
 	}
 	if strings.HasSuffix(path, "/model-permission") {
 		return ChatModeAdmin, AdminModePermQuery
+	}
+
+	// Check for star check permission management paths
+	if strings.HasSuffix(path, "/check-star/set") {
+		return ChatModeAdmin, AdminModeStargazerSet
+	}
+	if strings.HasSuffix(path, "/check-star") {
+		return ChatModeAdmin, AdminModeStargazerQuery
 	}
 
 	if strings.HasSuffix(path, "/v1/chat/completions") {
@@ -1618,6 +1710,144 @@ func setUserPermission(ctx wrapper.HttpContext, config QuotaConfig, body string,
 	}
 
 	return types.ActionPause
+}
+
+func setStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, body string, log wrapper.Log) types.Action {
+	queryValues, _ := url.ParseQuery(body)
+	values := make(map[string]string)
+	for k, v := range queryValues {
+		if len(v) > 0 {
+			values[k] = v[0]
+		}
+	}
+
+	employeeNumber := values["employee_number"]
+	enabledParam := values["enabled"]
+	if employeeNumber == "" {
+		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		return types.ActionContinue
+	}
+
+	// Parse enabled parameter
+	enabled := false
+	if enabledParam == "true" || enabledParam == "1" {
+		enabled = true
+	}
+
+	log.Debugf("Setting star check permission for employee %s: %t", employeeNumber, enabled)
+
+	// Set user star check permission
+	if config.starCheckChecker != nil {
+		config.starCheckChecker.SetStarCheckPermission(employeeNumber, enabled, func(err error) {
+			if err != nil {
+				log.Errorf("Failed to set star check permission for employee %s: %v", employeeNumber, err)
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", fmt.Sprintf("Failed to set star check permission: %v", err), false, nil)
+				return
+			}
+			data := map[string]interface{}{
+				"employee_number": employeeNumber,
+				"enabled":         enabled,
+			}
+			sendJSONResponse(http.StatusOK, "ai-quota.set_star_permission", "set star check permission successful", true, data)
+		})
+	} else {
+		log.Errorf("Star check permission checker not initialized, cannot set permission for employee %s", employeeNumber)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Star check permission management not configured.", false, nil)
+	}
+
+	return types.ActionPause
+}
+
+func queryStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, log wrapper.Log) types.Action {
+	queryValues := url.Query()
+	values := make(map[string]string, len(queryValues))
+	for k, v := range queryValues {
+		values[k] = v[0]
+	}
+
+	employeeNumber := values["employee_number"]
+	if employeeNumber == "" {
+		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		return types.ActionContinue
+	}
+
+	log.Debugf("Querying star check permission for employee %s", employeeNumber)
+
+	if config.starCheckChecker != nil {
+		config.starCheckChecker.CheckStarCheckPermission(employeeNumber, log, func(enabled bool) {
+			data := map[string]interface{}{
+				"employee_number": employeeNumber,
+				"enabled":         enabled,
+			}
+			sendJSONResponse(http.StatusOK, "ai-quota.query_star_permission", "query star check permission successful", true, data)
+		})
+	} else {
+		log.Errorf("Star check permission checker not initialized, cannot query permission for employee %s", employeeNumber)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Star check permission management not configured.", false, nil)
+	}
+
+	return types.ActionPause
+}
+
+// performStarCheck performs the actual star checking logic
+func performStarCheck(ctx wrapper.HttpContext, config QuotaConfig, body []byte, userId string, log wrapper.Log) {
+	// First check local cache
+	if cached, hasStar := config.checkStarCache(userId); cached {
+		log.Debugf("Star projects found in cache for user %s, target repo starred: %t", userId, hasStar)
+		if hasStar {
+			log.Debugf("User %s has starred the target project (cached), proceeding with quota check", userId)
+			// Star check passed, continue with quota logic
+			processQuotaLogic(ctx, config, body, userId, log)
+		} else {
+			log.Debugf("User %s has not starred the target project (cached)", userId)
+			sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", config.StarCheckManagement.TargetRepo), false, nil)
+		}
+		return
+	}
+
+	// Cache miss, check Redis
+	log.Debugf("Star projects not in cache, checking Redis for user: %s", userId)
+	starKey := config.StarCheckManagement.RedisStarPrefix + userId
+	config.redisClient.Get(starKey, func(starResponse resp.Value) {
+		// Check if there's a Redis error
+		if err := starResponse.Error(); err != nil {
+			log.Warnf("Redis error when checking star status for user %s: %v. Allowing request to pass through.", userId, err)
+			// Redis error - allow request to pass through for better user experience
+			processQuotaLogic(ctx, config, body, userId, log)
+			return
+		}
+
+		// Parse starred projects from Redis
+		var starredProjects []string
+		var hasStar bool = false
+
+		if !starResponse.IsNull() {
+			starredProjectsStr := starResponse.String()
+			if starredProjectsStr != "" {
+				// Parse comma-separated project list
+				starredProjects = strings.Split(starredProjectsStr, ",")
+				for i, project := range starredProjects {
+					starredProjects[i] = strings.TrimSpace(project)
+					if starredProjects[i] == config.StarCheckManagement.TargetRepo {
+						hasStar = true
+					}
+				}
+			}
+		}
+
+		log.Debugf("User %s starred projects from Redis: %v, target repo (%s) starred: %t", userId, starredProjects, config.StarCheckManagement.TargetRepo, hasStar)
+
+		// Cache the starred projects
+		config.setStarCache(userId, starredProjects)
+		log.Debugf("Cached starred projects for user %s: %v", userId, starredProjects)
+
+		if hasStar {
+			// Star check passed, continue with quota logic
+			processQuotaLogic(ctx, config, body, userId, log)
+		} else {
+			sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", config.StarCheckManagement.TargetRepo), false, nil)
+		}
+	})
 }
 
 // continueWithQuotaLogic continues with quota checking after permission validation

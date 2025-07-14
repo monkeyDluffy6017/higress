@@ -83,7 +83,10 @@ description: AI 配额管理插件配置参考
 | 配置项        | 类型    | 必填 | 默认值 | 说明                                           |
 |---------------|---------|------|--------|------------------------------------------------|
 | `enabled`     | boolean | 选填 | false  | 是否启用GitHub项目关注检查                     |
+| `user_level_enabled` | boolean | 选填 | false  | 是否启用针对单个用户的独立控制                     |
 | `redis_star_prefix` | string | 选填 | chat_quota_star: | GitHub关注项目的redis key前缀（存储employee_number -> 项目列表） |
+| `admin_stargazer_path` | string | 选填 | /check-star | star检查权限管理接口路径前缀                     |
+| `redis_stargazer_prefix` | string | 选填 | star_check: | star检查权限的redis key前缀（存储employee_number -> enabled状态） |
 | `target_repo` | string  | 选填 | -      | 目标检查的仓库（例如："zgsm-ai.zgsm"）         |
 
 ## 配置示例
@@ -94,7 +97,10 @@ redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
 star_check_management:
   enabled: false
+  user_level_enabled: false
   redis_star_prefix: "chat_quota_star:"
+  admin_stargazer_path: "/check-star"
+  redis_stargazer_prefix: "star_check:"
   target_repo: "zgsm-ai.zgsm"
 token_header: "authorization"
 admin_header: "x-admin-key"
@@ -135,7 +141,10 @@ redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
 star_check_management:
   enabled: true
+  user_level_enabled: true
   redis_star_prefix: "chat_quota_star:"
+  admin_stargazer_path: "/check-star"
+  redis_stargazer_prefix: "star_check:"
   target_repo: "zgsm-ai.zgsm"
 token_header: "authorization"
 admin_header: "x-admin-key"
@@ -288,6 +297,47 @@ curl -X POST https://example.com/v1/chat/completions \
   }'
 # 返回：403 Forbidden - 无权限访问此模型
 ```
+
+## Star检查权限管理API（新增）
+
+当启用用户级别的star检查控制时 (`star_check_management.user_level_enabled: true`)，可以使用以下接口管理每个用户的star检查开关。
+
+### 设置用户star检查权限
+```bash
+curl -X POST "https://example.com/check-star/set" \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "employee_number=85054712&enabled=true"
+```
+
+### 查询用户star检查权限
+```bash
+curl -X GET "https://example.com/check-star?employee_number=85054712" \
+  -H "x-admin-key: your-admin-secret"
+```
+
+**参数说明**:
+- `employee_number`: 员工编号（必填）
+- `enabled`: 是否启用该用户的star检查，true或false（设置接口必填）
+
+**响应示例**:
+```json
+{
+  "code": "ai-quota.set_star_permission",
+  "message": "set star check permission successful",
+  "success": true,
+  "data": {
+    "employee_number": "85054712",
+    "enabled": true
+  }
+}
+```
+
+### Star检查工作流程
+
+1. **全局开关检查**: 首先检查 `star_check_management.enabled`
+2. **用户级别控制**: 如果启用了 `user_level_enabled`，检查用户的个人开关
+3. **实际star检查**: 只有当用户的star检查开关为true时，才进行实际的GitHub项目关注检查
 
 ## API接口
 

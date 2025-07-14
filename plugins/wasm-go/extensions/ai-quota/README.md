@@ -72,7 +72,10 @@ Explanation of each configuration field in `redis`
 | Name        | Data Type | Required | Default Value | Description                                      |
 |-------------|-----------|----------|---------------|--------------------------------------------------|
 | `enabled`   | boolean   | No       | false         | Whether to enable GitHub star checking          |
+| `user_level_enabled` | boolean | No | false    | Whether to enable individual user-level control |
 | `redis_star_prefix` | string | No | chat_quota_star: | Redis key prefix for GitHub star projects (employee_number -> starred projects) |
+| `admin_stargazer_path` | string | No | /check-star | Path prefix for star check permission management APIs |
+| `redis_stargazer_prefix` | string | No | star_check: | Redis key prefix for star check permissions (employee_number -> enabled status) |
 | `target_repo` | string  | No       | -             | Target repository for star checking (e.g., "zgsm-ai.zgsm") |
 
 ## Configuration Example
@@ -83,7 +86,10 @@ redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
 star_check_management:
   enabled: false
+  user_level_enabled: false
   redis_star_prefix: "chat_quota_star:"
+  admin_stargazer_path: "/check-star"
+  redis_stargazer_prefix: "star_check:"
   target_repo: "zgsm-ai.zgsm"
 token_header: "authorization"
 admin_header: "x-admin-key"
@@ -110,7 +116,10 @@ redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
 star_check_management:
   enabled: true
+  user_level_enabled: true
   redis_star_prefix: "chat_quota_star:"
+  admin_stargazer_path: "/check-star"
+  redis_stargazer_prefix: "star_check:"
   target_repo: "zgsm-ai.zgsm"
 token_header: "authorization"
 admin_header: "x-admin-key"
@@ -533,6 +542,36 @@ When handling `/ai-gateway/api/v1/models` requests:
 - `POST /model-permission/set`: Set user model permissions
   - Parameters: `employee_number`, `models` (JSON array)
 - `GET /model-permission?employee_number={employee_number}`: Query user permissions
+
+### Star Check Permission Management (New)
+
+When user-level star check control is enabled (`star_check_management.user_level_enabled: true`), you can use these APIs to manage individual user star check settings:
+
+- `POST /check-star/set`: Set user star check permission
+  - Parameters: `employee_number`, `enabled` (true/false)
+- `GET /check-star?employee_number={employee_number}`: Query user star check permission
+
+#### Setting User Star Check Permission
+
+```bash
+curl -X POST "https://example.com/check-star/set" \
+  -H "x-admin-key: your-admin-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "employee_number=85054712&enabled=true"
+```
+
+#### Querying User Star Check Permission
+
+```bash
+curl -X GET "https://example.com/check-star?employee_number=85054712" \
+  -H "x-admin-key: your-admin-secret"
+```
+
+#### Star Check Workflow
+
+1. **Global Check**: First checks `star_check_management.enabled`
+2. **User-Level Control**: If `user_level_enabled` is true, checks user's individual setting
+3. **Actual Star Check**: Only performs GitHub star checking when user's star check is enabled
 
 ## Configuration Details
 
