@@ -22,7 +22,7 @@ description: AI 配额管理插件配置参考
 - **灵活的配额扣减机制**：基于请求头触发配额扣减
 - **完整的管理接口**：支持配额总数和已使用量的查询、刷新、增减操作
 - **Redis集群支持**：兼容Redis单机和集群模式
-- **GitHub关注检查**：可选的GitHub项目关注状态验证
+- **GitHub项目关注管理**：支持多项目关注状态管理和验证
 - **模型列表展示**：支持通过 `/ai-gateway/api/v1/models` 端点展示可配置provider的可用模型列表
 - **模型权限管理**（新增）：支持基于用户身份的细粒度模型访问控制
 - **受限模型配置**：可配置需要特殊权限的模型列表
@@ -39,7 +39,7 @@ description: AI 配额管理插件配置参考
 ### Redis Key结构
 - `{redis_key_prefix}{user_id}` - 存储用户的配额总数
 - `{redis_used_prefix}{user_id}` - 存储用户的已使用量
-- `{redis_star_prefix}{user_id}` - 存储用户的GitHub关注状态（当启用check_github_star时）
+- `{redis_star_prefix}{employee_number}` - 存储用户的GitHub关注项目列表（当启用star_check_management时）
 
 ### 配额扣减机制
 插件从请求体中提取模型名称，根据 `model_quota_weights` 配置确定扣减额度：
@@ -53,8 +53,7 @@ description: AI 配额管理插件配置参考
 |------------------------|-----------|----------|------------------------|--------------------------------|
 | `redis_key_prefix`     | string    | 选填     | chat_quota:            | 配额总数的redis key前缀         |
 | `redis_used_prefix`    | string    | 选填     | chat_quota_used:       | 已使用量的redis key前缀         |
-| `redis_star_prefix`    | string    | 选填     | chat_quota_star:       | GitHub关注状态的redis key前缀   |
-| `check_github_star`    | boolean   | 选填     | false                  | 是否启用GitHub关注检查          |
+| `star_check_management` | object   | 选填     | -                      | GitHub项目关注检查配置          |
 | `token_header`         | string    | 选填     | authorization          | 存储JWT token的请求头名称       |
 | `admin_header`         | string    | 选填     | x-admin-key            | 管理操作验证用的请求头名称       |
 | `admin_key`            | string    | 必填     | -                      | 管理操作验证用的密钥            |
@@ -79,14 +78,24 @@ description: AI 配额管理插件配置参考
 | timeout      | int    | 选填 | 1000                                                       | redis连接超时时间，单位毫秒                                                                     |
 | database     | int    | 选填 | 0                                                          | 使用的数据库 ID，例如，配置为1，对应`SELECT 1`                                                    |
 
+### GitHub项目关注检查配置
+
+| 配置项        | 类型    | 必填 | 默认值 | 说明                                           |
+|---------------|---------|------|--------|------------------------------------------------|
+| `enabled`     | boolean | 选填 | false  | 是否启用GitHub项目关注检查                     |
+| `redis_star_prefix` | string | 选填 | chat_quota_star: | GitHub关注项目的redis key前缀（存储employee_number -> 项目列表） |
+| `target_repo` | string  | 选填 | -      | 目标检查的仓库（例如："zgsm-ai.zgsm"）         |
+
 ## 配置示例
 
 ### 基本配置
 ```yaml
 redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
-redis_star_prefix: "chat_quota_star:"
-check_github_star: false
+star_check_management:
+  enabled: false
+  redis_star_prefix: "chat_quota_star:"
+  target_repo: "zgsm-ai.zgsm"
 token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
@@ -124,8 +133,10 @@ redis:
 ```yaml
 redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
-redis_star_prefix: "chat_quota_star:"
-check_github_star: true
+star_check_management:
+  enabled: true
+  redis_star_prefix: "chat_quota_star:"
+  target_repo: "zgsm-ai.zgsm"
 token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
@@ -152,7 +163,7 @@ redis:
   timeout: 2000
 ```
 
-**说明**: 当 `check_github_star` 设置为 `true` 时，用户必须先关注 GitHub 项目才能使用AI服务。系统会检查Redis中键为 `chat_quota_star:{user_id}` 的值是否为 "true"。
+**说明**: 当 `star_check_management.enabled` 设置为 `true` 时，用户必须先关注指定的 GitHub 项目才能使用AI服务。系统会检查用户的星标项目列表中是否包含 `target_repo` 配置的项目。
 
 ### 模型权重配置说明
 
@@ -292,7 +303,7 @@ curl -X POST https://example.com/v1/chat/completions \
 
 **行为**:
 1. 从JWT token中提取用户ID
-2. 如果启用了 `check_github_star`，检查用户的GitHub关注状态（`{redis_star_prefix}{user_id}` 必须为 "true"）
+2. 如果启用了 `star_check_management`，检查用户的GitHub关注项目列表中是否包含 `target_repo`
 3. 从请求体中提取模型名称
 4. 根据 `model_quota_weights` 配置确定所需配额
 5. 检查用户的剩余配额是否足够（总数 - 已使用量 >= 所需配额）
@@ -300,8 +311,8 @@ curl -X POST https://example.com/v1/chat/completions \
 7. 如果模型未配置权重，则不扣减配额直接放行
 
 **GitHub关注检查**:
-- 当 `check_github_star` 设置为 `true` 时，会首先检查用户是否关注了GitHub项目
-- 如果Redis中 `{redis_star_prefix}{user_id}` 的值不是 "true"，将返回403错误，提示用户需要关注 https://github.com/zgsm-ai/zgsm 项目
+- 当 `star_check_management.enabled` 设置为 `true` 时，会首先检查用户是否关注了配置的GitHub项目
+- 如果用户的星标项目列表中不包含 `target_repo` 配置的项目，将返回403错误，提示用户需要关注对应项目
 - 只有通过GitHub关注检查后，才会继续进行配额检查和扣减
 
 ### 模型列表接口
@@ -463,26 +474,26 @@ curl -H "x-admin-key: your-admin-secret" \
 }
 ```
 
-##### 设置GitHub关注状态
+##### 设置GitHub关注项目
 ```bash
-# 设置为已关注
+# 为用户设置关注的项目列表（使用员工编号）
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&star_value=true" \
-  "https://example.com/v1/chat/completions/quota/star/set"
+  -d "employee_number=emp123&starred_projects=zgsm-ai.zgsm,microsoft/vscode,openai/gpt-4" \
+  "https://example.com/v1/chat/completions/quota/star/projects/set"
 
-# 设置为未关注
+# 清空用户的所有关注项目
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&star_value=false" \
-  "https://example.com/v1/chat/completions/quota/star/set"
+  -d "employee_number=emp123&starred_projects=" \
+  "https://example.com/v1/chat/completions/quota/star/projects/set"
 ```
 
 **参数说明**:
-- `user_id`: 用户ID（必填）
-- `star_value`: 关注状态，只能是 "true" 或 "false"（必填）
+- `employee_number`: 员工编号（必填，从JWT token的EmployeeNumber字段获取）
+- `starred_projects`: 关注的项目仓库列表，逗号分隔（选填，空值表示清空所有关注）
 
 ## 使用示例
 

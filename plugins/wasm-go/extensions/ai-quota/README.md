@@ -45,8 +45,7 @@ When a request contains specified headers and values, the system increments the 
 |------------------------|-----------|---------------------|---------------------|------------------------------------------------|
 | `redis_key_prefix`     | string    | Optional           | chat_quota:         | Redis key prefix for total quota              |
 | `redis_used_prefix`    | string    | Optional           | chat_quota_used:    | Redis key prefix for used quota               |
-| `redis_star_prefix`    | string    | Optional           | chat_quota_star:    | Redis key prefix for GitHub star status       |
-| `check_github_star`    | boolean   | Optional           | false               | Whether to enable GitHub star checking        |
+| `star_check_management` | object   | Optional           | -                   | GitHub star checking configuration            |
 | `token_header`         | string    | Optional           | authorization       | Request header name storing JWT token         |
 | `admin_header`         | string    | Optional           | x-admin-key         | Request header name for admin verification    |
 | `admin_key`            | string    | Required           | -                   | Secret key for admin operation verification   |
@@ -68,14 +67,24 @@ Explanation of each configuration field in `redis`
 | timeout            | int    | No       | 1000                                                    | Redis connection timeout in milliseconds                                                                |
 | database           | int    | No       | 0                                                       | The database ID used, for example, configured as 1, corresponds to `SELECT 1`.                          |
 
+### Star Check Management Configuration
+
+| Name        | Data Type | Required | Default Value | Description                                      |
+|-------------|-----------|----------|---------------|--------------------------------------------------|
+| `enabled`   | boolean   | No       | false         | Whether to enable GitHub star checking          |
+| `redis_star_prefix` | string | No | chat_quota_star: | Redis key prefix for GitHub star projects (employee_number -> starred projects) |
+| `target_repo` | string  | No       | -             | Target repository for star checking (e.g., "zgsm-ai.zgsm") |
+
 ## Configuration Example
 
 ### Basic Configuration
 ```yaml
 redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
-redis_star_prefix: "chat_quota_star:"
-check_github_star: false
+star_check_management:
+  enabled: false
+  redis_star_prefix: "chat_quota_star:"
+  target_repo: "zgsm-ai.zgsm"
 token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
@@ -99,8 +108,10 @@ redis:
 ```yaml
 redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
-redis_star_prefix: "chat_quota_star:"
-check_github_star: true
+star_check_management:
+  enabled: true
+  redis_star_prefix: "chat_quota_star:"
+  target_repo: "zgsm-ai.zgsm"
 token_header: "authorization"
 admin_header: "x-admin-key"
 admin_key: "your-admin-secret"
@@ -301,7 +312,7 @@ curl -X POST \
   "https://example.com/v1/chat/completions/quota/used/delta"
 ```
 
-#### GitHub Star Status Management
+#### GitHub Star Projects Management
 
 ##### Query GitHub Star Status
 ```bash
@@ -323,26 +334,26 @@ curl -H "x-admin-key: your-admin-secret" \
 }
 ```
 
-##### Set GitHub Star Status
+##### Set GitHub Star Projects
 ```bash
-# Set as starred
+# Set starred projects for a user (using employee number)
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&star_value=true" \
-  "https://example.com/v1/chat/completions/quota/star/set"
+  -d "employee_number=emp123&starred_projects=zgsm-ai.zgsm,microsoft/vscode,openai/gpt-4" \
+  "https://example.com/v1/chat/completions/quota/star/projects/set"
 
-# Set as not starred
+# Clear all starred projects for a user
 curl -X POST \
   -H "x-admin-key: your-admin-secret" \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&star_value=false" \
-  "https://example.com/v1/chat/completions/quota/star/set"
+  -d "employee_number=emp123&starred_projects=" \
+  "https://example.com/v1/chat/completions/quota/star/projects/set"
 ```
 
 **Parameter Description**:
-- `user_id`: User ID (required)
-- `star_value`: Star status, must be "true" or "false" (required)
+- `employee_number`: Employee number (required, extracted from JWT token's EmployeeNumber field)
+- `starred_projects`: Comma-separated list of starred project repositories (optional, empty means clear all)
 
 ## Usage Examples
 
@@ -428,8 +439,10 @@ redis:
 
 redis_key_prefix: "chat_quota:"
 redis_used_prefix: "chat_quota_used:"
-redis_star_prefix: "github_star:"
-check_github_star: true
+star_check_management:
+  enabled: true
+  redis_star_prefix: "github_star:"
+  target_repo: "zgsm-ai.zgsm"
 
 # New: Model Permission Management
 restricted_models:

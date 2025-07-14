@@ -189,18 +189,17 @@ func (c *ProviderConfig) BuildModelsResponse() ([]byte, error) {
 }
 
 type QuotaConfig struct {
-	redisInfo         RedisInfo      `yaml:"redis"`
-	RedisKeyPrefix    string         `yaml:"redis_key_prefix"`
-	RedisUsedPrefix   string         `yaml:"redis_used_prefix"`
-	RedisStarPrefix   string         `yaml:"redis_star_prefix"`
-	CheckGithubStar   bool           `yaml:"check_github_star"`
-	TokenHeader       string         `yaml:"token_header"`
-	AdminHeader       string         `yaml:"admin_header"`
-	AdminKey          string         `yaml:"admin_key"`
-	AdminPath         string         `yaml:"admin_path"`
-	DeductHeader      string         `yaml:"deduct_header"`
-	DeductHeaderValue string         `yaml:"deduct_header_value"`
-	ModelQuotaWeights map[string]int `yaml:"model_quota_weights"`
+	redisInfo           RedisInfo                 `yaml:"redis"`
+	RedisKeyPrefix      string                    `yaml:"redis_key_prefix"`
+	RedisUsedPrefix     string                    `yaml:"redis_used_prefix"`
+	StarCheckManagement StarCheckManagementConfig `yaml:"star_check_management"`
+	TokenHeader         string                    `yaml:"token_header"`
+	AdminHeader         string                    `yaml:"admin_header"`
+	AdminKey            string                    `yaml:"admin_key"`
+	AdminPath           string                    `yaml:"admin_path"`
+	DeductHeader        string                    `yaml:"deduct_header"`
+	DeductHeaderValue   string                    `yaml:"deduct_header_value"`
+	ModelQuotaWeights   map[string]int            `yaml:"model_quota_weights"`
 
 	// Provider configuration for /ai-gateway/api/v1/models endpoint
 	Provider  ProviderConfig   `yaml:"provider"`  // Single provider configuration (legacy support)
@@ -211,9 +210,16 @@ type QuotaConfig struct {
 	PermissionManagement PermissionManagementConfig `yaml:"permission_management"`
 
 	redisClient       wrapper.RedisClient `yaml:"-"`
-	starCache         map[string]bool     `yaml:"-"` // Simple star status cache
+	starCache         map[string][]string `yaml:"-"` // Star projects cache (employee_number -> starred projects)
 	providerConfigs   []ProviderConfig    `yaml:"-"` // All configured providers for models endpoint
 	permissionChecker *PermissionChecker  `yaml:"-"` // Permission checker instance
+}
+
+// StarCheckManagementConfig configuration for star check management
+type StarCheckManagementConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	RedisStarPrefix string `yaml:"redis_star_prefix"`
+	TargetRepo      string `yaml:"target_repo"`
 }
 
 // PermissionManagementConfig configuration for permission management
@@ -438,15 +444,26 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		config.RedisUsedPrefix = "chat_quota_used:"
 	}
 
-	config.RedisStarPrefix = json.Get("redis_star_prefix").String()
-	if config.RedisStarPrefix == "" {
-		config.RedisStarPrefix = "chat_quota_star:"
+	// Parse star check management configuration
+	starCheckManagement := json.Get("star_check_management")
+	if starCheckManagement.Exists() {
+		config.StarCheckManagement.Enabled = starCheckManagement.Get("enabled").Bool()
+		config.StarCheckManagement.RedisStarPrefix = starCheckManagement.Get("redis_star_prefix").String()
+		config.StarCheckManagement.TargetRepo = starCheckManagement.Get("target_repo").String()
+	} else {
+		// For backward compatibility, check old check_github_star config
+		config.StarCheckManagement.Enabled = json.Get("check_github_star").Bool()
+		config.StarCheckManagement.RedisStarPrefix = json.Get("redis_star_prefix").String()
+		config.StarCheckManagement.TargetRepo = "zgsm-ai.costrict" // Default value
 	}
 
-	config.CheckGithubStar = json.Get("check_github_star").Bool()
+	// Set default value for RedisStarPrefix if not specified
+	if config.StarCheckManagement.RedisStarPrefix == "" {
+		config.StarCheckManagement.RedisStarPrefix = "chat_quota_star:"
+	}
 
-	// Initialize simple star cache
-	config.starCache = make(map[string]bool)
+	// Initialize star projects cache
+	config.starCache = make(map[string][]string)
 
 	redisConfig := json.Get("redis")
 	if !redisConfig.Exists() {
@@ -773,12 +790,17 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		return types.ActionContinue
 	}
 
-	if userInfo.ID == "" {
-		sendJSONResponse(http.StatusUnauthorized, "ai-gateway.no_userid", "Request denied by ai quota check. No user ID found in token.", false, nil)
+	if userInfo.EmployeeNumber == "" {
+		sendJSONResponse(http.StatusUnauthorized, "ai-gateway.no_userid", "Request denied by ai quota check. No employee number found in token.", false, nil)
 		return types.ActionContinue
 	}
 
-	context.SetContext("userId", userInfo.ID)
+	// For star check, use employee number; for quota operations, maintain compatibility using universal_id as fallback
+	employeeNumber := userInfo.EmployeeNumber
+	if employeeNumber == "" {
+		employeeNumber = userInfo.ID // fallback to universal_id for backward compatibility
+	}
+	context.SetContext("userId", employeeNumber)
 
 	// Buffer request body to extract model info
 	// Note: ai-proxy plugin (priority 100) may have already buffered the request body
@@ -849,26 +871,26 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 	}
 
 	// Check GitHub star status first if enabled
-	if config.CheckGithubStar {
+	if config.StarCheckManagement.Enabled {
 		log.Debugf("GitHub star check is enabled, checking star status for user: %s", userId)
 
 		// First check local cache
 		if cached, hasStar := config.checkStarCache(userId); cached {
-			log.Debugf("Star status found in cache for user %s: %t", userId, hasStar)
+			log.Debugf("Star projects found in cache for user %s, target repo starred: %t", userId, hasStar)
 			if hasStar {
-				log.Debugf("User %s has starred the project (cached), proceeding with quota check", userId)
+				log.Debugf("User %s has starred the target project (cached), proceeding with quota check", userId)
 				// Star check passed, continue with quota logic
 				processQuotaLogic(ctx, config, body, userId, log)
 			} else {
-				log.Debugf("User %s has not starred the project (cached)", userId)
-				sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", "Please star the project first: https://github.com/zgsm-ai/zgsm", false, nil)
+				log.Debugf("User %s has not starred the target project (cached)", userId)
+				sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", config.StarCheckManagement.TargetRepo), false, nil)
 			}
 			return types.ActionPause
 		}
 
 		// Cache miss, check Redis
-		log.Debugf("Star status not in cache, checking Redis for user: %s", userId)
-		starKey := config.RedisStarPrefix + userId
+		log.Debugf("Star projects not in cache, checking Redis for user: %s", userId)
+		starKey := config.StarCheckManagement.RedisStarPrefix + userId
 		config.redisClient.Get(starKey, func(starResponse resp.Value) {
 			// Check if there's a Redis error
 			if err := starResponse.Error(); err != nil {
@@ -878,24 +900,35 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 				return
 			}
 
-			// No Redis error, check the actual value
-			hasStar := false
-			if !starResponse.IsNull() && starResponse.String() == "true" {
-				log.Debugf("User %s has starred the project (from Redis)", userId)
-				hasStar = true
-			} else {
-				log.Debugf("User %s has not starred the project (confirmed from Redis)", userId)
+			// Parse starred projects from Redis
+			var starredProjects []string
+			var hasStar bool = false
+
+			if !starResponse.IsNull() {
+				starredProjectsStr := starResponse.String()
+				if starredProjectsStr != "" {
+					// Parse comma-separated project list
+					starredProjects = strings.Split(starredProjectsStr, ",")
+					for i, project := range starredProjects {
+						starredProjects[i] = strings.TrimSpace(project)
+						if starredProjects[i] == config.StarCheckManagement.TargetRepo {
+							hasStar = true
+						}
+					}
+				}
 			}
 
-			// Only cache true status
+			log.Debugf("User %s starred projects from Redis: %v, target repo (%s) starred: %t", userId, starredProjects, config.StarCheckManagement.TargetRepo, hasStar)
+
+			// Cache the starred projects
+			config.setStarCache(userId, starredProjects)
+			log.Debugf("Cached starred projects for user %s: %v", userId, starredProjects)
+
 			if hasStar {
-				config.setStarCache(userId, hasStar)
-				log.Debugf("Cached star status for user %s: %t", userId, hasStar)
 				// Star check passed, continue with quota logic
 				processQuotaLogic(ctx, config, body, userId, log)
 			} else {
-				log.Debugf("User %s has not starred, not caching false status", userId)
-				sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", "Please star the project first: https://github.com/zgsm-ai/zgsm", false, nil)
+				sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", config.StarCheckManagement.TargetRepo), false, nil)
 			}
 		})
 		return types.ActionPause
@@ -1176,10 +1209,10 @@ func getOperationMode(path string, adminPath string, log wrapper.Log) (ChatMode,
 	if strings.HasSuffix(path, fullAdminPath+"/used") {
 		return ChatModeAdmin, AdminModeUsedQuery
 	}
-	if strings.HasSuffix(path, fullAdminPath+"/star/set") {
+	if strings.HasSuffix(path, fullAdminPath+"/star/projects/set") {
 		return ChatModeAdmin, AdminModeStarSet
 	}
-	if strings.HasSuffix(path, fullAdminPath+"/star") {
+	if strings.HasSuffix(path, fullAdminPath+"/star/projects/query") {
 		return ChatModeAdmin, AdminModeStarQuery
 	}
 	if strings.HasSuffix(path, fullAdminPath) {
@@ -1236,39 +1269,49 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 	for k, v := range queryValues {
 		values[k] = v[0]
 	}
-	if values["user_id"] == "" {
-		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty.", false, nil)
-		return types.ActionContinue
+
+	// For star query, use employee_number; for other queries, keep backward compatibility with user_id
+	var employeeNumber string
+	if adminMode == AdminModeStarQuery {
+		employeeNumber = values["employee_number"]
+		if employeeNumber == "" {
+			sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+			return types.ActionContinue
+		}
+	} else {
+		// For quota queries, maintain backward compatibility with user_id
+		employeeNumber = values["user_id"]
+		if employeeNumber == "" {
+			sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty.", false, nil)
+			return types.ActionContinue
+		}
 	}
-	userId := values["user_id"]
 
 	// Determine which key to use based on admin mode
 	var redisKey string
 	var responseType string
 	if adminMode == AdminModeUsedQuery {
-		redisKey = config.RedisUsedPrefix + userId
+		redisKey = config.RedisUsedPrefix + employeeNumber
 		responseType = "used_quota"
 	} else if adminMode == AdminModeStarQuery {
 		// Check cache first for star query
-		if cached, hasStar := config.checkStarCache(userId); cached {
-			log.Debugf("Star status found in cache for user %s: %t", userId, hasStar)
-			starValue := "false"
-			if hasStar {
-				starValue = "true"
-			}
-			data := map[string]string{
-				"user_id":    userId,
-				"star_value": starValue,
-				"type":       "star_status",
+		if cached, _ := config.checkStarCache(employeeNumber); cached {
+			starredProjects := config.starCache[employeeNumber]
+			log.Debugf("Star projects found in cache for employee %s: %v", employeeNumber, starredProjects)
+
+			data := map[string]interface{}{
+				"employee_number":  employeeNumber,
+				"starred_projects": strings.Join(starredProjects, ","), // Return as comma-separated string
+				"type":             "star_status",
 			}
 			sendJSONResponse(http.StatusOK, "ai-gateway.querystar", "query star status successful (cached)", true, data)
 			return types.ActionContinue
 		}
 
-		redisKey = config.RedisStarPrefix + userId
+		redisKey = config.StarCheckManagement.RedisStarPrefix + employeeNumber
 		responseType = "star_status"
 	} else {
-		redisKey = config.RedisKeyPrefix + userId
+		redisKey = config.RedisKeyPrefix + employeeNumber
 		responseType = "total_quota"
 	}
 
@@ -1276,42 +1319,38 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 		// Check for Redis errors first
 		if wrapper.IsRedisErrorResponse(response) {
 			redisErr := wrapper.GetRedisErrorFromResponse(response)
-			log.Errorf("Failed to query %s for user %s: %v", responseType, userId, redisErr)
+			log.Errorf("Failed to query %s for employee %s: %v", responseType, employeeNumber, redisErr)
 			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.redis_error",
 				fmt.Sprintf("Redis error: %s", redisErr.Error()), false, nil)
 			return
 		}
 
 		if adminMode == AdminModeStarQuery {
-			// Handle star status query (string value)
-			starValue := "false"
+			// Handle star projects query (comma-separated string value)
+			var starredProjects []string
 			if !response.IsNull() {
-				starValueFromRedis := response.String()
-				// Validate star value format
-				if starValueFromRedis == "true" || starValueFromRedis == "false" {
-					starValue = starValueFromRedis
-				} else {
-					log.Warnf("Invalid star status value for user %s: %s, defaulting to false", userId, starValueFromRedis)
+				starredProjectsStr := response.String()
+				if starredProjectsStr != "" {
+					// Parse comma-separated project list
+					starredProjects = strings.Split(starredProjectsStr, ",")
+					for i, project := range starredProjects {
+						starredProjects[i] = strings.TrimSpace(project)
+					}
 				}
 			} else {
-				log.Debugf("No star status found for user %s (key does not exist), defaulting to false", userId)
+				log.Debugf("No starred projects found for employee %s (key does not exist)", employeeNumber)
 			}
 
-			// Only cache true status
-			hasStar := starValue == "true"
-			if hasStar {
-				config.setStarCache(userId, hasStar)
-				log.Debugf("Cached star status from Redis for user %s: %t", userId, hasStar)
-			} else {
-				log.Debugf("User %s has not starred, not caching false status", userId)
-			}
+			// Cache the starred projects
+			config.setStarCache(employeeNumber, starredProjects)
+			log.Debugf("Cached starred projects from Redis for employee %s: %v", employeeNumber, starredProjects)
 
-			data := map[string]string{
-				"user_id":    userId,
-				"star_value": starValue,
-				"type":       responseType,
+			data := map[string]interface{}{
+				"employee_number":  employeeNumber,
+				"starred_projects": strings.Join(starredProjects, ","), // Return as comma-separated string
+				"type":             responseType,
 			}
-			sendJSONResponse(http.StatusOK, "ai-gateway.querystar", "query star status successful", true, data)
+			sendJSONResponse(http.StatusOK, "ai-gateway.querystar", "query star projects successful", true, data)
 		} else {
 			// Handle quota query (integer value)
 			quota := 0
@@ -1322,7 +1361,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 					var parseErr error
 					quota, parseErr = strconv.Atoi(quotaStr)
 					if parseErr != nil {
-						log.Errorf("Invalid %s format for user %s: %s", responseType, userId, quotaStr)
+						log.Errorf("Invalid %s format for user %s: %s", responseType, employeeNumber, quotaStr)
 						sendJSONResponse(http.StatusInternalServerError, "ai-gateway.invalid_quota_format",
 							fmt.Sprintf("Invalid %s format", responseType), false, nil)
 						return
@@ -1330,18 +1369,18 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 
 					// Validate that quota is non-negative
 					if quota < 0 {
-						log.Errorf("Invalid %s value for user %s: %d (cannot be negative)", responseType, userId, quota)
+						log.Errorf("Invalid %s value for user %s: %d (cannot be negative)", responseType, employeeNumber, quota)
 						sendJSONResponse(http.StatusInternalServerError, "ai-gateway.invalid_quota_value",
 							fmt.Sprintf("Invalid %s value", responseType), false, nil)
 						return
 					}
 				}
 			} else {
-				log.Debugf("No %s found for user %s (key does not exist or is empty), defaulting to 0", responseType, userId)
+				log.Debugf("No %s found for user %s (key does not exist or is empty), defaulting to 0", responseType, employeeNumber)
 			}
 
 			data := map[string]interface{}{
-				"user_id": userId,
+				"user_id": employeeNumber,
 				"quota":   quota,
 				"type":    responseType,
 			}
@@ -1480,33 +1519,45 @@ func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log
 			values[k] = v[0]
 		}
 	}
-	userId := values["user_id"]
-	starValue := values["star_value"]
-	if userId == "" || starValue == "" {
-		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id and star_value can't be empty.", false, nil)
+
+	employeeNumber := values["employee_number"]
+	starredProjects := values["starred_projects"]
+	if employeeNumber == "" {
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
-	// Validate star_value should be "true" or "false"
-	if starValue != "true" && starValue != "false" {
-		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. star_value must be 'true' or 'false'.", false, nil)
-		return types.ActionContinue
+	// starredProjects can be empty (to clear all starred projects) or comma-separated project names
+	var projectsList []string
+	if starredProjects != "" {
+		projectsList = strings.Split(starredProjects, ",")
+		for i, project := range projectsList {
+			projectsList[i] = strings.TrimSpace(project)
+		}
 	}
 
-	redisKey := config.RedisStarPrefix + userId
+	redisKey := config.StarCheckManagement.RedisStarPrefix + employeeNumber
 
 	// Delete from local cache before setting to ensure fresh read
-	config.deleteStarCache(userId)
-	log.Debugf("Deleted star cache for user %s before setting", userId)
+	config.deleteStarCache(employeeNumber)
+	log.Debugf("Deleted star cache for employee %s before setting", employeeNumber)
 
-	err := config.redisClient.Set(redisKey, starValue, func(response resp.Value) {
-		log.Debugf("Redis set key = %s star_value = %s", redisKey, starValue)
+	err := config.redisClient.Set(redisKey, starredProjects, func(response resp.Value) {
+		log.Debugf("Redis set key = %s starred_projects = %s", redisKey, starredProjects)
 		if err := response.Error(); err != nil {
 			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
 
-		sendJSONResponse(http.StatusOK, "ai-gateway.setstar", "set star status successful", true, nil)
+		// Update memory cache
+		config.setStarCache(employeeNumber, projectsList)
+		log.Debugf("Updated star cache for employee %s with projects: %v", employeeNumber, projectsList)
+
+		data := map[string]interface{}{
+			"employee_number":  employeeNumber,
+			"starred_projects": starredProjects,
+		}
+		sendJSONResponse(http.StatusOK, "ai-gateway.setstar", "set star projects successful", true, data)
 	})
 
 	if err != nil {
@@ -1590,30 +1641,33 @@ func continueWithQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []
 	doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
 }
 
-// checkStarCache checks if user star status is cached
-func (config *QuotaConfig) checkStarCache(userId string) (bool, bool) {
-	hasStar, exists := config.starCache[userId]
-	// Only return cache hit if the user has starred (true)
-	// If user hasn't starred, we should always check Redis
-	if exists && hasStar {
-		return true, true
+// checkStarCache checks if user starred projects are cached and if target repo is starred
+func (config *QuotaConfig) checkStarCache(employeeNumber string) (bool, bool) {
+	starredProjects, exists := config.starCache[employeeNumber]
+	if !exists {
+		return false, false // Not cached yet
 	}
-	return false, false
+
+	// Check if target repo is in the starred projects list
+	for _, project := range starredProjects {
+		if project == config.StarCheckManagement.TargetRepo {
+			return true, true
+		}
+	}
+	return true, false // Cache exists but target repo not starred
 }
 
-// setStarCache sets user star status in cache (only cache true status)
-func (config *QuotaConfig) setStarCache(userId string, hasStar bool) {
-	if hasStar {
-		config.starCache[userId] = hasStar
-	} else {
-		// Don't cache false status, delete if exists
-		delete(config.starCache, userId)
-	}
+// setStarCache sets user starred projects in cache
+func (config *QuotaConfig) setStarCache(employeeNumber string, starredProjects []string) {
+	// Always cache the result, even if it's empty
+	// Empty slice means "queried but no starred projects found in Redis"
+	// Missing key means "not queried yet"
+	config.starCache[employeeNumber] = starredProjects
 }
 
-// deleteStarCache removes user star status from cache
-func (config *QuotaConfig) deleteStarCache(userId string) {
-	delete(config.starCache, userId)
+// deleteStarCache removes user starred projects from cache
+func (config *QuotaConfig) deleteStarCache(employeeNumber string) {
+	delete(config.starCache, employeeNumber)
 }
 
 // BuildCombinedModelsResponse builds a models response that combines all configured providers
