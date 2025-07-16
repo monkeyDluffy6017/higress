@@ -201,6 +201,7 @@ type QuotaManagementConfig struct {
 	AdminQuotaPath    string         `yaml:"admin_quota_path"`
 	RedisQuotaPrefix  string         `yaml:"redis_quota_prefix"`
 	ModelQuotaWeights map[string]int `yaml:"model_quota_weights"`
+	CacheTTLSeconds   int            `yaml:"cache_ttl_seconds"` // Cache TTL in seconds, default 60s
 }
 
 type QuotaConfig struct {
@@ -250,18 +251,25 @@ type PermissionManagementConfig struct {
 type PermissionChecker struct {
 	restrictedModels []string
 	memoryCache      map[string][]string // employee_number -> allowed_models
+	cacheExpireTime  map[string]int64    // employee_number -> expire_timestamp
 	mu               sync.RWMutex
 	redisClient      wrapper.RedisClient
 	redisPermPrefix  string
+	cacheTTLSeconds  int64 // Cache TTL in seconds
 }
 
 // NewPermissionChecker creates a new permission checker
-func NewPermissionChecker(restrictedModels []string, redisClient wrapper.RedisClient, redisPermPrefix string) *PermissionChecker {
+func NewPermissionChecker(restrictedModels []string, redisClient wrapper.RedisClient, redisPermPrefix string, cacheTTLSeconds int) *PermissionChecker {
+	if cacheTTLSeconds <= 0 {
+		cacheTTLSeconds = 60 // Default 60 seconds
+	}
 	return &PermissionChecker{
 		restrictedModels: restrictedModels,
 		memoryCache:      make(map[string][]string),
+		cacheExpireTime:  make(map[string]int64),
 		redisClient:      redisClient,
 		redisPermPrefix:  redisPermPrefix,
+		cacheTTLSeconds:  int64(cacheTTLSeconds),
 	}
 }
 
@@ -322,17 +330,27 @@ func (p *PermissionChecker) isModelAllowed(modelName string, allowedModels []str
 
 // getUserAllowedModels gets user's allowed models with callback
 func (p *PermissionChecker) getUserAllowedModels(employeeNumber string, callback func([]string)) {
-	// Check memory cache first
+	now := time.Now().Unix()
+
+	// Check if cache exists and is not expired
 	p.mu.RLock()
-	if models, exists := p.memoryCache[employeeNumber]; exists {
-		p.mu.RUnlock()
-		callback(models)
-		return
-	}
+	cachedModels, hasCache := p.memoryCache[employeeNumber]
+	expireTime, hasExpireTime := p.cacheExpireTime[employeeNumber]
 	p.mu.RUnlock()
 
-	// Cache miss, get from Redis
-	p.getFromRedis(employeeNumber, callback)
+	// If cache exists and not expired, use it
+	if hasCache && hasExpireTime && now < expireTime {
+		callback(cachedModels)
+		return
+	}
+
+	// Cache expired or missing, get from Redis
+	p.getFromRedis(employeeNumber, func(loadedModels []string) {
+		// Update cache with new expiration time
+		newExpireTime := now + p.cacheTTLSeconds
+		p.updateMemoryCacheWithTTL(employeeNumber, loadedModels, newExpireTime)
+		callback(loadedModels)
+	})
 }
 
 // getFromRedis gets allowed models from Redis (async, non-blocking)
@@ -351,8 +369,6 @@ func (p *PermissionChecker) getFromRedis(employeeNumber string, callback func([]
 			data := response.String()
 			var loadedModels []string
 			if json.Unmarshal([]byte(data), &loadedModels) == nil {
-				// Update memory cache with loaded data
-				p.updateMemoryCache(employeeNumber, loadedModels)
 				callback(loadedModels) // Call callback with loaded data
 			} else {
 				callback(nil) // Call callback with nil on parse error
@@ -364,63 +380,94 @@ func (p *PermissionChecker) getFromRedis(employeeNumber string, callback func([]
 }
 
 // updateMemoryCache updates the memory cache
-func (p *PermissionChecker) updateMemoryCache(employeeNumber string, models []string) {
+// updateMemoryCache updates the memory cache
+func (p *PermissionChecker) updateMemoryCacheWithTTL(employeeNumber string, models []string, expireTime int64) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.memoryCache[employeeNumber] = models
+	p.cacheExpireTime[employeeNumber] = expireTime
+	p.mu.Unlock()
+}
+
+// deleteMemoryCache removes the cache entry for a specific employee
+func (p *PermissionChecker) deleteMemoryCache(employeeNumber string) {
+	p.mu.Lock()
+	delete(p.memoryCache, employeeNumber)
+	delete(p.cacheExpireTime, employeeNumber)
+	p.mu.Unlock()
 }
 
 // SetUserPermission sets user's allowed models in Redis and cache
 func (p *PermissionChecker) SetUserPermission(employeeNumber string, models []string, callback func(error)) {
+	// Clear memory cache first to force Redis reads on all instances
+	p.deleteMemoryCache(employeeNumber)
+
 	// Update Redis
 	key := p.redisPermPrefix + employeeNumber
 	data, _ := json.Marshal(models)
 
 	p.redisClient.Set(key, string(data), func(response resp.Value) {
-		// Update memory cache regardless of Redis result
-		p.updateMemoryCache(employeeNumber, models)
-
 		// Call the callback with the result
 		if callback != nil {
 			callback(response.Error())
 		}
 	})
-
-	// Always update memory cache immediately for consistency
-	p.updateMemoryCache(employeeNumber, models)
 }
 
 // StarCheckChecker manages user-level star check permissions
 type StarCheckChecker struct {
-	memoryCache     map[string]bool // employee_number -> star_check_enabled
+	memoryCache     map[string]bool  // employee_number -> star_check_enabled
+	cacheExpireTime map[string]int64 // employee_number -> expire_timestamp
 	mu              sync.RWMutex
 	redisClient     wrapper.RedisClient
 	redisStarPrefix string
+	cacheTTLSeconds int64 // Cache TTL in seconds
 }
 
-func NewStarCheckChecker(redisClient wrapper.RedisClient, redisStarPrefix string) *StarCheckChecker {
+func NewStarCheckChecker(redisClient wrapper.RedisClient, redisStarPrefix string, cacheTTLSeconds int) *StarCheckChecker {
+	if cacheTTLSeconds <= 0 {
+		cacheTTLSeconds = 60 // Default 60 seconds
+	}
 	return &StarCheckChecker{
 		memoryCache:     make(map[string]bool),
+		cacheExpireTime: make(map[string]int64),
 		redisClient:     redisClient,
 		redisStarPrefix: redisStarPrefix,
+		cacheTTLSeconds: int64(cacheTTLSeconds),
 	}
 }
 
 func (s *StarCheckChecker) CheckStarCheckPermission(employeeNumber string, log wrapper.Log, callback func(bool)) {
-	// First check memory cache
+	now := time.Now().Unix()
+
+	// Check if cache exists and is not expired
 	s.mu.RLock()
-	if enabled, exists := s.memoryCache[employeeNumber]; exists {
-		s.mu.RUnlock()
-		log.Debugf("Star check permission found in cache for employee %s: %t", employeeNumber, enabled)
-		callback(enabled)
-		return
-	}
+	cachedValue, hasCache := s.memoryCache[employeeNumber]
+	expireTime, hasExpireTime := s.cacheExpireTime[employeeNumber]
 	s.mu.RUnlock()
 
-	// Cache miss, get from Redis
+	// If cache exists and not expired, use it
+	if hasCache && hasExpireTime && now < expireTime {
+		log.Debugf("Star check permission found in valid cache for employee %s: %t (expires in %d seconds)",
+			employeeNumber, cachedValue, expireTime-now)
+		callback(cachedValue)
+		return
+	}
+
+	// Cache expired or missing, get from Redis
+	log.Debugf("Star check cache expired or missing for employee %s, fetching from Redis", employeeNumber)
 	s.getFromRedis(employeeNumber, func(enabled bool) {
+		// Update cache with new expiration time
+		newExpireTime := now + s.cacheTTLSeconds
+		s.updateMemoryCacheWithTTL(employeeNumber, enabled, newExpireTime)
 		callback(enabled)
 	})
+}
+
+func (s *StarCheckChecker) updateMemoryCacheWithTTL(employeeNumber string, enabled bool, expireTime int64) {
+	s.mu.Lock()
+	s.memoryCache[employeeNumber] = enabled
+	s.cacheExpireTime[employeeNumber] = expireTime
+	s.mu.Unlock()
 }
 
 func (s *StarCheckChecker) getFromRedis(employeeNumber string, callback func(bool)) {
@@ -436,21 +483,21 @@ func (s *StarCheckChecker) getFromRedis(employeeNumber string, callback func(boo
 			}
 		}
 
-		// Update memory cache
-		s.updateMemoryCache(employeeNumber, enabled)
 		callback(enabled)
 	})
 }
 
-func (s *StarCheckChecker) updateMemoryCache(employeeNumber string, enabled bool) {
+// deleteMemoryCache removes the cache entry for a specific employee
+func (s *StarCheckChecker) deleteMemoryCache(employeeNumber string) {
 	s.mu.Lock()
-	s.memoryCache[employeeNumber] = enabled
+	delete(s.memoryCache, employeeNumber)
+	delete(s.cacheExpireTime, employeeNumber)
 	s.mu.Unlock()
 }
 
 func (s *StarCheckChecker) SetStarCheckPermission(employeeNumber string, enabled bool, callback func(error)) {
-	// Update memory cache first
-	s.updateMemoryCache(employeeNumber, enabled)
+	// Clear memory cache first to force Redis reads on all instances
+	s.deleteMemoryCache(employeeNumber)
 
 	// Save to Redis
 	redisKey := s.redisStarPrefix + employeeNumber
@@ -472,35 +519,59 @@ func (s *StarCheckChecker) SetStarCheckPermission(employeeNumber string, enabled
 
 // QuotaChecker manages user-level quota control permissions
 type QuotaChecker struct {
-	memoryCache      map[string]bool // employee_number -> quota_enabled
+	memoryCache      map[string]bool  // employee_number -> quota_enabled
+	cacheExpireTime  map[string]int64 // employee_number -> expire_timestamp
 	mu               sync.RWMutex
 	redisClient      wrapper.RedisClient
 	redisQuotaPrefix string
+	cacheTTLSeconds  int64 // Cache TTL in seconds
 }
 
-func NewQuotaChecker(redisClient wrapper.RedisClient, redisQuotaPrefix string) *QuotaChecker {
+func NewQuotaChecker(redisClient wrapper.RedisClient, redisQuotaPrefix string, cacheTTLSeconds int) *QuotaChecker {
+	if cacheTTLSeconds <= 0 {
+		cacheTTLSeconds = 60 // Default 60 seconds
+	}
 	return &QuotaChecker{
 		memoryCache:      make(map[string]bool),
+		cacheExpireTime:  make(map[string]int64),
 		redisClient:      redisClient,
 		redisQuotaPrefix: redisQuotaPrefix,
+		cacheTTLSeconds:  int64(cacheTTLSeconds),
 	}
 }
 
 func (q *QuotaChecker) CheckQuotaPermission(employeeNumber string, log wrapper.Log, callback func(bool)) {
-	// First check memory cache
+	now := time.Now().Unix()
+
+	// Check if cache exists and is not expired
 	q.mu.RLock()
-	if enabled, exists := q.memoryCache[employeeNumber]; exists {
-		q.mu.RUnlock()
-		log.Debugf("Quota control permission found in cache for employee %s: %t", employeeNumber, enabled)
-		callback(enabled)
-		return
-	}
+	cachedValue, hasCache := q.memoryCache[employeeNumber]
+	expireTime, hasExpireTime := q.cacheExpireTime[employeeNumber]
 	q.mu.RUnlock()
 
-	// Cache miss, get from Redis
+	// If cache exists and not expired, use it
+	if hasCache && hasExpireTime && now < expireTime {
+		log.Debugf("Quota control permission found in valid cache for employee %s: %t (expires in %d seconds)",
+			employeeNumber, cachedValue, expireTime-now)
+		callback(cachedValue)
+		return
+	}
+
+	// Cache expired or missing, get from Redis
+	log.Debugf("Cache expired or missing for employee %s, fetching from Redis", employeeNumber)
 	q.getFromRedis(employeeNumber, func(enabled bool) {
+		// Update cache with new expiration time
+		newExpireTime := now + q.cacheTTLSeconds
+		q.updateMemoryCacheWithTTL(employeeNumber, enabled, newExpireTime)
 		callback(enabled)
 	})
+}
+
+func (q *QuotaChecker) updateMemoryCacheWithTTL(employeeNumber string, enabled bool, expireTime int64) {
+	q.mu.Lock()
+	q.memoryCache[employeeNumber] = enabled
+	q.cacheExpireTime[employeeNumber] = expireTime
+	q.mu.Unlock()
 }
 
 func (q *QuotaChecker) getFromRedis(employeeNumber string, callback func(bool)) {
@@ -516,21 +587,21 @@ func (q *QuotaChecker) getFromRedis(employeeNumber string, callback func(bool)) 
 			}
 		}
 
-		// Update memory cache
-		q.updateMemoryCache(employeeNumber, enabled)
 		callback(enabled)
 	})
 }
 
-func (q *QuotaChecker) updateMemoryCache(employeeNumber string, enabled bool) {
+// deleteMemoryCache removes the cache entry for a specific employee
+func (q *QuotaChecker) deleteMemoryCache(employeeNumber string) {
 	q.mu.Lock()
-	q.memoryCache[employeeNumber] = enabled
+	delete(q.memoryCache, employeeNumber)
+	delete(q.cacheExpireTime, employeeNumber)
 	q.mu.Unlock()
 }
 
 func (q *QuotaChecker) SetQuotaPermission(employeeNumber string, enabled bool, callback func(error)) {
-	// Update memory cache first
-	q.updateMemoryCache(employeeNumber, enabled)
+	// Clear memory cache first to force Redis reads on all instances
+	q.deleteMemoryCache(employeeNumber)
 
 	// Save to Redis
 	redisKey := q.redisQuotaPrefix + employeeNumber
@@ -640,6 +711,12 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		})
 	}
 
+	// Parse cache TTL seconds
+	config.QuotaManagement.CacheTTLSeconds = int(quotaManagement.Get("cache_ttl_seconds").Int())
+	if config.QuotaManagement.CacheTTLSeconds <= 0 {
+		config.QuotaManagement.CacheTTLSeconds = 60 // Default 60 seconds
+	}
+
 	// Parse star check management configuration
 	starCheckManagement := json.Get("star_check_management")
 	config.StarCheckManagement.Enabled = starCheckManagement.Get("enabled").Bool()
@@ -734,6 +811,7 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		config.RestrictedModels,
 		config.redisClient,
 		config.PermissionManagement.RedisPermissionPrefix,
+		config.QuotaManagement.CacheTTLSeconds,
 	)
 	log.Debugf("[parseConfig] Permission checker initialized successfully: %t", config.permissionChecker != nil)
 
@@ -743,6 +821,7 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		config.starCheckChecker = NewStarCheckChecker(
 			config.redisClient,
 			config.StarCheckManagement.RedisStargazerPrefix,
+			config.QuotaManagement.CacheTTLSeconds,
 		)
 		log.Debugf("[parseConfig] Star check permission checker initialized successfully: %t", config.starCheckChecker != nil)
 	}
@@ -753,6 +832,7 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		config.quotaChecker = NewQuotaChecker(
 			config.redisClient,
 			config.QuotaManagement.RedisQuotaPrefix,
+			config.QuotaManagement.CacheTTLSeconds,
 		)
 		log.Debugf("[parseConfig] Quota permission checker initialized successfully: %t", config.quotaChecker != nil)
 	}
@@ -872,7 +952,6 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 	if path.Path == "/ai-gateway/api/v1/models" {
 		log.Debugf("[onHttpRequestHeaders] handling /ai-gateway/api/v1/models request locally")
 		log.Debugf("[onHttpRequestHeaders] Restricted models config: %v", config.RestrictedModels)
-		log.Debugf("[onHttpRequestHeaders] PermissionChecker available: %t", config.permissionChecker != nil)
 		context.DontReadRequestBody()
 
 		// Get user's allowed models if token exists
@@ -883,8 +962,6 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		if err == nil && tokenHeader != "" {
 			// Extract token
 			token := extractTokenFromHeader(tokenHeader)
-			log.Debugf("[onHttpRequestHeaders] Extracted token length: %d", len(token))
-
 			if token != "" {
 				// Parse token to get employee number
 				userInfo, err := parseUserInfoFromToken(token)
@@ -897,7 +974,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 					if config.permissionChecker != nil {
 						config.permissionChecker.getUserAllowedModels(userInfo.EmployeeNumber, func(models []string) {
 							allowedModels = models
-							log.Debugf("[onHttpRequestHeaders] user %s has allowed models: %v", userInfo.EmployeeNumber, allowedModels)
+							log.Debugf("[onHttpRequestHeaders] user %s has allowed models: %v", userInfo.ID, allowedModels)
 
 							// Generate filtered models response with user permissions
 							responseBody, err := config.BuildFilteredModelsResponse(allowedModels, log)
@@ -1021,12 +1098,12 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		return types.ActionContinue
 	}
 
-	// For star check, use employee number; for quota operations, maintain compatibility using universal_id as fallback
+	// For star check, use universal_id; for quota operations, maintain compatibility using universal_id as fallback
 	employeeNumber := userInfo.EmployeeNumber
-	if employeeNumber == "" {
-		employeeNumber = userInfo.ID // fallback to universal_id for backward compatibility
-	}
-	context.SetContext("userId", employeeNumber)
+	userId := userInfo.ID
+
+	context.SetContext("userId", userId)
+	context.SetContext("employeeNumber", employeeNumber)
 
 	// Buffer request body to extract model info
 	// Note: ai-proxy plugin (priority 100) may have already buffered the request body
@@ -1108,10 +1185,16 @@ func handleCompletionQuota(ctx wrapper.HttpContext, config QuotaConfig, body []b
 
 		// Check if user-level control is enabled
 		if config.StarCheckManagement.UserLevelEnabled {
+			employeeNumber, ok := ctx.GetContext("employeeNumber").(string)
+			if !ok {
+				sendJSONResponse(http.StatusUnauthorized, "ai-gateway.no_userid", "Request denied by ai quota check. No user ID found.", false, nil)
+				return types.ActionContinue
+			}
+
 			log.Debugf("User-level star check control is enabled, checking user permission for user: %s", userId)
 
 			if config.starCheckChecker != nil {
-				config.starCheckChecker.CheckStarCheckPermission(userId, log, func(userStarCheckEnabled bool) {
+				config.starCheckChecker.CheckStarCheckPermission(employeeNumber, log, func(userStarCheckEnabled bool) {
 					if !userStarCheckEnabled {
 						log.Debugf("User %s has star check disabled at user level, proceeding with quota check", userId)
 						// User has star check disabled, skip star check and proceed with quota logic
@@ -1161,44 +1244,28 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 		// Check if the model is in restricted list
 		isRestricted := config.permissionChecker.isRestrictedModel(modelName, log)
 		if isRestricted {
-			// Get employee number from token
-			tokenHeader, err := proxywasm.GetHttpRequestHeader(config.TokenHeader)
-			log.Debugf("[processQuotaLogic] Token header retrieval result - err: %v, header present: %t", err, tokenHeader != "")
-
-			if err != nil || tokenHeader == "" {
-				log.Warnf("[processQuotaLogic] No token found for restricted model %s - BLOCKING REQUEST", modelName)
-				sendJSONResponse(http.StatusUnauthorized, "ai-quota.no_token_restricted_model",
-					fmt.Sprintf("Token required to access restricted model %s", modelName), false, nil)
-				return types.ActionContinue
-			}
-
-			token := extractTokenFromHeader(tokenHeader)
-			if token == "" {
-				log.Warnf("[processQuotaLogic] Empty token for restricted model %s - BLOCKING REQUEST", modelName)
-				sendJSONResponse(http.StatusUnauthorized, "ai-quota.invalid_token_restricted_model",
-					fmt.Sprintf("Valid token required to access restricted model %s", modelName), false, nil)
-				return types.ActionContinue
-			}
-
-			userInfo, err := parseUserInfoFromToken(token)
-			if err != nil || userInfo.EmployeeNumber == "" {
-				log.Warnf("[processQuotaLogic] Failed to parse employee number from token for restricted model %s - BLOCKING REQUEST", modelName)
-				sendJSONResponse(http.StatusUnauthorized, "ai-quota.invalid_employee_number",
+			// Get employee number from context (more efficient than re-parsing token)
+			employeeNumber, ok := ctx.GetContext("employeeNumber").(string)
+			if !ok || employeeNumber == "" {
+				log.Warnf("[processQuotaLogic] Employee number not found in context for restricted model %s - BLOCKING REQUEST", modelName)
+				sendJSONResponse(http.StatusUnauthorized, "ai-quota.no_employee_number",
 					fmt.Sprintf("Valid employee information required to access restricted model %s", modelName), false, nil)
 				return types.ActionContinue
 			}
 
+			log.Debugf("[processQuotaLogic] Employee number retrieved from context: %s", employeeNumber)
+
 			// Check if user has permission to use this model
-			config.permissionChecker.CheckModelPermission(userInfo.EmployeeNumber, modelName, log, func(hasPermission bool) {
+			config.permissionChecker.CheckModelPermission(employeeNumber, modelName, log, func(hasPermission bool) {
 				if !hasPermission {
-					log.Warnf("[processQuotaLogic] User %s does not have permission to use restricted model %s - BLOCKING REQUEST", userInfo.EmployeeNumber, modelName)
+					log.Warnf("[processQuotaLogic] User %s does not have permission to use restricted model %s - BLOCKING REQUEST", userId, modelName)
 					sendJSONResponse(http.StatusForbidden, "ai-quota.model_permission_denied",
 						fmt.Sprintf("You don't have permission to use model %s", modelName), false, nil)
 					return
 				}
 
 				// Permission check passed, continue with quota logic
-				log.Debugf("[processQuotaLogic] Permission check passed for user %s and model %s", userInfo.EmployeeNumber, modelName)
+				log.Debugf("[processQuotaLogic] Permission check passed for user %s and model %s", userId, modelName)
 				continueWithQuotaLogic(ctx, config, body, userId, modelName, log)
 			})
 			return types.ActionPause // Wait for async permission check
@@ -1928,7 +1995,7 @@ func performStarCheck(ctx wrapper.HttpContext, config QuotaConfig, body []byte, 
 			processQuotaLogic(ctx, config, body, userId, log)
 		} else {
 			log.Debugf("User %s has not starred the target project (cached)", userId)
-			sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", config.StarCheckManagement.TargetRepo), false, nil)
+			sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", strings.ReplaceAll(config.StarCheckManagement.TargetRepo, ".", "/")), false, nil)
 		}
 		return
 	}
@@ -1973,7 +2040,7 @@ func performStarCheck(ctx wrapper.HttpContext, config QuotaConfig, body []byte, 
 			// Star check passed, continue with quota logic
 			processQuotaLogic(ctx, config, body, userId, log)
 		} else {
-			sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", config.StarCheckManagement.TargetRepo), false, nil)
+			sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", strings.ReplaceAll(config.StarCheckManagement.TargetRepo, ".", "/")), false, nil)
 		}
 	})
 }
@@ -2074,10 +2141,18 @@ func continueWithQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []
 
 	// Check if user-level quota control is enabled
 	if config.QuotaManagement.UserLevelEnabled {
+		// Get employeeNumber from context for quota permission check
+		employeeNumber, ok := ctx.GetContext("employeeNumber").(string)
+		if !ok {
+			log.Warnf("Employee number not found in context, falling back to global quota check for user: %s", userId)
+			doQuotaCheck(ctx, config, userId, quotaWeight, modelName, log)
+			return
+		}
+
 		log.Debugf("User-level quota control is enabled, checking user permission for user: %s", userId)
 
 		if config.quotaChecker != nil {
-			config.quotaChecker.CheckQuotaPermission(userId, log, func(userQuotaEnabled bool) {
+			config.quotaChecker.CheckQuotaPermission(employeeNumber, log, func(userQuotaEnabled bool) {
 				if !userQuotaEnabled {
 					log.Debugf("User %s has quota control disabled at user level, skipping quota check", userId)
 					// User has quota control disabled, skip quota check and allow request

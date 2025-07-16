@@ -26,7 +26,7 @@ description: AI 配额管理插件配置参考
 - **模型列表展示**：支持通过 `/ai-gateway/api/v1/models` 端点展示可配置provider的可用模型列表
 - **模型权限管理**（新增）：支持基于用户身份的细粒度模型访问控制
 - **受限模型配置**：可配置需要特殊权限的模型列表
-- **内存权限缓存**：高性能的权限验证，支持内存缓存
+- **智能权限缓存**：高性能的权限验证，支持可配置TTL的内存缓存，确保权限变更及时生效
 - **权限管理接口**：提供权限设置和查询的管理接口
 
 ## 工作原理
@@ -40,6 +40,13 @@ description: AI 配额管理插件配置参考
 - `{redis_key_prefix}{user_id}` - 存储用户的配额总数
 - `{redis_used_prefix}{user_id}` - 存储用户的已使用量
 - `{redis_star_prefix}{employee_number}` - 存储用户的GitHub关注项目列表（当启用star_check_management时）
+
+### 缓存机制
+插件采用带TTL的内存缓存机制来优化性能和确保数据一致性：
+- **缓存读取**：首次读取权限时从Redis获取并缓存到内存中，后续请求直接使用内存缓存
+- **TTL控制**：通过 `cache_ttl_seconds` 配置缓存过期时间，默认60秒
+- **缓存失效**：权限设置后立即清除相关缓存，确保下次访问获取最新数据
+- **一致性保证**：最坏情况下权限变更会在TTL时间内生效，平衡了性能和一致性需求
 
 ### 配额扣减机制
 插件从请求体中提取模型名称，根据 `model_quota_weights` 配置确定扣减额度：
@@ -75,6 +82,7 @@ description: AI 配额管理插件配置参考
 | `admin_quota_path`     | string    | 选填 | /check-quota           | 配额权限管理接口路径前缀         |
 | `redis_quota_prefix`   | string    | 选填 | quota_check:           | 配额权限的redis key前缀         |
 | `model_quota_weights`  | object    | 选填 | {}                     | 模型配额权重配置，指定每个模型的扣减额度 |
+| `cache_ttl_seconds`    | integer   | 选填 | 60                     | 权限缓存过期时间（秒），用于控制缓存一致性 |
 
 `redis`中每一项的配置字段说明
 
@@ -115,6 +123,7 @@ quota_management:
     'gpt-4': 2
     'gpt-4-turbo': 3
     'gpt-4o': 4
+  cache_ttl_seconds: 60
 star_check_management:
   enabled: false
   user_level_enabled: false
@@ -163,6 +172,7 @@ quota_management:
     'deepseek-r1': 3
     'gpt-4': 10
     'gpt-3.5-turbo': 2
+  cache_ttl_seconds: 30
 star_check_management:
   enabled: true
   user_level_enabled: true
