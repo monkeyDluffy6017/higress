@@ -193,15 +193,15 @@ func (c *ProviderConfig) BuildModelsResponse() ([]byte, error) {
 }
 
 type QuotaManagementConfig struct {
-	UserLevelEnabled  bool           `yaml:"user_level_enabled"`
-	DeductHeader      string         `yaml:"deduct_header"`
-	DeductHeaderValue string         `yaml:"deduct_header_value"`
-	RedisKeyPrefix    string         `yaml:"redis_key_prefix"`
-	RedisUsedPrefix   string         `yaml:"redis_used_prefix"`
-	AdminQuotaPath    string         `yaml:"admin_quota_path"`
-	RedisQuotaPrefix  string         `yaml:"redis_quota_prefix"`
-	ModelQuotaWeights map[string]int `yaml:"model_quota_weights"`
-	CacheTTLSeconds   int            `yaml:"cache_ttl_seconds"` // Cache TTL in seconds, default 60s
+	UserLevelEnabled  bool               `yaml:"user_level_enabled"`
+	DeductHeader      string             `yaml:"deduct_header"`
+	DeductHeaderValue string             `yaml:"deduct_header_value"`
+	RedisKeyPrefix    string             `yaml:"redis_key_prefix"`
+	RedisUsedPrefix   string             `yaml:"redis_used_prefix"`
+	AdminQuotaPath    string             `yaml:"admin_quota_path"`
+	RedisQuotaPrefix  string             `yaml:"redis_quota_prefix"`
+	ModelQuotaWeights map[string]float64 `yaml:"model_quota_weights"`
+	CacheTTLSeconds   int                `yaml:"cache_ttl_seconds"` // Cache TTL in seconds, default 60s
 }
 
 type QuotaConfig struct {
@@ -702,11 +702,11 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 	}
 
 	// Parse model quota weights
-	config.QuotaManagement.ModelQuotaWeights = make(map[string]int)
+	config.QuotaManagement.ModelQuotaWeights = make(map[string]float64)
 	modelWeights := quotaManagement.Get("model_quota_weights")
 	if modelWeights.Exists() {
 		modelWeights.ForEach(func(key, value gjson.Result) bool {
-			config.QuotaManagement.ModelQuotaWeights[key.String()] = int(value.Int())
+			config.QuotaManagement.ModelQuotaWeights[key.String()] = value.Float()
 			return true
 		})
 	}
@@ -1279,7 +1279,7 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 	return types.ActionPause
 }
 
-func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, quotaWeight int, modelName string, log wrapper.Log) {
+func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, quotaWeight float64, modelName string, log wrapper.Log) {
 	// Check if we need to deduct quota based on header
 	deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.QuotaManagement.DeductHeader)
 	shouldDeduct := err == nil && deductHeaderValue == config.QuotaManagement.DeductHeaderValue
@@ -1309,7 +1309,7 @@ func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, qu
 	}
 }
 
-func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfig, usedKey string, totalResponse resp.Value, userId string, quotaWeight int, modelName string, log wrapper.Log, retryConfig wrapper.RetryConfig) {
+func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfig, usedKey string, totalResponse resp.Value, userId string, quotaWeight float64, modelName string, log wrapper.Log, retryConfig wrapper.RetryConfig) {
 	if wrapper.IsRedisErrorResponse(totalResponse) {
 		redisErr := wrapper.GetRedisErrorFromResponse(totalResponse)
 		log.Errorf("Failed to get total quota for user %s: %v", userId, redisErr)
@@ -1326,11 +1326,11 @@ func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConf
 
 	// Handle the case where total quota key doesn't exist or is empty - default to 0
 	totalQuotaStr := totalResponse.String()
-	totalQuota := 0 // Default value for users without allocated quota
+	var totalQuota float64 = 0 // Default value for users without allocated quota
 
 	if totalQuotaStr != "" {
 		var parseErr error
-		totalQuota, parseErr = strconv.Atoi(totalQuotaStr)
+		totalQuota, parseErr = strconv.ParseFloat(totalQuotaStr, 64)
 		if parseErr != nil {
 			log.Warnf("Invalid total quota format for user %s: %s", userId, totalQuotaStr)
 			totalQuota = 0 // Default to 0 on parse error
@@ -1338,7 +1338,7 @@ func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConf
 
 		// Validate that total quota is non-negative
 		if totalQuota < 0 {
-			log.Warnf("Invalid total quota value for user %s: %d (cannot be negative)", userId, totalQuota)
+			log.Warnf("Invalid total quota value for user %s: %f (cannot be negative)", userId, totalQuota)
 			totalQuota = 0 // Default to 0 on parse error
 		}
 	} else {
@@ -1351,7 +1351,7 @@ func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConf
 	})
 }
 
-func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfig, usedResponse resp.Value, userId string, quotaWeight int, modelName string, totalQuota int, log wrapper.Log) {
+func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfig, usedResponse resp.Value, userId string, quotaWeight float64, modelName string, totalQuota float64, log wrapper.Log) {
 	if wrapper.IsRedisErrorResponse(usedResponse) {
 		redisErr := wrapper.GetRedisErrorFromResponse(usedResponse)
 		log.Errorf("Failed to get used quota for user %s: %v", userId, redisErr)
@@ -1368,11 +1368,11 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 
 	// Handle the case where used quota key doesn't exist or is empty - default to 0
 	usedQuotaStr := usedResponse.String()
-	usedQuota := 0 // Default used quota to 0 if no data in Redis
+	var usedQuota float64 = 0 // Default used quota to 0 if no data in Redis
 
 	if usedQuotaStr != "" {
 		var parseErr error
-		usedQuota, parseErr = strconv.Atoi(usedQuotaStr)
+		usedQuota, parseErr = strconv.ParseFloat(usedQuotaStr, 64)
 		if parseErr != nil {
 			log.Warnf("Invalid used quota format for user %s: %s, defaulting to 0", userId, usedQuotaStr)
 			usedQuota = 0 // Default to 0 on parse error
@@ -1380,14 +1380,14 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 
 		// Validate that used quota is non-negative
 		if usedQuota < 0 {
-			log.Warnf("Invalid used quota value for user %s: %d (cannot be negative)", userId, usedQuota)
+			log.Warnf("Invalid used quota value for user %s: %f (cannot be negative)", userId, usedQuota)
 			usedQuota = 0 // Default to 0 on parse error
 		}
 
 		// Additional sanity check: used quota shouldn't exceed total quota by a large margin
 		// (Allow some tolerance for concurrent operations)
 		if usedQuota > totalQuota+quotaWeight {
-			log.Warnf("Used quota (%d) significantly exceeds total quota (%d) for user %s. This may indicate data inconsistency.",
+			log.Warnf("Used quota (%f) significantly exceeds total quota (%f) for user %s. This may indicate data inconsistency.",
 				usedQuota, totalQuota, userId)
 		}
 	} else {
@@ -1398,24 +1398,40 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 	remainingQuota := totalQuota - usedQuota
 
 	// Log quota status for debugging
-	log.Debugf("Quota status for user %s: total=%d, used=%d, remaining=%d, required=%d",
+	log.Debugf("Quota status for user %s: total=%f, used=%f, remaining=%f, required=%f",
 		userId, totalQuota, usedQuota, remainingQuota, quotaWeight)
 
 	// Check if sufficient quota is available
 	if remainingQuota >= quotaWeight {
-		// Use regular IncrBy for quota deduction
+		// Use Redis native INCRBYFLOAT for atomic quota deduction
 		usedKey := config.QuotaManagement.RedisUsedPrefix + userId
-		config.redisClient.IncrBy(usedKey, quotaWeight, func(incrResponse resp.Value) {
-			handleQuotaDeductionResponse(ctx, incrResponse, userId, quotaWeight, modelName, remainingQuota, log)
+		config.redisClient.IncrByFloat(usedKey, quotaWeight, func(response resp.Value) {
+			handleQuotaDeductionResponse(ctx, response, userId, quotaWeight, modelName, remainingQuota, log)
 		})
 	} else {
-		log.Warnf("Insufficient quota for user %s: remaining=%d, required=%d", userId, remainingQuota, quotaWeight)
+		log.Warnf("Insufficient quota for user %s: remaining=%f, required=%f", userId, remainingQuota, quotaWeight)
 		sendJSONResponse(http.StatusForbidden, "quota-check.insufficient_quota",
-			fmt.Sprintf("Insufficient quota. Required: %d, Available: %d", quotaWeight, remainingQuota), false, nil)
+			fmt.Sprintf("Insufficient quota. Required: %f, Available: %f", quotaWeight, remainingQuota), false, nil)
 	}
 }
 
-func handleQuotaDeductionResponse(ctx wrapper.HttpContext, incrResponse resp.Value, userId string, quotaWeight int, modelName string, remainingQuota int, log wrapper.Log) {
+// incrementFloatValue is now deprecated - use handleQuotaDeductionResponse with redisClient.IncrByFloat directly
+// This function is kept only for compatibility with admin operations (deltaQuota, deltaUsedQuota)
+func incrementFloatValue(redisClient wrapper.RedisClient, key string, delta float64, callback func(float64, error)) {
+	redisClient.IncrByFloat(key, delta, func(response resp.Value) {
+		// Handle Redis errors
+		if err := response.Error(); err != nil {
+			callback(0, fmt.Errorf("redis incrbyfloat error: %w", err))
+			return
+		}
+
+		// Parse the new value returned by INCRBYFLOAT
+		newValue := response.Float()
+		callback(newValue, nil)
+	})
+}
+
+func handleQuotaDeductionResponse(ctx wrapper.HttpContext, incrResponse resp.Value, userId string, quotaWeight float64, modelName string, remainingQuota float64, log wrapper.Log) {
 	if wrapper.IsRedisErrorResponse(incrResponse) {
 		redisErr := wrapper.GetRedisErrorFromResponse(incrResponse)
 		log.Errorf("Failed to deduct quota for user %s: %v", userId, redisErr)
@@ -1424,28 +1440,28 @@ func handleQuotaDeductionResponse(ctx wrapper.HttpContext, incrResponse resp.Val
 		return
 	}
 
-	// Validate the response from Redis IncrBy operation
-	newUsedQuota := incrResponse.Integer()
+	// Validate the response from Redis operation
+	newUsedQuotaFloat := incrResponse.Float()
 
 	// Sanity check: the new used quota should be reasonable
-	if newUsedQuota < quotaWeight {
-		log.Errorf("Unexpected used quota after deduction for user %s: got %d, expected at least %d",
-			userId, newUsedQuota, quotaWeight)
+	if newUsedQuotaFloat < quotaWeight {
+		log.Errorf("Unexpected used quota after deduction for user %s: got %f, expected at least %f",
+			userId, newUsedQuotaFloat, quotaWeight)
 		sendJSONResponse(http.StatusInternalServerError, "quota-check.deduction_inconsistent",
 			"Quota deduction resulted in inconsistent state", false, nil)
 		return
 	}
 
 	// Calculate what the previous used quota should have been
-	expectedPreviousUsed := newUsedQuota - quotaWeight
+	expectedPreviousUsed := newUsedQuotaFloat - quotaWeight
 
 	// Log quota deduction details for audit and debugging
-	log.Infof("Successfully deducted %d quota for user %s, model %s. Previous used: %d, New used: %d",
-		quotaWeight, userId, modelName, expectedPreviousUsed, newUsedQuota)
+	log.Infof("Successfully deducted %f quota for user %s, model %s. Previous used: %f, New used: %f",
+		quotaWeight, userId, modelName, expectedPreviousUsed, newUsedQuotaFloat)
 
 	// Additional debug information
-	log.Debugf("Quota deduction details for user %s: deducted=%d, new_used=%d, expected_previous=%d",
-		userId, quotaWeight, newUsedQuota, expectedPreviousUsed)
+	log.Debugf("Quota deduction details for user %s: deducted=%f, new_used=%f, expected_previous=%f",
+		userId, quotaWeight, newUsedQuotaFloat, expectedPreviousUsed)
 
 	proxywasm.ResumeHttpRequest()
 }
@@ -1527,13 +1543,13 @@ func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log 
 		values[k] = v[0]
 	}
 	userId := values["user_id"]
-	quota, err := strconv.Atoi(values["quota"])
+	quota, err := strconv.ParseFloat(values["quota"], 64)
 	if userId == "" || err != nil {
-		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and quota must be integer.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and quota must be a valid number.", false, nil)
 		return types.ActionContinue
 	}
-	err2 := config.redisClient.Set(config.QuotaManagement.RedisKeyPrefix+userId, quota, func(response resp.Value) {
-		log.Debugf("Redis set key = %s quota = %d", config.QuotaManagement.RedisKeyPrefix+userId, quota)
+	err2 := config.redisClient.Set(config.QuotaManagement.RedisKeyPrefix+userId, fmt.Sprintf("%.6f", quota), func(response resp.Value) {
+		log.Debugf("Redis set key = %s quota = %f", config.QuotaManagement.RedisKeyPrefix+userId, quota)
 		if err := response.Error(); err != nil {
 			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
@@ -1639,14 +1655,14 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 			}
 			sendJSONResponse(http.StatusOK, "ai-gateway.querystar", "query star projects successful", true, data)
 		} else {
-			// Handle quota query (integer value)
-			quota := 0
+			// Handle quota query (float value)
+			var quota float64 = 0
 			if !response.IsNull() {
-				// Validate that the response can be converted to integer
+				// Validate that the response can be converted to float
 				quotaStr := response.String()
 				if quotaStr != "" {
 					var parseErr error
-					quota, parseErr = strconv.Atoi(quotaStr)
+					quota, parseErr = strconv.ParseFloat(quotaStr, 64)
 					if parseErr != nil {
 						log.Errorf("Invalid %s format for user %s: %s", responseType, employeeNumber, quotaStr)
 						sendJSONResponse(http.StatusInternalServerError, "ai-gateway.invalid_quota_format",
@@ -1656,7 +1672,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 
 					// Validate that quota is non-negative
 					if quota < 0 {
-						log.Errorf("Invalid %s value for user %s: %d (cannot be negative)", responseType, employeeNumber, quota)
+						log.Errorf("Invalid %s value for user %s: %f (cannot be negative)", responseType, employeeNumber, quota)
 						sendJSONResponse(http.StatusInternalServerError, "ai-gateway.invalid_quota_value",
 							fmt.Sprintf("Invalid %s value", responseType), false, nil)
 						return
@@ -1688,39 +1704,22 @@ func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wr
 		values[k] = v[0]
 	}
 	userId := values["user_id"]
-	value, err := strconv.Atoi(values["value"])
+	value, err := strconv.ParseFloat(values["value"], 64)
 	if userId == "" || err != nil {
-		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and value must be integer.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and value must be a valid number.", false, nil)
 		return types.ActionContinue
 	}
 
-	if value >= 0 {
-		err := config.redisClient.IncrBy(config.QuotaManagement.RedisKeyPrefix+userId, value, func(response resp.Value) {
-			log.Debugf("Redis Incr key = %s value = %d", config.QuotaManagement.RedisKeyPrefix+userId, value)
-			if err := response.Error(); err != nil {
-				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
-				return
-			}
-			sendJSONResponse(http.StatusOK, "ai-gateway.deltaquota", "delta quota successful", true, nil)
-		})
+	key := config.QuotaManagement.RedisKeyPrefix + userId
+	incrementFloatValue(config.redisClient, key, value, func(newValue float64, err error) {
 		if err != nil {
+			log.Errorf("Redis delta operation failed for key = %s value = %f: %v", key, value, err)
 			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
-			return types.ActionContinue
+			return
 		}
-	} else {
-		err := config.redisClient.DecrBy(config.QuotaManagement.RedisKeyPrefix+userId, 0-value, func(response resp.Value) {
-			log.Debugf("Redis Decr key = %s value = %d", config.QuotaManagement.RedisKeyPrefix+userId, 0-value)
-			if err := response.Error(); err != nil {
-				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
-				return
-			}
-			sendJSONResponse(http.StatusOK, "ai-gateway.deltaquota", "delta quota successful", true, nil)
-		})
-		if err != nil {
-			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
-			return types.ActionContinue
-		}
-	}
+		log.Debugf("Redis delta operation successful for key = %s value = %f, new value = %f", key, value, newValue)
+		sendJSONResponse(http.StatusOK, "ai-gateway.deltaquota", "delta quota successful", true, nil)
+	})
 
 	return types.ActionPause
 }
@@ -1732,13 +1731,13 @@ func refreshUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, 
 		values[k] = v[0]
 	}
 	userId := values["user_id"]
-	quota, err := strconv.Atoi(values["quota"])
+	quota, err := strconv.ParseFloat(values["quota"], 64)
 	if userId == "" || err != nil {
-		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and quota must be integer.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and quota must be a valid number.", false, nil)
 		return types.ActionContinue
 	}
-	err2 := config.redisClient.Set(config.QuotaManagement.RedisUsedPrefix+userId, quota, func(response resp.Value) {
-		log.Debugf("Redis set key = %s quota = %d", config.QuotaManagement.RedisUsedPrefix+userId, quota)
+	err2 := config.redisClient.Set(config.QuotaManagement.RedisUsedPrefix+userId, fmt.Sprintf("%.6f", quota), func(response resp.Value) {
+		log.Debugf("Redis set key = %s quota = %f", config.QuotaManagement.RedisUsedPrefix+userId, quota)
 		if err := response.Error(); err != nil {
 			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
@@ -1761,39 +1760,22 @@ func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, lo
 		values[k] = v[0]
 	}
 	userId := values["user_id"]
-	value, err := strconv.Atoi(values["value"])
+	value, err := strconv.ParseFloat(values["value"], 64)
 	if userId == "" || err != nil {
-		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and value must be integer.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. user_id can't be empty and value must be a valid number.", false, nil)
 		return types.ActionContinue
 	}
 
-	if value >= 0 {
-		err := config.redisClient.IncrBy(config.QuotaManagement.RedisUsedPrefix+userId, value, func(response resp.Value) {
-			log.Debugf("Redis Incr key = %s value = %d", config.QuotaManagement.RedisUsedPrefix+userId, value)
-			if err := response.Error(); err != nil {
-				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
-				return
-			}
-			sendJSONResponse(http.StatusOK, "ai-gateway.deltausedquota", "delta used quota successful", true, nil)
-		})
+	key := config.QuotaManagement.RedisUsedPrefix + userId
+	incrementFloatValue(config.redisClient, key, value, func(newValue float64, err error) {
 		if err != nil {
+			log.Errorf("Redis delta used operation failed for key = %s value = %f: %v", key, value, err)
 			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
-			return types.ActionContinue
+			return
 		}
-	} else {
-		err := config.redisClient.DecrBy(config.QuotaManagement.RedisUsedPrefix+userId, 0-value, func(response resp.Value) {
-			log.Debugf("Redis Decr key = %s value = %d", config.QuotaManagement.RedisUsedPrefix+userId, 0-value)
-			if err := response.Error(); err != nil {
-				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
-				return
-			}
-			sendJSONResponse(http.StatusOK, "ai-gateway.deltausedquota", "delta used quota successful", true, nil)
-		})
-		if err != nil {
-			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
-			return types.ActionContinue
-		}
-	}
+		log.Debugf("Redis delta used operation successful for key = %s value = %f, new value = %f", key, value, newValue)
+		sendJSONResponse(http.StatusOK, "ai-gateway.deltausedquota", "delta used quota successful", true, nil)
+	})
 
 	return types.ActionPause
 }
@@ -2125,12 +2107,12 @@ func queryQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.
 
 func continueWithQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte, userId string, modelName string, log wrapper.Log) {
 	// Get quota weight for this model, default to 0 if not configured
-	quotaWeight := 0
+	var quotaWeight float64 = 0
 	if weight, exists := config.QuotaManagement.ModelQuotaWeights[modelName]; exists {
 		quotaWeight = weight
 	}
 
-	log.Debugf("Model %s quota weight: %d", modelName, quotaWeight)
+	log.Debugf("Model %s quota weight: %f", modelName, quotaWeight)
 
 	// If quota weight is 0, no deduction needed, allow request to continue
 	if quotaWeight == 0 {

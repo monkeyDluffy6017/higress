@@ -118,6 +118,7 @@ type RedisClient interface {
 	Incr(key string, callback RedisResponseCallback) error
 	Decr(key string, callback RedisResponseCallback) error
 	IncrBy(key string, delta int, callback RedisResponseCallback) error
+	IncrByFloat(key string, delta float64, callback RedisResponseCallback) error
 	DecrBy(key string, delta int, callback RedisResponseCallback) error
 
 	// Optimized batch operations for quota management
@@ -609,6 +610,17 @@ func (c *RedisClusterClient[C]) IncrBy(key string, delta int, callback RedisResp
 	return RedisCallWithRetry(c.cluster, respString(args), callback, "INCRBY", key, DefaultRetryConfig)
 }
 
+func (c *RedisClusterClient[C]) IncrByFloat(key string, delta float64, callback RedisResponseCallback) error {
+	if err := c.checkReadyFunc(); err != nil {
+		return err
+	}
+	args := make([]interface{}, 0)
+	args = append(args, "incrbyfloat")
+	args = append(args, key)
+	args = append(args, delta)
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "INCRBYFLOAT", key, DefaultRetryConfig)
+}
+
 // IncrByWithRetry provides enhanced INCRBY with retry support
 func (c *RedisClusterClient[C]) IncrByWithRetry(key string, delta int, callback RedisResponseCallback, config RetryConfig) error {
 	if err := c.checkReadyFunc(); err != nil {
@@ -616,6 +628,15 @@ func (c *RedisClusterClient[C]) IncrByWithRetry(key string, delta int, callback 
 	}
 	args := []interface{}{"incrby", key, delta}
 	return RedisCallWithRetry(c.cluster, respString(args), callback, "INCRBY", key, config)
+}
+
+// IncrByFloatWithRetry provides enhanced INCRBYFLOAT with retry support
+func (c *RedisClusterClient[C]) IncrByFloatWithRetry(key string, delta float64, callback RedisResponseCallback, config RetryConfig) error {
+	if err := c.checkReadyFunc(); err != nil {
+		return err
+	}
+	args := []interface{}{"incrbyfloat", key, delta}
+	return RedisCallWithRetry(c.cluster, respString(args), callback, "INCRBYFLOAT", key, config)
 }
 
 func (c *RedisClusterClient[C]) DecrBy(key string, delta int, callback RedisResponseCallback) error {
