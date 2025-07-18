@@ -226,41 +226,6 @@ redis:
 - `gpt-4o` 每次调用扣减 4 个配额
 - 未配置的模型（如 `claude-3`）扣减 0 个配额（不限制）
 
-## 使用示例
-
-以下是请求不同模型时的配额扣减行为：
-
-```bash
-# 请求 gpt-3.5-turbo 模型，扣减 1 个配额
-curl -X POST https://example.com/v1/chat/completions \
-  -H "Authorization: Bearer <jwt-token>" \
-  -H "x-quota-identity: user" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-3.5-turbo",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-
-# 请求 gpt-4 模型，扣减 2 个配额
-curl -X POST https://example.com/v1/chat/completions \
-  -H "Authorization: Bearer <jwt-token>" \
-  -H "x-quota-identity: user" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-
-# 请求未配置的模型，不扣减配额
-curl -X POST https://example.com/v1/chat/completions \
-  -H "Authorization: Bearer <jwt-token>" \
-  -H "x-quota-identity: user" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-3",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-```
 
 ## JWT Token 格式
 
@@ -283,82 +248,74 @@ curl -X POST https://example.com/v1/chat/completions \
 
 提取的员工号将用于权限验证。
 
-## 权限管理API（新增）
 
-### 设置用户权限
+## API接口
+
+### 用户配额检查
+#### 完整的API端点列表
+
+| 路径                                  | 方法   | 用途说明                  |
+|---------------------------------------|--------|--------------------------|
+| `/model-permission/set`               | POST   | 设置用户模型权限          |
+| `/model-permission/query`             | GET    | 查询用户模型权限          |
+| `/check-star/set`                     | POST   | 设置用户star检查权限      |
+| `/check-star`                         | GET    | 查询用户star检查权限      |
+| `/check-quota/set`                    | POST   | 设置用户配额控制权限      |
+| `/check-quota`                        | GET    | 查询用户配额控制权限      |
+| `/quota`                              | GET    | 查询配额总数              |
+| `/quota/refresh`                      | POST   | 刷新配额总数              |
+| `/quota/delta`                        | POST   | 增减配额总数              |
+| `/quota/used`                         | GET    | 查询已使用量              |
+| `/quota/used/refresh`                 | POST   | 刷新已使用量              |
+| `/quota/used/delta`                   | POST   | 增减已使用量              |
+| `/quota/star`                         | GET    | 查询GitHub关注状态        |
+| `/quota/star/projects/set`            | POST   | 设置用户关注项目列表      |
+
+#### 接口请求/响应示例
+
+##### 设置模型权限
 ```bash
 curl -X POST "https://example.com/model-permission/set" \
   -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
   -d "employee_number=85054712&models=[\"gpt-4\",\"claude-3-opus\"]"
 ```
 
-### 查询用户权限
+响应：
+```json
+{
+  "code": "ai-quota.set_model_permission",
+  "message": "set model permission successful",
+  "success": true
+}
+```
+
+##### 查询模型权限
 ```bash
 curl -X GET "https://example.com/model-permission/query?employee_number=85054712" \
   -H "x-admin-key: your-admin-secret"
 ```
 
-### 权限验证工作流程
-
-1. **请求 `/ai-gateway/api/v1/models`**：
-   - 获取所有可用模型列表
-   - 根据用户权限过滤受限模型
-   - 返回用户可访问的模型列表
-
-2. **普通AI请求**：
-   - 从JWT token解析员工号
-   - 检查请求的模型是否在受限模型列表中
-   - 如果是受限模型，验证用户权限
-   - 允许或拒绝请求
-
-### 权限验证示例
-
-```bash
-# 有权限的用户访问受限模型
-curl -X POST https://example.com/v1/chat/completions \
-  -H "Authorization: Bearer <jwt-token-with-permission>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-# 返回：正常响应
-
-# 无权限的用户访问受限模型
-curl -X POST https://example.com/v1/chat/completions \
-  -H "Authorization: Bearer <jwt-token-without-permission>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-# 返回：403 Forbidden - 无权限访问此模型
+响应：
+```json
+{
+  "code": "ai-quota.query_model_permission",
+  "message": "query model permission successful",
+  "success": true,
+  "data": {
+    "employee_number": "85054712",
+    "models": ["gpt-4", "claude-3-opus"]
+  }
+}
 ```
 
-## Star检查权限管理API（新增）
-
-当启用用户级别的star检查控制时 (`star_check_management.user_level_enabled: true`)，可以使用以下接口管理每个用户的star检查开关。
-
-### 设置用户star检查权限
+##### 设置star检查权限
 ```bash
 curl -X POST "https://example.com/check-star/set" \
   -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
   -d "employee_number=85054712&enabled=true"
 ```
 
-### 查询用户star检查权限
-```bash
-curl -X GET "https://example.com/check-star?employee_number=85054712" \
-  -H "x-admin-key: your-admin-secret"
-```
-
-**参数说明**:
-- `employee_number`: 员工编号（必填）
-- `enabled`: 是否启用该用户的star检查，true或false（设置接口必填）
-
-**响应示例**:
+响应：
 ```json
 {
   "code": "ai-quota.set_star_permission",
@@ -371,35 +328,33 @@ curl -X GET "https://example.com/check-star?employee_number=85054712" \
 }
 ```
 
-### Star检查工作流程
-
-1. **全局开关检查**: 首先检查 `star_check_management.enabled`
-2. **用户级别控制**: 如果启用了 `user_level_enabled`，检查用户的个人开关
-3. **实际star检查**: 只有当用户的star检查开关为true时，才进行实际的GitHub项目关注检查
-
-## 配额权限管理
-
-当启用用户级别的配额控制时 (`quota_management.user_level_enabled: true`)，可以使用以下接口管理每个用户的配额控制开关。
-
-### 设置用户配额权限
+##### 查询star检查权限
 ```bash
-curl -X POST "https://example.com/check-quota/set" \
-  -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "employee_number=85054712&enabled=true"
-```
-
-### 查询用户配额权限
-```bash
-curl -X GET "https://example.com/check-quota?employee_number=85054712" \
+curl -X GET "https://example.com/check-star?employee_number=85054712" \
   -H "x-admin-key: your-admin-secret"
 ```
 
-**参数说明**:
-- `employee_number`: 员工编号（必填）
-- `enabled`: 是否启用该用户的配额控制，true或false（设置接口必填，默认为false）
+响应：
+```json
+{
+  "code": "ai-quota.query_star_permission",
+  "message": "query star check permission successful",
+  "success": true,
+  "data": {
+    "employee_number": "85054712",
+    "enabled": true
+  }
+}
+```
 
-**响应示例**:
+##### 设置配额控制权限
+```bash
+curl -X POST "https://example.com/check-quota/set" \
+  -H "x-admin-key: your-admin-secret" \
+  -d "employee_number=85054712&enabled=true"
+```
+
+响应：
 ```json
 {
   "code": "ai-quota.set_quota_permission",
@@ -412,23 +367,169 @@ curl -X GET "https://example.com/check-quota?employee_number=85054712" \
 }
 ```
 
-### 配额控制工作流程
+##### 查询配额控制权限
+```bash
+curl -X GET "https://example.com/check-quota?employee_number=85054712" \
+  -H "x-admin-key: your-admin-secret"
+```
 
-1. **全局检查**: 检查 `quota_management.user_level_enabled` 是否启用
-2. **用户级别控制**: 如果启用了用户级别控制，检查用户的个人配额控制开关
-3. **配额检查**: 只有当用户的配额控制开关为true时，才进行实际的配额检查和扣减
+响应：
+```json
+{
+  "code": "ai-quota.query_quota_permission",
+  "message": "query quota control permission successful",
+  "success": true,
+  "data": {
+    "employee_number": "85054712",
+    "enabled": true
+  }
+}
+```
 
-## API接口
+##### 查询配额总数
+```bash
+curl -H "x-admin-key: your-admin-secret" \
+  "https://example.com/quota?user_id=user123"
+```
 
-### 用户配额检查
+响应：
+```json
+{
+  "code": "ai-gateway.queryquota",
+  "message": "query quota successful",
+  "success": true,
+  "data": {
+    "user_id": "user123",
+    "quota": 10000,
+    "type": "total_quota"
+  }
+}
+```
 
-**路径**: `/v1/chat/completions`
+##### 刷新配额总数
+```bash
+curl -X POST "https://example.com/quota/refresh" \
+  -H "x-admin-key: your-admin-secret" \
+  -d "user_id=user123&quota=15000"
+```
 
-**方法**: POST
+响应：
+```json
+{
+  "code": "ai-quota.refresh_quota",
+  "message": "refresh total quota successful",
+  "success": true
+}
+```
 
-**请求头**:
-- `Authorization`: JWT token，用于用户身份验证
-- `x-quota-identity`: 可选，值为"user"时触发配额扣减
+##### 增减配额总数
+```bash
+curl -X POST "https://example.com/quota/delta" \
+  -H "x-admin-key: your-admin-secret" \
+  -d "user_id=user123&delta=500"
+```
+
+响应：
+```json
+{
+  "code": "ai-quota.adjust_quota",
+  "message": "adjust total quota successful",
+  "success": true,
+  "data": {
+    "new_quota": 15500
+  }
+}
+```
+
+##### 查询已使用量
+```bash
+curl -H "x-admin-key: your-admin-secret" \
+  "https://example.com/quota/used?user_id=user123"
+```
+
+响应：
+```json
+{
+  "code": "ai-quota.query_used",
+  "message": "query used quota successful",
+  "success": true,
+  "data": {
+    "user_id": "user123",
+    "used": 1200,
+    "type": "used_quota"
+  }
+}
+```
+
+##### 刷新已使用量
+```bash
+curl -X POST "https://example.com/quota/used/refresh" \
+  -H "x-admin-key: your-admin-secret" \
+  -d "user_id=user123&used=1000"
+```
+
+响应：
+```json
+{
+  "code": "ai-quota.refresh_used",
+  "message": "refresh used quota successful",
+  "success": true
+}
+```
+
+##### 增减已使用量
+```bash
+curl -X POST "https://example.com/quota/used/delta" \
+  -H "x-admin-key: your-admin-secret" \
+  -d "user_id=user123&delta=200"
+```
+
+响应：
+```json
+{
+  "code": "ai-quota.adjust_used",
+  "message": "adjust used quota successful",
+  "success": true,
+  "data": {
+    "new_used": 1200
+  }
+}
+```
+
+##### 查询GitHub关注状态
+```bash
+curl -H "x-admin-key: your-admin-secret" \
+  "https://example.com/quota/star?user_id=user123"
+```
+
+响应：
+```json
+{
+  "code": "ai-quota.query_star_status",
+  "message": "query GitHub star status successful",
+  "success": true,
+  "data": {
+    "user_id": "user123",
+    "starred": true
+  }
+}
+```
+
+##### 设置关注项目列表
+```bash
+curl -X POST "https://example.com/quota/star/projects/set" \
+  -H "x-admin-key: your-admin-secret" \
+  -d "employee_number=85054712&projects=[\"repo1\",\"repo2\"]"
+```
+
+响应：
+```json
+{
+  "code": "ai-quota.set_star_projects",
+  "message": "set starred projects successful",
+  "success": true
+}
+```
 
 **行为**:
 1. 从JWT token中提取用户ID
@@ -478,177 +579,6 @@ curl -X GET "https://example.com/check-quota?employee_number=85054712" \
 - `owned_by` 字段会根据provider类型自动设置（openai → "openai", qwen → "alibaba" 等）
 - 此端点由插件本地处理，不会转发请求到上游服务
 
-### 管理接口
-
-所有管理接口都需要在请求头中包含管理员认证信息：
-```
-x-admin-key: your-admin-secret-key
-```
-
-#### 配额总数管理
-
-##### 查询配额总数
-```bash
-curl -H "x-admin-key: your-admin-secret" \
-  "https://example.com/v1/chat/completions/quota?user_id=user123"
-```
-
-**响应示例**:
-```json
-{
-  "code": "ai-gateway.queryquota",
-  "message": "query quota successful",
-  "success": true,
-  "data": {
-    "user_id": "user123",
-    "quota": 10000,
-    "type": "total_quota"
-  }
-}
-```
-
-##### 刷新配额总数
-```bash
-curl -X POST \
-  -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&quota=1000" \
-  "https://example.com/v1/chat/completions/quota/refresh"
-```
-
-##### 增减配额总数
-```bash
-# 增加配额
-curl -X POST \
-  -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&value=100" \
-  "https://example.com/v1/chat/completions/quota/delta"
-
-# 减少配额
-curl -X POST \
-  -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&value=-50" \
-  "https://example.com/v1/chat/completions/quota/delta"
-```
-
-#### 已使用量管理
-
-##### 查询已使用量
-```bash
-curl -H "x-admin-key: your-admin-secret" \
-  "https://example.com/v1/chat/completions/quota/used?user_id=user123"
-```
-
-**响应示例**:
-```json
-{
-  "code": "ai-gateway.queryquota",
-  "message": "query quota successful",
-  "success": true,
-  "data": {
-    "user_id": "user123",
-    "quota": 2500,
-    "type": "used_quota"
-  }
-}
-```
-
-##### 刷新已使用量
-```bash
-curl -X POST \
-  -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&quota=2500" \
-  "https://example.com/v1/chat/completions/quota/used/refresh"
-```
-
-##### 增减已使用量
-```bash
-# 增加已使用量
-curl -X POST \
-  -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&value=10" \
-  "https://example.com/v1/chat/completions/quota/used/delta"
-
-# 减少已使用量
-curl -X POST \
-  -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "user_id=user123&value=-5" \
-  "https://example.com/v1/chat/completions/quota/used/delta"
-```
-
-#### GitHub关注状态管理
-
-##### 查询GitHub关注状态
-```bash
-curl -H "x-admin-key: your-admin-secret" \
-  "https://example.com/v1/chat/completions/quota/star?user_id=user123"
-```
-
-**响应示例**:
-```json
-{
-  "code": "ai-gateway.querystar",
-  "message": "query star status successful",
-  "success": true,
-  "data": {
-    "user_id": "user123",
-    "star_value": "true",
-    "type": "star_status"
-  }
-}
-```
-
-##### 设置GitHub关注项目
-```bash
-# 为用户设置关注的项目列表（使用员工编号）
-curl -X POST \
-  -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "employee_number=emp123&starred_projects=zgsm-ai.zgsm,microsoft/vscode,openai/gpt-4" \
-  "https://example.com/v1/chat/completions/quota/star/projects/set"
-
-# 清空用户的所有关注项目
-curl -X POST \
-  -H "x-admin-key: your-admin-secret" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "employee_number=emp123&starred_projects=" \
-  "https://example.com/v1/chat/completions/quota/star/projects/set"
-```
-
-**参数说明**:
-- `employee_number`: 员工编号（必填，从JWT token的EmployeeNumber字段获取）
-- `starred_projects`: 关注的项目仓库列表，逗号分隔（选填，空值表示清空所有关注）
-
-## 使用示例
-
-### 正常的AI请求（不扣减配额）
-```bash
-curl "https://example.com/v1/chat/completions" \
-  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-3.5-turbo",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-```
-
-### 扣减配额的AI请求
-```bash
-curl "https://example.com/v1/chat/completions" \
-  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
-  -H "x-quota-identity: user" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-3.5-turbo",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-```
-
 ## 错误处理
 
 ### 常见错误响应
@@ -663,7 +593,10 @@ curl "https://example.com/v1/chat/completions" \
 | 403 | `ai-gateway.star_required` | 需要先关注GitHub项目 |
 | 403 | `ai-gateway.noquota` | 配额不足 |
 | 400 | `ai-gateway.invalid_params` | 请求参数无效 |
+| 500 | `ai-gateway.invalid_quota_format` | 配额格式无效 |
+| 500 | `ai-gateway.invalid_quota_value` | 配额值无效 |
 | 503 | `ai-gateway.error` | Redis连接错误 |
+| 503 | `ai-gateway.redis_error` | Redis操作错误 |
 
 **错误响应示例**:
 ```json

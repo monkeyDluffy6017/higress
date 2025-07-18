@@ -104,9 +104,7 @@ const (
 // AuthUser struct for parsing user info from JWT
 type AuthUser struct {
 	ID             string `json:"universal_id"`
-	Username       string `json:"username"`
 	EmployeeNumber string `json:"id"`
-	FullName       string `json:"fullName"`
 }
 
 func main() {
@@ -928,7 +926,19 @@ func parseUserInfoFromToken(accessToken string) (*AuthUser, error) {
 		return nil, fmt.Errorf("failed to extract claims: %w", err)
 	}
 
-	// serialize and deserialize claims to get user info
+	var employeeNumber string
+	if properties, ok := customClaims["properties"].(map[string]interface{}); ok {
+		if customID, ok := properties["oauth_Custom_id"].(string); ok {
+			employeeNumber = customID
+		}
+	}
+
+	if employeeNumber == "" {
+		if universalID, ok := customClaims["universal_id"].(string); ok {
+			employeeNumber = universalID
+		}
+	}
+
 	jsonBytes, err := json.Marshal(customClaims)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize user info: %w", err)
@@ -938,6 +948,8 @@ func parseUserInfoFromToken(accessToken string) (*AuthUser, error) {
 	if err := json.Unmarshal(jsonBytes, &userInfo); err != nil {
 		return nil, fmt.Errorf("failed to deserialize user info: %w", err)
 	}
+
+	userInfo.EmployeeNumber = employeeNumber
 
 	return &userInfo, nil
 }
