@@ -222,7 +222,7 @@ type QuotaConfig struct {
 	PermissionManagement PermissionManagementConfig `yaml:"permission_management"`
 
 	redisClient       wrapper.RedisClient `yaml:"-"`
-	starCache         map[string][]string `yaml:"-"` // Star projects cache (employee_number -> starred projects)
+	starCacheManager  *StarCacheManager   `yaml:"-"` // Manager for star projects cache
 	providerConfigs   []ProviderConfig    `yaml:"-"` // All configured providers for models endpoint
 	permissionChecker *PermissionChecker  `yaml:"-"` // Permission checker instance
 	starCheckChecker  *StarCheckChecker   `yaml:"-"` // Star check permission checker instance
@@ -237,12 +237,14 @@ type StarCheckManagementConfig struct {
 	AdminStargazerPath   string `yaml:"admin_stargazer_path"`
 	RedisStargazerPrefix string `yaml:"redis_stargazer_prefix"`
 	TargetRepo           string `yaml:"target_repo"`
+	CacheTTLSeconds      int    `yaml:"cache_ttl_seconds"` // Cache TTL in seconds for StarCache, default 60s
 }
 
 // PermissionManagementConfig configuration for permission management
 type PermissionManagementConfig struct {
 	RedisPermissionPrefix string `yaml:"redis_permission_prefix"`
 	AdminPermissionPath   string `yaml:"admin_permission_path"`
+	CacheTTLSeconds       int    `yaml:"cache_ttl_seconds"` // Cache TTL in seconds for StarCache, default 60s
 }
 
 // PermissionChecker handles model permission checking
@@ -378,7 +380,6 @@ func (p *PermissionChecker) getFromRedis(employeeNumber string, callback func([]
 }
 
 // updateMemoryCache updates the memory cache
-// updateMemoryCache updates the memory cache
 func (p *PermissionChecker) updateMemoryCacheWithTTL(employeeNumber string, models []string, expireTime int64) {
 	p.mu.Lock()
 	p.memoryCache[employeeNumber] = models
@@ -408,6 +409,118 @@ func (p *PermissionChecker) SetUserPermission(employeeNumber string, models []st
 		if callback != nil {
 			callback(response.Error())
 		}
+	})
+}
+
+// StarCacheManager manages the star projects cache
+type StarCacheManager struct {
+	memoryCache     map[string][]string // employee_number -> starred projects
+	cacheExpireTime map[string]int64    // employee_number -> expire_timestamp
+	mu              sync.RWMutex
+	redisClient     wrapper.RedisClient
+	redisStarPrefix string
+	cacheTTLSeconds int64 // Cache TTL in seconds
+}
+
+func NewStarCacheManager(redisClient wrapper.RedisClient, redisStarPrefix string, cacheTTLSeconds int) *StarCacheManager {
+	if cacheTTLSeconds <= 0 {
+		cacheTTLSeconds = 60 // Default 60 seconds
+	}
+	return &StarCacheManager{
+		memoryCache:     make(map[string][]string),
+		cacheExpireTime: make(map[string]int64),
+		redisClient:     redisClient,
+		redisStarPrefix: redisStarPrefix,
+		cacheTTLSeconds: int64(cacheTTLSeconds),
+	}
+}
+
+func (s *StarCacheManager) CheckStarredProjects(userId string, log wrapper.Log, callback func([]string, error)) {
+	now := time.Now().Unix()
+
+	// Check if cache exists and is not expired
+	s.mu.RLock()
+	cachedProjects, hasCache := s.memoryCache[userId]
+	expireTime, hasExpireTime := s.cacheExpireTime[userId]
+	s.mu.RUnlock()
+
+	// If cache exists and not expired, use it
+	if hasCache && hasExpireTime && now < expireTime {
+		log.Debugf("Starred projects found in valid cache for employee %s: %v (expires in %d seconds)",
+			userId, cachedProjects, expireTime-now)
+		callback(cachedProjects, nil)
+		return
+	}
+
+	// Cache expired or missing, get from Redis
+	log.Debugf("Starred projects cache expired or missing for employee %s, fetching from Redis", userId)
+	s.getFromRedis(userId, func(projects []string, err error) {
+		if err == nil {
+			// Update cache with new expiration time only on success
+			newExpireTime := now + s.cacheTTLSeconds
+			s.updateMemoryCacheWithTTL(userId, projects, newExpireTime)
+			log.Debugf("Fetched starred projects for employee %s from Redis: %v", userId, projects)
+		}
+		callback(projects, err)
+	})
+}
+
+func (s *StarCacheManager) updateMemoryCacheWithTTL(userId string, projects []string, expireTime int64) {
+	s.mu.Lock()
+	s.memoryCache[userId] = projects
+	s.cacheExpireTime[userId] = expireTime
+	s.mu.Unlock()
+}
+
+func (s *StarCacheManager) getFromRedis(userId string, callback func([]string, error)) {
+	redisKey := s.redisStarPrefix + userId
+	s.redisClient.Get(redisKey, func(response resp.Value) {
+		var projects []string // Default to empty slice
+
+		// Check for Redis errors
+		if err := response.Error(); err != nil {
+			callback(nil, err)
+			return
+		}
+
+		// Parse starred projects from comma-separated format
+		if !response.IsNull() {
+			data := response.String()
+			if data != "" {
+				// Parse comma-separated project list
+				projects = strings.Split(data, ",")
+				for i, project := range projects {
+					projects[i] = strings.TrimSpace(project)
+				}
+			}
+		}
+
+		callback(projects, nil)
+	})
+}
+
+// deleteMemoryCache removes the cache entry for a specific employee
+func (s *StarCacheManager) deleteMemoryCache(userId string) {
+	s.mu.Lock()
+	delete(s.memoryCache, userId)
+	delete(s.cacheExpireTime, userId)
+	s.mu.Unlock()
+}
+
+func (s *StarCacheManager) SetStarredProjects(userId string, projects []string, callback func(error)) {
+	// Clear memory cache first to force Redis reads on all instances
+	s.deleteMemoryCache(userId)
+
+	// Save to Redis as comma-separated string (not JSON)
+	redisKey := s.redisStarPrefix + userId
+	projectsStr := strings.Join(projects, ",")
+
+	s.redisClient.Set(redisKey, projectsStr, func(response resp.Value) {
+		if err := response.Error(); err != nil {
+			callback(err)
+			return
+		}
+		callback(nil)
 	})
 }
 
@@ -724,6 +837,12 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 	config.StarCheckManagement.RedisStargazerPrefix = starCheckManagement.Get("redis_stargazer_prefix").String()
 	config.StarCheckManagement.TargetRepo = starCheckManagement.Get("target_repo").String()
 
+	// Parse cache TTL seconds for StarCache
+	config.StarCheckManagement.CacheTTLSeconds = int(starCheckManagement.Get("cache_ttl_seconds").Int())
+	if config.StarCheckManagement.CacheTTLSeconds <= 0 {
+		config.StarCheckManagement.CacheTTLSeconds = 60 // Default 60 seconds
+	}
+
 	// Set default values if not specified
 	if config.StarCheckManagement.RedisStarPrefix == "" {
 		config.StarCheckManagement.RedisStarPrefix = "chat_quota_star:"
@@ -735,8 +854,7 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		config.StarCheckManagement.RedisStargazerPrefix = "star_check:"
 	}
 
-	// Initialize star projects cache
-	config.starCache = make(map[string][]string)
+	// Initialize star projects cache with expiration time management
 
 	redisConfig := json.Get("redis")
 	if !redisConfig.Exists() {
@@ -803,15 +921,27 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 	}
 	log.Debugf("[parseConfig] Admin permission path: %s", config.PermissionManagement.AdminPermissionPath)
 
+	// Parse cache TTL seconds for StarCache
+	config.PermissionManagement.CacheTTLSeconds = int(permConfig.Get("cache_ttl_seconds").Int())
+	if config.PermissionManagement.CacheTTLSeconds <= 0 {
+		config.PermissionManagement.CacheTTLSeconds = 60 // Default 60 seconds
+	}
+
 	// Initialize permission checker
 	log.Debugf("[parseConfig] Initializing permission checker with restricted models: %v", config.RestrictedModels)
 	config.permissionChecker = NewPermissionChecker(
 		config.RestrictedModels,
 		config.redisClient,
 		config.PermissionManagement.RedisPermissionPrefix,
-		config.QuotaManagement.CacheTTLSeconds,
+		config.PermissionManagement.CacheTTLSeconds,
 	)
 	log.Debugf("[parseConfig] Permission checker initialized successfully: %t", config.permissionChecker != nil)
+
+	config.starCacheManager = NewStarCacheManager(
+		config.redisClient,
+		config.StarCheckManagement.RedisStarPrefix,
+		config.StarCheckManagement.CacheTTLSeconds,
+	)
 
 	// Initialize star check permission checker if user level is enabled
 	if config.StarCheckManagement.UserLevelEnabled {
@@ -819,7 +949,7 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 		config.starCheckChecker = NewStarCheckChecker(
 			config.redisClient,
 			config.StarCheckManagement.RedisStargazerPrefix,
-			config.QuotaManagement.CacheTTLSeconds,
+			config.StarCheckManagement.CacheTTLSeconds,
 		)
 		log.Debugf("[parseConfig] Star check permission checker initialized successfully: %t", config.starCheckChecker != nil)
 	}
@@ -1610,13 +1740,18 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 		responseType = "used_quota"
 	} else if adminMode == AdminModeStarQuery {
 		// Check cache first for star query
-		if cached, _ := config.checkStarCache(employeeNumber); cached {
-			starredProjects := config.starCache[employeeNumber]
-			log.Debugf("Star projects found in cache for employee %s: %v", employeeNumber, starredProjects)
+		cached, _ := config.checkStarCache(employeeNumber)
+		if cached {
+			// Get actual projects from cache
+			config.starCacheManager.mu.RLock()
+			projects := config.starCacheManager.memoryCache[employeeNumber]
+			config.starCacheManager.mu.RUnlock()
+
+			log.Debugf("Star projects found in cache for employee %s: %v", employeeNumber, projects)
 
 			data := map[string]interface{}{
 				"employee_number":  employeeNumber,
-				"starred_projects": strings.Join(starredProjects, ","), // Return as comma-separated string
+				"starred_projects": strings.Join(projects, ","), // Return as comma-separated string
 				"type":             "star_status",
 			}
 			sendJSONResponse(http.StatusOK, "ai-gateway.querystar", "query star status successful (cached)", true, data)
@@ -1817,22 +1952,15 @@ func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log
 		}
 	}
 
-	redisKey := config.StarCheckManagement.RedisStarPrefix + employeeNumber
-
-	// Delete from local cache before setting to ensure fresh read
-	config.deleteStarCache(employeeNumber)
-	log.Debugf("Deleted star cache for employee %s before setting", employeeNumber)
-
-	err := config.redisClient.Set(redisKey, starredProjects, func(response resp.Value) {
-		log.Debugf("Redis set key = %s starred_projects = %s", redisKey, starredProjects)
-		if err := response.Error(); err != nil {
+	// Use StarCacheManager to set starred projects
+	config.starCacheManager.SetStarredProjects(employeeNumber, projectsList, func(err error) {
+		if err != nil {
+			log.Errorf("Failed to set starred projects for employee %s: %v", employeeNumber, err)
 			sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
 
-		// Update memory cache
-		config.setStarCache(employeeNumber, projectsList)
-		log.Debugf("Updated star cache for employee %s with projects: %v", employeeNumber, projectsList)
+		log.Debugf("Successfully set starred projects for employee %s: %v", employeeNumber, projectsList)
 
 		data := map[string]interface{}{
 			"employee_number":  employeeNumber,
@@ -1840,11 +1968,6 @@ func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log
 		}
 		sendJSONResponse(http.StatusOK, "ai-gateway.setstar", "set star projects successful", true, data)
 	})
-
-	if err != nil {
-		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("redis error:%v", err), false, nil)
-		return types.ActionContinue
-	}
 
 	return types.ActionPause
 }
@@ -1980,55 +2103,25 @@ func queryStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, url *
 
 // performStarCheck performs the actual star checking logic
 func performStarCheck(ctx wrapper.HttpContext, config QuotaConfig, body []byte, userId string, log wrapper.Log) {
-	// First check local cache
-	if cached, hasStar := config.checkStarCache(userId); cached {
-		log.Debugf("Star projects found in cache for user %s, target repo starred: %t", userId, hasStar)
-		if hasStar {
-			log.Debugf("User %s has starred the target project (cached), proceeding with quota check", userId)
-			// Star check passed, continue with quota logic
-			processQuotaLogic(ctx, config, body, userId, log)
-		} else {
-			log.Debugf("User %s has not starred the target project (cached)", userId)
-			sendJSONResponse(http.StatusForbidden, "ai-gateway.star_required", fmt.Sprintf("Please star the project first: https://github.com/%s", strings.ReplaceAll(config.StarCheckManagement.TargetRepo, ".", "/")), false, nil)
-		}
-		return
-	}
-
-	// Cache miss, check Redis
-	log.Debugf("Star projects not in cache, checking Redis for user: %s", userId)
-	starKey := config.StarCheckManagement.RedisStarPrefix + userId
-	config.redisClient.Get(starKey, func(starResponse resp.Value) {
-		// Check if there's a Redis error
-		if err := starResponse.Error(); err != nil {
-			log.Warnf("Redis error when checking star status for user %s: %v. Allowing request to pass through.", userId, err)
+	// Use StarCacheManager to check starred projects
+	config.starCacheManager.CheckStarredProjects(userId, log, func(starredProjects []string, err error) {
+		if err != nil {
 			// Redis error - allow request to pass through for better user experience
+			log.Warnf("Redis error when checking star status for user %s: %v. Allowing request to pass through.", userId, err)
 			processQuotaLogic(ctx, config, body, userId, log)
 			return
 		}
 
-		// Parse starred projects from Redis
-		var starredProjects []string
-		var hasStar bool = false
-
-		if !starResponse.IsNull() {
-			starredProjectsStr := starResponse.String()
-			if starredProjectsStr != "" {
-				// Parse comma-separated project list
-				starredProjects = strings.Split(starredProjectsStr, ",")
-				for i, project := range starredProjects {
-					starredProjects[i] = strings.TrimSpace(project)
-					if starredProjects[i] == config.StarCheckManagement.TargetRepo {
-						hasStar = true
-					}
-				}
+		// Check if target repo is in starred projects
+		hasStar := false
+		for _, project := range starredProjects {
+			if project == config.StarCheckManagement.TargetRepo {
+				hasStar = true
+				break
 			}
 		}
 
-		log.Debugf("User %s starred projects from Redis: %v, target repo (%s) starred: %t", userId, starredProjects, config.StarCheckManagement.TargetRepo, hasStar)
-
-		// Cache the starred projects
-		config.setStarCache(userId, starredProjects)
-		log.Debugf("Cached starred projects for user %s: %v", userId, starredProjects)
+		log.Debugf("User %s starred projects: %v, target repo (%s) starred: %t", userId, starredProjects, config.StarCheckManagement.TargetRepo, hasStar)
 
 		if hasStar {
 			// Star check passed, continue with quota logic
@@ -2174,18 +2267,25 @@ func continueWithQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []
 
 // checkStarCache checks if user starred projects are cached and if target repo is starred
 func (config *QuotaConfig) checkStarCache(employeeNumber string) (bool, bool) {
-	starredProjects, exists := config.starCache[employeeNumber]
-	if !exists {
-		return false, false // Not cached yet
-	}
+	// Check if cache exists and is not expired
+	now := time.Now().Unix()
 
-	// Check if target repo is in the starred projects list
-	for _, project := range starredProjects {
-		if project == config.StarCheckManagement.TargetRepo {
-			return true, true
+	config.starCacheManager.mu.RLock()
+	cachedProjects, hasCache := config.starCacheManager.memoryCache[employeeNumber]
+	expireTime, hasExpireTime := config.starCacheManager.cacheExpireTime[employeeNumber]
+	config.starCacheManager.mu.RUnlock()
+
+	// If cache exists and not expired, use it
+	if hasCache && hasExpireTime && now < expireTime {
+		// Check if target repo is in the starred projects list
+		for _, project := range cachedProjects {
+			if project == config.StarCheckManagement.TargetRepo {
+				return true, true
+			}
 		}
+		return true, false // Cache exists but target repo not starred
 	}
-	return true, false // Cache exists but target repo not starred
+	return false, false // Not cached or expired
 }
 
 // setStarCache sets user starred projects in cache
@@ -2193,12 +2293,14 @@ func (config *QuotaConfig) setStarCache(employeeNumber string, starredProjects [
 	// Always cache the result, even if it's empty
 	// Empty slice means "queried but no starred projects found in Redis"
 	// Missing key means "not queried yet"
-	config.starCache[employeeNumber] = starredProjects
+	now := time.Now().Unix()
+	expireTime := now + config.starCacheManager.cacheTTLSeconds
+	config.starCacheManager.updateMemoryCacheWithTTL(employeeNumber, starredProjects, expireTime)
 }
 
 // deleteStarCache removes user starred projects from cache
 func (config *QuotaConfig) deleteStarCache(employeeNumber string) {
-	delete(config.starCache, employeeNumber)
+	config.starCacheManager.deleteMemoryCache(employeeNumber)
 }
 
 // BuildCombinedModelsResponse builds a models response that combines all configured providers
