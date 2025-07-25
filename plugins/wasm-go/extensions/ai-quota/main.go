@@ -1422,33 +1422,22 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 }
 
 func doQuotaCheck(ctx wrapper.HttpContext, config QuotaConfig, userId string, quotaWeight float64, modelName string, log wrapper.Log) {
-	// Check if we need to deduct quota based on header
-	deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.QuotaManagement.DeductHeader)
-	shouldDeduct := err == nil && deductHeaderValue == config.QuotaManagement.DeductHeaderValue
+	// Need to deduct quota: perform full quota check and deduction
+	totalKey := config.QuotaManagement.RedisKeyPrefix + userId
+	usedKey := config.QuotaManagement.RedisUsedPrefix + userId
 
-	if shouldDeduct {
-		// Need to deduct quota: perform full quota check and deduction
-		totalKey := config.QuotaManagement.RedisKeyPrefix + userId
-		usedKey := config.QuotaManagement.RedisUsedPrefix + userId
-
-		// Use enhanced error handling with retries for critical quota operations
-		retryConfig := wrapper.RetryConfig{
-			MaxRetries:    2, // Limit retries for latency-sensitive operations
-			InitialDelay:  50 * time.Millisecond,
-			MaxDelay:      500 * time.Millisecond,
-			BackoffFactor: 2.0,
-			EnableJitter:  true,
-		}
-
-		config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
-			handleTotalQuotaResponseWithRetry(ctx, config, usedKey, totalResponse, userId, quotaWeight, modelName, log, retryConfig)
-		})
-	} else {
-		// No quota deduction needed: allow request to continue without Redis queries
-		log.Debugf("Quota deduction not required for user %s (header: %s != %s), allowing request",
-			userId, deductHeaderValue, config.QuotaManagement.DeductHeaderValue)
-		proxywasm.ResumeHttpRequest()
+	// Use enhanced error handling with retries for critical quota operations
+	retryConfig := wrapper.RetryConfig{
+		MaxRetries:    2, // Limit retries for latency-sensitive operations
+		InitialDelay:  50 * time.Millisecond,
+		MaxDelay:      500 * time.Millisecond,
+		BackoffFactor: 2.0,
+		EnableJitter:  true,
 	}
+
+	config.redisClient.Get(totalKey, func(totalResponse resp.Value) {
+		handleTotalQuotaResponseWithRetry(ctx, config, usedKey, totalResponse, userId, quotaWeight, modelName, log, retryConfig)
+	})
 }
 
 func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfig, usedKey string, totalResponse resp.Value, userId string, quotaWeight float64, modelName string, log wrapper.Log, retryConfig wrapper.RetryConfig) {
@@ -1545,11 +1534,23 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 
 	// Check if sufficient quota is available
 	if remainingQuota >= quotaWeight {
-		// Use Redis native INCRBYFLOAT for atomic quota deduction
-		usedKey := config.QuotaManagement.RedisUsedPrefix + userId
-		config.redisClient.IncrByFloat(usedKey, quotaWeight, func(response resp.Value) {
-			handleQuotaDeductionResponse(ctx, response, userId, quotaWeight, modelName, remainingQuota, log)
-		})
+		// Check if we need to deduct quota based on header
+		deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.QuotaManagement.DeductHeader)
+		shouldDeduct := err == nil && deductHeaderValue == config.QuotaManagement.DeductHeaderValue
+
+		if shouldDeduct {
+			// Use Redis native INCRBYFLOAT for atomic quota deduction
+			usedKey := config.QuotaManagement.RedisUsedPrefix + userId
+			config.redisClient.IncrByFloat(usedKey, quotaWeight, func(response resp.Value) {
+				handleQuotaDeductionResponse(ctx, response, userId, quotaWeight, modelName, remainingQuota, log)
+			})
+		} else {
+			// No quota deduction needed: allow request to continue without Redis queries
+			log.Debugf("Quota deduction not required for user %s (header: %s != %s), allowing request",
+				userId, deductHeaderValue, config.QuotaManagement.DeductHeaderValue)
+			proxywasm.ResumeHttpRequest()
+			return
+		}
 	} else {
 		log.Warnf("Insufficient quota for user %s: remaining=%f, required=%f", userId, remainingQuota, quotaWeight)
 		sendJSONResponse(http.StatusForbidden, "quota-check.insufficient_quota",
