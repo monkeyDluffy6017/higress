@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	logs "github.com/higress-group/wasm-go/pkg/log"
@@ -53,21 +55,30 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config, log logs.Log) 
 	log.Infof("=== 开始调试上游主机信息获取 ===")
 	log.Infof("wasm-go版本信息准备检查...")
 
-	// 获取上游主机信息
-	log.Infof("尝试调用 proxywasm.GetUpstreamHosts()...")
-	hostInfos, err := proxywasm.GetUpstreamHosts()
-	if err != nil {
-		return types.HeaderContinue
-	}
-
-	// 打印所有上游主机信息
-	log.Infof("路由上游主机列表 (共 %d 个):", len(hostInfos))
-	// 直接打印完整的主机信息数组
-	log.Infof("上游主机详细信息: %+v", hostInfos)
-
-	// 同时打印每个主机的详细信息
-	for i, hostInfo := range hostInfos {
-		log.Infof("  [%d] %+v", i+1, hostInfo)
+	// 获取命中路由下的所有 LLM 集群及端点（新接口）
+	if raw, err := proxywasm.GetAllLLMClusters(); err == nil {
+		var clusters []struct {
+			ClusterName string `json:"cluster_name"`
+			Weight      int    `json:"weight"`
+			Endpoints   []struct {
+				IP           string `json:"ip"`
+				Port         int    `json:"port"`
+				HealthStatus string `json:"health_status"`
+			} `json:"endpoints"`
+		}
+		if err := json.Unmarshal(raw, &clusters); err == nil {
+			log.Infof("命中路由的 LLM 集群数: %d", len(clusters))
+			for _, c := range clusters {
+				log.Infof("集群 %s (权重 %d)", c.ClusterName, c.Weight)
+				for _, ep := range c.Endpoints {
+					log.Infof("  - %s:%d (%s)", ep.IP, ep.Port, ep.HealthStatus)
+				}
+			}
+		} else {
+			log.Errorf("解析 all_llm_clusters 失败: %v", err)
+		}
+	} else {
+		log.Warnf("获取 all_llm_clusters 失败: %v", err)
 	}
 
 	return types.HeaderContinue
