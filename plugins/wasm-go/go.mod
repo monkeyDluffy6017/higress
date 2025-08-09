@@ -4,8 +4,7 @@ go 1.24.1
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20250611100342-5654e89a7a80
-	// github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20250611100342-5654e89a7a80
+	github.com/monkeyDluffy6017/proxy-wasm-go-sdk v0.0.0-20250809050325-76d64f332157
 
 	github.com/stretchr/testify v1.10.0
 	github.com/tidwall/gjson v1.18.0
@@ -18,7 +17,7 @@ require (
 	github.com/corazawaf/coraza-wasilibs v0.2.0
 	github.com/corazawaf/coraza/v3 v3.3.3
 	github.com/go-jose/go-jose/v3 v3.0.4
-	github.com/higress-group/wasm-go v1.0.1
+	github.com/monkeyDluffy6017/wasm-go v0.0.0-20250809060223-480f9756e05e
 )
 
 require (

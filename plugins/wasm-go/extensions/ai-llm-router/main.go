@@ -3,10 +3,11 @@ package main
 import (
 	"encoding/json"
 
-	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
-	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
-	logs "github.com/higress-group/wasm-go/pkg/log"
-	"github.com/higress-group/wasm-go/pkg/wrapper"
+	logs "github.com/monkeyDluffy6017/wasm-go/pkg/log"
+	"github.com/monkeyDluffy6017/wasm-go/pkg/wrapper"
+
+	"github.com/monkeyDluffy6017/proxy-wasm-go-sdk/proxywasm"
+	"github.com/monkeyDluffy6017/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/tidwall/gjson"
 )
 
@@ -20,10 +21,10 @@ func init() {
 		wrapper.ParseConfigBy(parseConfig),
 		// 为处理请求头，设置自定义函数
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
-		wrapper.ProcessRequestBody(onHttpRequestBody),
-		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
+		// wrapper.ProcessRequestBody(onHttpRequestBody),
+		// wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		// wrapper.ProcessStreamingResponseBody(onHttpStreamingResponseBody),
-		wrapper.ProcessResponseBody(onHttpResponseBody),
+		// wrapper.ProcessResponseBody(onHttpResponseBody),
 		// wrapper.ProcessStreamDone(onHttpStreamDone),
 	)
 }
