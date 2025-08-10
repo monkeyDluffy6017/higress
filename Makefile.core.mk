@@ -158,7 +158,7 @@ build-pilot-local: prebuild
 buildx-prepare:
 	docker buildx inspect multi-arch >/dev/null 2>&1 || docker buildx create --name multi-arch --platform linux/amd64 --use
 
-build-gateway: prebuild buildx-prepare build-golang-filter build-envoy
+build-gateway: prebuild buildx-prepare build-golang-filter
 	USE_REAL_USER=1 ISTIO_ENVOY_LINUX_RELEASE_URL="" TARGET_ARCH=amd64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh init
 	DOCKER_TARGETS="docker.proxyv2" IMG_URL="${IMG_URL}" ./tools/hack/build-istio-image.sh docker.buildx
 
