@@ -1206,7 +1206,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 							responseBody, err := config.BuildFilteredModelsResponse(allowedModels, log)
 							if err != nil {
 								log.Errorf("failed to build models response: %v", err)
-								_ = sendJSONResponse(500, "ai-quota.build_models_failed", "Failed to build models response", false, nil)
+								_ = sendJSONResponse(500, "ai-gateway.build_models_failed", "Failed to build models response", false, nil)
 								return
 							}
 
@@ -1217,7 +1217,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 							err = proxywasm.SendHttpResponse(200, headers, responseBody, -1)
 							if err != nil {
 								log.Errorf("failed to send response: %v", err)
-								_ = sendJSONResponse(500, "ai-quota.send_models_response_failed", "Failed to send models response", false, nil)
+								_ = sendJSONResponse(500, "ai-gateway.send_models_response_failed", "Failed to send models response", false, nil)
 								return
 							}
 
@@ -1241,7 +1241,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		responseBody, err := config.BuildFilteredModelsResponse(allowedModels, log)
 		if err != nil {
 			log.Errorf("failed to build models response: %v", err)
-			_ = sendJSONResponse(500, "ai-quota.build_models_failed", "Failed to build models response", false, nil)
+			_ = sendJSONResponse(500, "ai-gateway.build_models_failed", "Failed to build models response", false, nil)
 			return types.ActionContinue
 		}
 
@@ -1252,7 +1252,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		err = proxywasm.SendHttpResponse(200, headers, responseBody, -1)
 		if err != nil {
 			log.Errorf("failed to send response: %v", err)
-			_ = sendJSONResponse(500, "ai-quota.send_models_response_failed", "Failed to send models response", false, nil)
+			_ = sendJSONResponse(500, "ai-gateway.send_models_response_failed", "Failed to send models response", false, nil)
 			return types.ActionContinue
 		}
 
@@ -1288,6 +1288,10 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		// query quota permission
 		if adminMode == AdminModeQuotaQuery {
 			return queryQuotaPermission(context, config, path, log)
+		}
+		// query model permission (whitelist)
+		if adminMode == AdminModePermQuery {
+			return queryModelPermission(context, config, path, log)
 		}
 		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta || adminMode == AdminModeUsedRefresh || adminMode == AdminModeUsedDelta || adminMode == AdminModeStarSet || adminMode == AdminModeStargazerSet || adminMode == AdminModeQuotaSet {
 			context.BufferRequestBody()
@@ -1479,7 +1483,7 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 			employeeNumber, ok := ctx.GetContext("employeeNumber").(string)
 			if !ok || employeeNumber == "" {
 				log.Warnf("[processQuotaLogic] Employee number not found in context for restricted model %s - BLOCKING REQUEST", modelName)
-				sendJSONResponse(http.StatusUnauthorized, "ai-quota.no_employee_number",
+				sendJSONResponse(http.StatusUnauthorized, "ai-gateway.no_employee_number",
 					fmt.Sprintf("Valid employee information required to access restricted model %s", modelName), false, nil)
 				return types.ActionContinue
 			}
@@ -1490,7 +1494,7 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 			config.permissionChecker.CheckModelPermission(employeeNumber, modelName, log, func(hasPermission bool) {
 				if !hasPermission {
 					log.Warnf("[processQuotaLogic] User %s does not have permission to use restricted model %s - BLOCKING REQUEST", userId, modelName)
-					sendJSONResponse(http.StatusForbidden, "ai-quota.model_permission_denied",
+					sendJSONResponse(http.StatusForbidden, "ai-gateway.model_permission_denied",
 						fmt.Sprintf("You don't have permission to use model %s", modelName), false, nil)
 					return
 				}
@@ -2128,7 +2132,7 @@ func setUserPermission(ctx wrapper.HttpContext, config QuotaConfig, body string,
 	employeeNumber := values["employee_number"]
 	modelsParam := values["models"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2151,18 +2155,18 @@ func setUserPermission(ctx wrapper.HttpContext, config QuotaConfig, body string,
 		config.permissionChecker.SetUserPermission(employeeNumber, models, func(err error) {
 			if err != nil {
 				log.Errorf("Failed to set user permission for employee %s: %v", employeeNumber, err)
-				sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", fmt.Sprintf("Failed to set user permission: %v", err), false, nil)
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("Failed to set user permission: %v", err), false, nil)
 				return
 			}
 			data := map[string]interface{}{
 				"employee_number": employeeNumber,
 				"models":          models,
 			}
-			sendJSONResponse(http.StatusOK, "ai-quota.setpermission", "set user permission successful", true, data)
+			sendJSONResponse(http.StatusOK, "ai-gateway.setpermission", "set user permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Permission checker not initialized, cannot set user permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", "Permission management not configured.", false, nil)
 	}
 
 	return types.ActionPause
@@ -2180,7 +2184,7 @@ func setStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, body st
 	employeeNumber := values["employee_number"]
 	enabledParam := values["enabled"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2197,18 +2201,18 @@ func setStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, body st
 		config.starCheckChecker.SetStarCheckPermission(employeeNumber, enabled, func(err error) {
 			if err != nil {
 				log.Errorf("Failed to set star check permission for employee %s: %v", employeeNumber, err)
-				sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", fmt.Sprintf("Failed to set star check permission: %v", err), false, nil)
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("Failed to set star check permission: %v", err), false, nil)
 				return
 			}
 			data := map[string]interface{}{
 				"employee_number": employeeNumber,
 				"enabled":         enabled,
 			}
-			sendJSONResponse(http.StatusOK, "ai-quota.set_star_permission", "set star check permission successful", true, data)
+			sendJSONResponse(http.StatusOK, "ai-gateway.set_star_permission", "set star check permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Star check permission checker not initialized, cannot set permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Star check permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", "Star check permission management not configured.", false, nil)
 	}
 
 	return types.ActionPause
@@ -2223,7 +2227,7 @@ func queryStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, url *
 
 	employeeNumber := values["employee_number"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2235,11 +2239,11 @@ func queryStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, url *
 				"employee_number": employeeNumber,
 				"enabled":         enabled,
 			}
-			sendJSONResponse(http.StatusOK, "ai-quota.query_star_permission", "query star check permission successful", true, data)
+			sendJSONResponse(http.StatusOK, "ai-gateway.query_star_permission", "query star check permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Star check permission checker not initialized, cannot query permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Star check permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", "Star check permission management not configured.", false, nil)
 	}
 
 	return types.ActionPause
@@ -2289,7 +2293,7 @@ func setQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, body string
 	employeeNumber := values["employee_number"]
 	enabledParam := values["enabled"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2306,18 +2310,18 @@ func setQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, body string
 		config.quotaChecker.SetQuotaPermission(employeeNumber, enabled, func(err error) {
 			if err != nil {
 				log.Errorf("Failed to set quota control permission for employee %s: %v", employeeNumber, err)
-				sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", fmt.Sprintf("Failed to set quota control permission: %v", err), false, nil)
+				sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", fmt.Sprintf("Failed to set quota control permission: %v", err), false, nil)
 				return
 			}
 			data := map[string]interface{}{
 				"employee_number": employeeNumber,
 				"enabled":         enabled,
 			}
-			sendJSONResponse(http.StatusOK, "ai-quota.set_quota_permission", "set quota control permission successful", true, data)
+			sendJSONResponse(http.StatusOK, "ai-gateway.set_quota_permission", "set quota control permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Quota permission checker not initialized, cannot set permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Quota control permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", "Quota control permission management not configured.", false, nil)
 	}
 
 	return types.ActionPause
@@ -2332,7 +2336,7 @@ func queryQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.
 
 	employeeNumber := values["employee_number"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, "ai-quota.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2344,12 +2348,49 @@ func queryQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.
 				"employee_number": employeeNumber,
 				"enabled":         enabled,
 			}
-			sendJSONResponse(http.StatusOK, "ai-quota.query_quota_permission", "query quota control permission successful", true, data)
+			sendJSONResponse(http.StatusOK, "ai-gateway.query_quota_permission", "query quota control permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Quota permission checker not initialized, cannot query permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, "ai-quota.error", "Quota control permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", "Quota control permission management not configured.", false, nil)
 	}
+
+	return types.ActionPause
+}
+
+// queryModelPermission queries user's model whitelist (allowed models)
+func queryModelPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, log wrapper.Log) types.Action {
+	// Extract params
+	queryValues := url.Query()
+	values := make(map[string]string, len(queryValues))
+	for k, v := range queryValues {
+		values[k] = v[0]
+	}
+
+	employeeNumber := values["employee_number"]
+	if employeeNumber == "" {
+		sendJSONResponse(http.StatusBadRequest, "ai-gateway.invalid_params", "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		return types.ActionContinue
+	}
+
+	if config.permissionChecker == nil {
+		log.Errorf("Permission checker not initialized, cannot query model permission for employee %s", employeeNumber)
+		sendJSONResponse(http.StatusServiceUnavailable, "ai-gateway.error", "Permission management not configured.", false, nil)
+		return types.ActionContinue
+	}
+
+	// Async fetch allowed models (reads memory cache or Redis)
+	config.permissionChecker.getUserAllowedModels(employeeNumber, func(models []string) {
+		// Ensure non-nil slice for JSON marshalling consistency
+		if models == nil {
+			models = []string{}
+		}
+		data := map[string]interface{}{
+			"employee_number": employeeNumber,
+			"models":          models,
+		}
+		sendJSONResponse(http.StatusOK, "ai-gateway.query_model_permission", "query model permission successful", true, data)
+	})
 
 	return types.ActionPause
 }
