@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/log"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
-	"github.com/higress-group/wasm-go/pkg/log"
-	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -26,7 +26,6 @@ const (
 	qwenDefaultDomain                     = "dashscope.aliyuncs.com"
 	qwenChatCompletionPath                = "/api/v1/services/aigc/text-generation/generation"
 	qwenTextEmbeddingPath                 = "/api/v1/services/embeddings/text-embedding/text-embedding"
-	qwenTextRerankPath                    = "/api/v1/services/rerank/text-rerank/text-rerank"
 	qwenCompatibleChatCompletionPath      = "/compatible-mode/v1/chat/completions"
 	qwenCompatibleCompletionsPath         = "/compatible-mode/v1/completions"
 	qwenCompatibleTextEmbeddingPath       = "/compatible-mode/v1/embeddings"
@@ -37,10 +36,6 @@ const (
 	qwenCompatibleRetrieveBatchPath       = "/compatible-mode/v1/batches/{batch_id}"
 	qwenBailianPath                       = "/api/v1/apps"
 	qwenMultimodalGenerationPath          = "/api/v1/services/aigc/multimodal-generation/generation"
-	qwenAnthropicMessagesPath             = "/api/v2/apps/claude-code-proxy/v1/messages"
-
-	qwenAsyncAIGCPath = "/api/v1/services/aigc/"
-	qwenAsyncTaskPath = "/api/v1/tasks/"
 
 	qwenTopPMin = 0.000001
 	qwenTopPMax = 0.999999
@@ -57,7 +52,7 @@ func (m *qwenProviderInitializer) ValidateConfig(config *ProviderConfig) error {
 	if len(config.qwenFileIds) != 0 && config.context != nil {
 		return errors.New("qwenFileIds and context cannot be configured at the same time")
 	}
-	if len(config.apiTokens) == 0 {
+	if config.apiTokens == nil || len(config.apiTokens) == 0 {
 		return errors.New("no apiToken found in provider config")
 	}
 	return nil
@@ -74,16 +69,11 @@ func (m *qwenProviderInitializer) DefaultCapabilities(qwenEnableCompatible bool)
 			string(ApiNameRetrieveFileContent): qwenCompatibleRetrieveFileContentPath,
 			string(ApiNameBatches):             qwenCompatibleBatchesPath,
 			string(ApiNameRetrieveBatch):       qwenCompatibleRetrieveBatchPath,
-			string(ApiNameAnthropicMessages):   qwenAnthropicMessagesPath,
 		}
 	} else {
 		return map[string]string{
-			string(ApiNameChatCompletion):    qwenChatCompletionPath,
-			string(ApiNameEmbeddings):        qwenTextEmbeddingPath,
-			string(ApiNameQwenAsyncAIGC):     qwenAsyncAIGCPath,
-			string(ApiNameQwenAsyncTask):     qwenAsyncTaskPath,
-			string(ApiNameQwenV1Rerank):      qwenTextRerankPath,
-			string(ApiNameAnthropicMessages): qwenAnthropicMessagesPath,
+			string(ApiNameChatCompletion): qwenChatCompletionPath,
+			string(ApiNameEmbeddings):     qwenTextEmbeddingPath,
 		}
 	}
 }
@@ -312,7 +302,7 @@ func (m *qwenProvider) buildChatCompletionResponse(ctx wrapper.HttpContext, qwen
 		message := qwenMessageToChatMessage(qwenChoice.Message, m.config.reasoningContentMode)
 		choices = append(choices, chatCompletionChoice{
 			Message:      &message,
-			FinishReason: util.Ptr(qwenChoice.FinishReason),
+			FinishReason: qwenChoice.FinishReason,
 		})
 	}
 	return &chatCompletionResponse{
@@ -322,7 +312,7 @@ func (m *qwenProvider) buildChatCompletionResponse(ctx wrapper.HttpContext, qwen
 		SystemFingerprint: "",
 		Object:            objectChatCompletion,
 		Choices:           choices,
-		Usage: &usage{
+		Usage: usage{
 			PromptTokens:     qwenResponse.Usage.InputTokens,
 			CompletionTokens: qwenResponse.Usage.OutputTokens,
 			TotalTokens:      qwenResponse.Usage.TotalTokens,
@@ -423,11 +413,11 @@ func (m *qwenProvider) buildChatCompletionStreamingResponse(ctx wrapper.HttpCont
 
 	if finished {
 		finishResponse := *&baseMessage
-		finishResponse.Choices = append(finishResponse.Choices, chatCompletionChoice{Delta: &chatMessage{}, FinishReason: util.Ptr(qwenChoice.FinishReason)})
+		finishResponse.Choices = append(finishResponse.Choices, chatCompletionChoice{Delta: &chatMessage{}, FinishReason: qwenChoice.FinishReason})
 
 		usageResponse := *&baseMessage
 		usageResponse.Choices = []chatCompletionChoice{{Delta: &chatMessage{}}}
-		usageResponse.Usage = &usage{
+		usageResponse.Usage = usage{
 			PromptTokens:     qwenResponse.Usage.InputTokens,
 			CompletionTokens: qwenResponse.Usage.OutputTokens,
 			TotalTokens:      qwenResponse.Usage.TotalTokens,
@@ -699,12 +689,6 @@ func (m *qwenProvider) GetApiName(path string) ApiName {
 	case strings.Contains(path, qwenTextEmbeddingPath),
 		strings.Contains(path, qwenCompatibleTextEmbeddingPath):
 		return ApiNameEmbeddings
-	case strings.Contains(path, qwenAsyncAIGCPath):
-		return ApiNameQwenAsyncAIGC
-	case strings.Contains(path, qwenAsyncTaskPath):
-		return ApiNameQwenAsyncTask
-	case strings.Contains(path, qwenTextRerankPath):
-		return ApiNameQwenV1Rerank
 	default:
 		return ""
 	}

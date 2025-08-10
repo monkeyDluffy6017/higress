@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
-	"github.com/higress-group/wasm-go/pkg/log"
-	"github.com/higress-group/wasm-go/pkg/wrapper"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/log"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 )
 
@@ -26,45 +26,28 @@ func (m *openaiProviderInitializer) ValidateConfig(config *ProviderConfig) error
 
 func (m *openaiProviderInitializer) DefaultCapabilities() map[string]string {
 	return map[string]string{
-		string(ApiNameCompletion):                           PathOpenAICompletions,
-		string(ApiNameChatCompletion):                       PathOpenAIChatCompletions,
-		string(ApiNameEmbeddings):                           PathOpenAIEmbeddings,
-		string(ApiNameImageGeneration):                      PathOpenAIImageGeneration,
-		string(ApiNameImageEdit):                            PathOpenAIImageEdit,
-		string(ApiNameImageVariation):                       PathOpenAIImageVariation,
-		string(ApiNameAudioSpeech):                          PathOpenAIAudioSpeech,
-		string(ApiNameModels):                               PathOpenAIModels,
-		string(ApiNameFiles):                                PathOpenAIFiles,
-		string(ApiNameRetrieveFile):                         PathOpenAIRetrieveFile,
-		string(ApiNameRetrieveFileContent):                  PathOpenAIRetrieveFileContent,
-		string(ApiNameBatches):                              PathOpenAIBatches,
-		string(ApiNameRetrieveBatch):                        PathOpenAIRetrieveBatch,
-		string(ApiNameCancelBatch):                          PathOpenAICancelBatch,
-		string(ApiNameResponses):                            PathOpenAIResponses,
-		string(ApiNameFineTuningJobs):                       PathOpenAIFineTuningJobs,
-		string(ApiNameRetrieveFineTuningJob):                PathOpenAIRetrieveFineTuningJob,
-		string(ApiNameFineTuningJobEvents):                  PathOpenAIFineTuningJobEvents,
-		string(ApiNameFineTuningJobCheckpoints):             PathOpenAIFineTuningJobCheckpoints,
-		string(ApiNameCancelFineTuningJob):                  PathOpenAICancelFineTuningJob,
-		string(ApiNameResumeFineTuningJob):                  PathOpenAIResumeFineTuningJob,
-		string(ApiNamePauseFineTuningJob):                   PathOpenAIPauseFineTuningJob,
-		string(ApiNameFineTuningCheckpointPermissions):      PathOpenAIFineTuningCheckpointPermissions,
-		string(ApiNameDeleteFineTuningCheckpointPermission): PathOpenAIFineDeleteTuningCheckpointPermission,
+		string(ApiNameCompletion):          PathOpenAICompletions,
+		string(ApiNameChatCompletion):      PathOpenAIChatCompletions,
+		string(ApiNameEmbeddings):          PathOpenAIEmbeddings,
+		string(ApiNameImageGeneration):     PathOpenAIImageGeneration,
+		string(ApiNameImageEdit):           PathOpenAIImageEdit,
+		string(ApiNameImageVariation):      PathOpenAIImageVariation,
+		string(ApiNameAudioSpeech):         PathOpenAIAudioSpeech,
+		string(ApiNameModels):              PathOpenAIModels,
+		string(ApiNameFiles):               PathOpenAIFiles,
+		string(ApiNameRetrieveFile):        PathOpenAIRetrieveFile,
+		string(ApiNameRetrieveFileContent): PathOpenAIRetrieveFileContent,
+		string(ApiNameBatches):             PathOpenAIBatches,
+		string(ApiNameRetrieveBatch):       PathOpenAIRetrieveBatch,
+		string(ApiNameCancelBatch):         PathOpenAICancelBatch,
 	}
 }
 
-// isDirectPath checks if the path is a known standard OpenAI interface path.
 func isDirectPath(path string) bool {
 	return strings.HasSuffix(path, "/completions") ||
 		strings.HasSuffix(path, "/embeddings") ||
 		strings.HasSuffix(path, "/audio/speech") ||
-		strings.HasSuffix(path, "/images/generations") ||
-		strings.HasSuffix(path, "/images/variations") ||
-		strings.HasSuffix(path, "/images/edits") ||
-		strings.HasSuffix(path, "/models") ||
-		strings.HasSuffix(path, "/responses") ||
-		strings.HasSuffix(path, "/fine_tuning/jobs") ||
-		strings.HasSuffix(path, "/fine_tuning/checkpoints")
+		strings.HasSuffix(path, "/images/generations")
 }
 
 func (m *openaiProviderInitializer) CreateProvider(config ProviderConfig) (Provider, error) {
@@ -118,12 +101,15 @@ func (m *openaiProvider) OnRequestHeaders(ctx wrapper.HttpContext, apiName ApiNa
 }
 
 func (m *openaiProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiName ApiName, headers http.Header) {
-	if m.isDirectCustomPath {
-		util.OverwriteRequestPathHeader(headers, m.customPath)
-	} else if apiName != "" {
+	if m.customPath != "" {
+		if m.isDirectCustomPath || apiName == "" {
+			util.OverwriteRequestPathHeader(headers, m.customPath)
+		} else {
+			util.OverwriteRequestPathHeaderByCapability(headers, string(apiName), m.config.capabilities)
+		}
+	} else {
 		util.OverwriteRequestPathHeaderByCapability(headers, string(apiName), m.config.capabilities)
 	}
-
 	if m.customDomain != "" {
 		util.OverwriteRequestHostHeader(headers, m.customDomain)
 	} else {

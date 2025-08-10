@@ -11,10 +11,8 @@ import (
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/config"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/provider"
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
-
-	"github.com/higress-group/wasm-go/pkg/log"
-	"github.com/higress-group/wasm-go/pkg/wrapper"
-
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/log"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/tidwall/gjson"
@@ -25,28 +23,9 @@ const (
 	pluginName = "ai-proxy"
 
 	defaultMaxBodyBytes uint32 = 100 * 1024 * 1024
-
-	ctxOriginalPath = "original_path"
-	ctxOriginalHost = "original_host"
-	ctxOriginalAuth = "original_auth"
 )
 
-var (
-	headersCtxKeyMapping = map[string]string{
-		util.HeaderAuthority:     ctxOriginalHost,
-		util.HeaderPath:          ctxOriginalPath,
-		util.HeaderAuthorization: ctxOriginalAuth,
-	}
-	headerToOriginalHeaderMapping = map[string]string{
-		util.HeaderAuthority:     util.HeaderOriginalHost,
-		util.HeaderPath:          util.HeaderOriginalPath,
-		util.HeaderAuthorization: util.HeaderOriginalAuth,
-	}
-)
-
-func main() {}
-
-func init() {
+func main() {
 	wrapper.SetCtx(
 		pluginName,
 		wrapper.ParseOverrideConfig(parseGlobalConfig, parseOverrideRuleConfig),
@@ -92,59 +71,54 @@ func parseOverrideRuleConfig(json gjson.Result, global config.PluginConfig, plug
 	return nil
 }
 
-func initContext(ctx wrapper.HttpContext) {
-	for header, ctxKey := range headersCtxKeyMapping {
-		value, _ := proxywasm.GetHttpRequestHeader(header)
-		ctx.SetContext(ctxKey, value)
-	}
-	for _, originHeader := range headerToOriginalHeaderMapping {
-		proxywasm.RemoveHttpRequestHeader(originHeader)
-	}
-}
-
-func saveContextsToHeaders(ctx wrapper.HttpContext) {
-	for header, ctxKey := range headersCtxKeyMapping {
-		originalValue := ctx.GetStringContext(ctxKey, "")
-		if originalValue == "" {
-			continue
-		}
-		currentValue, _ := proxywasm.GetHttpRequestHeader(header)
-		if currentValue == "" || originalValue == currentValue {
-			continue
-		}
-		originalHeader := headerToOriginalHeaderMapping[header]
-		if originalHeader != "" {
-			_ = proxywasm.ReplaceHttpRequestHeader(originalHeader, originalValue)
-		}
-	}
-}
-
 func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConfig) types.Action {
-	activeProvider := pluginConfig.GetProvider()
-
-	if activeProvider == nil {
-		log.Debugf("[onHttpRequestHeader] no active provider, skip processing")
-		ctx.DontReadRequestBody()
-		return types.ActionContinue
-	}
-
-	log.Debugf("[onHttpRequestHeader] provider=%s", activeProvider.GetProviderType())
-
-	// Disable the route re-calculation since the plugin may modify some headers related to the chosen route.
-	ctx.DisableReroute()
-
-	initContext(ctx)
-
 	rawPath := ctx.Path()
-
-	defer func() {
-		saveContextsToHeaders(ctx)
-	}()
-
 	path, _ := url.Parse(rawPath)
 	apiName := getApiName(path.Path)
-	providerConfig := pluginConfig.GetProviderConfig()
-	if providerConfig.IsOriginal() {
+
+	// Get model name from request for provider selection
+	if contentType, _ := proxywasm.GetHttpRequestHeader(util.HeaderContentType); contentType != "" && strings.Contains(contentType, util.MimeTypeApplicationJson) {
+		// For requests with body, we'll extract model in onHttpRequestBody
+		// For now, use a placeholder to avoid null provider
+		if len(pluginConfig.GetProviderConfigs()) > 0 {
+			ctx.SetContext("needs_model_extraction", true)
+		}
+	}
+
+	// Try to get active provider first (for legacy single provider configuration)
+	activeProviderConfig := pluginConfig.GetProviderConfig()
+	var activeProvider provider.Provider
+
+	if activeProviderConfig != nil {
+		// Legacy single provider configuration
+		activeProvider = pluginConfig.GetProvider()
+	} else {
+		// Multi-provider configuration - we'll determine the provider later based on model
+		// Use first provider as temporary fallback
+		providerConfigs := pluginConfig.GetProviderConfigs()
+		if len(providerConfigs) == 0 {
+			log.Debugf("[onHttpRequestHeader] no providers configured, skip processing")
+			ctx.DontReadRequestBody()
+			return types.ActionContinue
+		}
+
+		// Store provider configs in context for later use
+		ctx.SetContext("providerConfigs", providerConfigs)
+	}
+
+	// If we have a selected provider, continue with it
+	if activeProvider != nil {
+		log.Debugf("[onHttpRequestHeader] using provider=%s", activeProvider.GetProviderType())
+
+		// Store provider info in context
+		ctx.SetContext("activeProvider", activeProvider)
+		ctx.SetContext("activeProviderConfig", activeProviderConfig)
+	} else {
+		log.Debugf("[onHttpRequestHeader] multi-provider mode, will select provider based on model")
+	}
+
+	// Handle protocol checking for existing provider
+	if activeProviderConfig != nil && activeProviderConfig.IsOriginal() {
 		if handler, ok := activeProvider.(provider.ApiNameHandler); ok {
 			apiName = handler.GetApiName(path.Path)
 		}
@@ -162,67 +136,127 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 	}
 
 	ctx.SetContext(provider.CtxKeyApiName, apiName)
+	// Disable the route re-calculation since the plugin may modify some headers related to the chosen route.
+	ctx.DisableReroute()
 
 	// Always remove the Accept-Encoding header to prevent the LLM from sending compressed responses,
 	// allowing plugins to inspect or modify the response correctly
 	_ = proxywasm.RemoveHttpRequestHeader("Accept-Encoding")
 
-	if handler, ok := activeProvider.(provider.RequestHeadersHandler); ok {
-		// Set the apiToken for the current request.
-		providerConfig.SetApiTokenInUse(ctx)
-		// Set available apiTokens of current request in the context, will be used in the retryOnFailure
-		providerConfig.SetAvailableApiTokens(ctx)
+	// If we have an active provider, process headers immediately
+	if activeProvider != nil && activeProviderConfig != nil {
+		if handler, ok := activeProvider.(provider.RequestHeadersHandler); ok {
+			// Set the apiToken for the current request.
+			activeProviderConfig.SetApiTokenInUse(ctx)
+			// Set available apiTokens of current request in the context, will be used in the retryOnFailure
+			activeProviderConfig.SetAvailableApiTokens(ctx)
 
-		// save the original request host and path in case they are needed for apiToken health check and retry
-		ctx.SetContext(provider.CtxRequestHost, wrapper.GetRequestHost())
-		ctx.SetContext(provider.CtxRequestPath, wrapper.GetRequestPath())
+			// save the original request host and path in case they are needed for apiToken health check and retry
+			ctx.SetContext(provider.CtxRequestHost, wrapper.GetRequestHost())
+			ctx.SetContext(provider.CtxRequestPath, wrapper.GetRequestPath())
 
-		err := handler.OnRequestHeaders(ctx, apiName)
-		if err != nil {
-			_ = util.ErrorHandler("ai-proxy.proc_req_headers_failed", fmt.Errorf("failed to process request headers: %v", err))
+			err := handler.OnRequestHeaders(ctx, apiName)
+			if err != nil {
+				_ = util.ErrorHandler("ai-proxy.proc_req_headers_failed", fmt.Errorf("failed to process request headers: %v", err))
+				return types.ActionContinue
+			}
+
+			hasRequestBody := wrapper.HasRequestBody()
+			if hasRequestBody {
+				_ = proxywasm.RemoveHttpRequestHeader("Content-Length")
+				ctx.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
+				// Delay the header processing to allow changing in OnRequestBody
+				return types.HeaderStopIteration
+			}
+			ctx.DontReadRequestBody()
 			return types.ActionContinue
 		}
-
+	} else {
+		// Multi-provider mode: need to read body to extract model
 		hasRequestBody := wrapper.HasRequestBody()
 		if hasRequestBody {
 			_ = proxywasm.RemoveHttpRequestHeader("Content-Length")
 			ctx.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
-			// Delay the header processing to allow changing in OnRequestBody
 			return types.HeaderStopIteration
 		}
 		ctx.DontReadRequestBody()
-		return types.ActionContinue
 	}
 
 	return types.ActionContinue
 }
 
 func onHttpRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, body []byte) types.Action {
-	activeProvider := pluginConfig.GetProvider()
+	// Try to get provider from context (set in header phase)
+	var activeProvider provider.Provider
+	var activeProviderConfig *provider.ProviderConfig
+
+	if providerInstance, ok := ctx.GetContext("activeProvider").(provider.Provider); ok {
+		// Legacy single provider mode
+		activeProvider = providerInstance
+		if config, ok := ctx.GetContext("activeProviderConfig").(*provider.ProviderConfig); ok {
+			activeProviderConfig = config
+		}
+	} else {
+		// Multi-provider mode: select provider based on model in request
+		if needsExtraction, _ := ctx.GetContext("needs_model_extraction").(bool); needsExtraction {
+			// Extract model name from request body
+			modelName := gjson.GetBytes(body, "model").String()
+			if modelName != "" {
+				log.Debugf("[onHttpRequestBody] extracted model name: %s", modelName)
+
+				// Select provider based on model
+				selectedConfig, selectedProvider := pluginConfig.GetProviderForModel(modelName)
+				if selectedConfig != nil && selectedProvider != nil {
+					activeProviderConfig = selectedConfig
+					activeProvider = selectedProvider
+
+					log.Debugf("[onHttpRequestBody] selected provider=%s for model=%s", selectedProvider.GetProviderType(), modelName)
+
+					// Set up the selected provider (similar to header phase)
+					activeProviderConfig.SetApiTokenInUse(ctx)
+					activeProviderConfig.SetAvailableApiTokens(ctx)
+					ctx.SetContext("requestHost", wrapper.GetRequestHost())
+					ctx.SetContext("requestPath", wrapper.GetRequestPath())
+
+					// Process request headers for the selected provider
+					if handler, ok := selectedProvider.(provider.RequestHeadersHandler); ok {
+						apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
+						err := handler.OnRequestHeaders(ctx, apiName)
+						if err != nil {
+							log.Errorf("failed to process request headers for provider %s: %v", selectedProvider.GetProviderType(), err)
+							_ = util.ErrorHandler("ai-proxy.proc_req_headers_failed", fmt.Errorf("failed to process request headers: %v", err))
+							return types.ActionContinue
+						}
+					}
+				} else {
+					log.Warnf("[onHttpRequestBody] no provider can handle model: %s", modelName)
+					return types.ActionContinue
+				}
+			} else {
+				log.Warnf("[onHttpRequestBody] no model found in request body")
+				return types.ActionContinue
+			}
+		}
+	}
 
 	if activeProvider == nil {
 		log.Debugf("[onHttpRequestBody] no active provider, skip processing")
 		return types.ActionContinue
 	}
-	log.Debugf("[onHttpRequestBody] provider=%s", activeProvider.GetProviderType())
 
-	defer func() {
-		saveContextsToHeaders(ctx)
-	}()
+	log.Debugf("[onHttpRequestBody] provider=%s", activeProvider.GetProviderType())
 
 	if handler, ok := activeProvider.(provider.RequestBodyHandler); ok {
 		apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
-		providerConfig := pluginConfig.GetProviderConfig()
 		// If retryOnFailure is enabled, save the transformed body to the context in case of retry
-		if providerConfig.IsRetryOnFailureEnabled() {
-			ctx.SetContext(provider.CtxRequestBody, body)
+		if activeProviderConfig.IsRetryOnFailureEnabled() {
+			ctx.SetContext("requestBody", body)
 		}
-		newBody, settingErr := providerConfig.ReplaceByCustomSettings(body)
+		newBody, settingErr := activeProviderConfig.ReplaceByCustomSettings(body)
 		if settingErr != nil {
 			log.Errorf("failed to replace request body by custom settings: %v", settingErr)
 		}
-		// 仅 /v1/chat/completions 和 /v1/completions 接口支持 stream_options 参数
-		if providerConfig.IsOpenAIProtocol() && (apiName == provider.ApiNameChatCompletion || apiName == provider.ApiNameCompletion) {
+		if activeProviderConfig.IsOpenAIProtocol() {
 			newBody = normalizeOpenAiRequestBody(newBody)
 		}
 		log.Debugf("[onHttpRequestBody] newBody=%s", newBody)
@@ -270,7 +304,7 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, pluginConfig config.PluginCo
 	// the apiToken is removed only when the number of consecutive request failures exceeds the threshold.
 	providerConfig.ResetApiTokenRequestFailureCount(apiTokenInUse)
 
-	headers := util.GetResponseHeaders()
+	headers := util.GetOriginalResponseHeaders()
 	if handler, ok := activeProvider.(provider.TransformResponseHeadersHandler); ok {
 		apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
 		handler.TransformResponseHeaders(ctx, apiName, headers)
@@ -376,7 +410,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfi
 func normalizeOpenAiRequestBody(body []byte) []byte {
 	var err error
 	// Default setting include_usage.
-	if gjson.GetBytes(body, "stream").Bool() && (!gjson.GetBytes(body, "stream_options").Exists() || !gjson.GetBytes(body, "stream_options.include_usage").Exists()) {
+	if gjson.GetBytes(body, "stream").Bool() {
 		body, err = sjson.SetBytes(body, "stream_options.include_usage", true)
 		if err != nil {
 			log.Errorf("set include_usage failed, err:%s", err)
@@ -398,28 +432,28 @@ func checkStream(ctx wrapper.HttpContext) {
 
 func getApiName(path string) provider.ApiName {
 	// openai style
-	if strings.HasSuffix(path, provider.PathOpenAIChatCompletions) {
+	if strings.HasSuffix(path, "/v1/chat/completions") {
 		return provider.ApiNameChatCompletion
 	}
-	if strings.HasSuffix(path, provider.PathOpenAICompletions) {
+	if strings.HasSuffix(path, "/v1/completions") {
 		return provider.ApiNameCompletion
 	}
-	if strings.HasSuffix(path, provider.PathOpenAIEmbeddings) {
+	if strings.HasSuffix(path, "/v1/embeddings") {
 		return provider.ApiNameEmbeddings
 	}
-	if strings.HasSuffix(path, provider.PathOpenAIAudioSpeech) {
+	if strings.HasSuffix(path, "/v1/audio/speech") {
 		return provider.ApiNameAudioSpeech
 	}
-	if strings.HasSuffix(path, provider.PathOpenAIImageGeneration) {
+	if strings.HasSuffix(path, "/v1/images/generations") {
 		return provider.ApiNameImageGeneration
 	}
-	if strings.HasSuffix(path, provider.PathOpenAIImageVariation) {
+	if strings.HasSuffix(path, "/v1/images/variations") {
 		return provider.ApiNameImageVariation
 	}
-	if strings.HasSuffix(path, provider.PathOpenAIImageEdit) {
+	if strings.HasSuffix(path, "/v1/images/edits") {
 		return provider.ApiNameImageEdit
 	}
-	if strings.HasSuffix(path, provider.PathOpenAIBatches) {
+	if strings.HasSuffix(path, "/v1/batches") {
 		return provider.ApiNameBatches
 	}
 	if util.RegRetrieveBatchPath.MatchString(path) {
@@ -428,7 +462,7 @@ func getApiName(path string) provider.ApiName {
 	if util.RegCancelBatchPath.MatchString(path) {
 		return provider.ApiNameCancelBatch
 	}
-	if strings.HasSuffix(path, provider.PathOpenAIFiles) {
+	if strings.HasSuffix(path, "/v1/files") {
 		return provider.ApiNameFiles
 	}
 	if util.RegRetrieveFilePath.MatchString(path) {
@@ -437,58 +471,11 @@ func getApiName(path string) provider.ApiName {
 	if util.RegRetrieveFileContentPath.MatchString(path) {
 		return provider.ApiNameRetrieveFileContent
 	}
-	if strings.HasSuffix(path, provider.PathOpenAIModels) {
+	if strings.HasSuffix(path, "/v1/models") {
 		return provider.ApiNameModels
 	}
-	if strings.HasSuffix(path, provider.PathOpenAIFineTuningJobs) {
-		return provider.ApiNameFineTuningJobs
-	}
-	if util.RegRetrieveFineTuningJobPath.MatchString(path) {
-		return provider.ApiNameRetrieveFineTuningJob
-	}
-	if util.RegRetrieveFineTuningJobEventsPath.MatchString(path) {
-		return provider.ApiNameFineTuningJobEvents
-	}
-	if util.RegRetrieveFineTuningJobCheckpointsPath.MatchString(path) {
-		return provider.ApiNameFineTuningJobCheckpoints
-	}
-	if util.RegCancelFineTuningJobPath.MatchString(path) {
-		return provider.ApiNameCancelFineTuningJob
-	}
-	if util.RegResumeFineTuningJobPath.MatchString(path) {
-		return provider.ApiNameResumeFineTuningJob
-	}
-	if util.RegPauseFineTuningJobPath.MatchString(path) {
-		return provider.ApiNamePauseFineTuningJob
-	}
-	if util.RegFineTuningCheckpointPermissionPath.MatchString(path) {
-		return provider.ApiNameFineTuningCheckpointPermissions
-	}
-	if util.RegDeleteFineTuningCheckpointPermissionPath.MatchString(path) {
-		return provider.ApiNameDeleteFineTuningCheckpointPermission
-	}
-	if strings.HasSuffix(path, provider.PathOpenAIResponses) {
-		return provider.ApiNameResponses
-	}
-
-	// Anthropic
-	if strings.HasSuffix(path, provider.PathAnthropicMessages) {
-		return provider.ApiNameAnthropicMessages
-	}
-	if strings.HasSuffix(path, provider.PathAnthropicComplete) {
-		return provider.ApiNameAnthropicComplete
-	}
-
-	// Gemini
-	if util.RegGeminiGenerateContent.MatchString(path) {
-		return provider.ApiNameGeminiGenerateContent
-	}
-	if util.RegGeminiStreamGenerateContent.MatchString(path) {
-		return provider.ApiNameGeminiStreamGenerateContent
-	}
-
 	// cohere style
-	if strings.HasSuffix(path, provider.PathCohereV1Rerank) {
+	if strings.HasSuffix(path, "/v1/rerank") {
 		return provider.ApiNameCohereV1Rerank
 	}
 	return ""

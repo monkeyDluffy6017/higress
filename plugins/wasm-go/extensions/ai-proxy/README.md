@@ -1,69 +1,62 @@
 ---
-title: AI 代理
-keywords: [AI网关, AI代理]
-description: AI 代理插件配置参考
+title: AI Proxy
+keywords: [AI Gateway, AI Proxy]
+description: Reference for configuring the AI Proxy plugin
 ---
 
-## 功能说明
+## Function Description
 
-`AI 代理`插件实现了基于 OpenAI API 契约的 AI 代理功能。目前支持 OpenAI、Azure OpenAI、月之暗面（Moonshot）和通义千问等 AI
-服务提供商。
+The `AI Proxy` plugin implements AI proxy functionality based on the OpenAI API contract. It currently supports AI service providers such as OpenAI, Azure OpenAI, Moonshot, and Qwen.
 
-> **注意：**
+> **Note:**
 
-> 请求路径后缀匹配 `/v1/chat/completions` 时，对应文生文场景，会用 OpenAI 的文生文协议解析请求 Body，再转换为对应 LLM 厂商的文生文协议
+> When the request path suffix matches `/v1/chat/completions`, it corresponds to text-to-text scenarios. The request body will be parsed using OpenAI's text-to-text protocol and then converted to the corresponding LLM vendor's text-to-text protocol.
 
-> 请求路径后缀匹配 `/v1/embeddings` 时，对应文本向量场景，会用 OpenAI 的文本向量协议解析请求 Body，再转换为对应 LLM 厂商的文本向量协议
+> When the request path suffix matches `/v1/embeddings`, it corresponds to text vector scenarios. The request body will be parsed using OpenAI's text vector protocol and then converted to the corresponding LLM vendor's text vector protocol.
 
-## 运行属性
+## Execution Properties
+Plugin execution phase: `Default Phase`
+Plugin execution priority: `100`
 
-插件执行阶段：`默认阶段`
-插件执行优先级：`100`
 
-## 配置字段
+## Configuration Fields
 
-### 基本配置
+### Basic Configuration
 
-| 名称       | 数据类型 | 填写要求 | 默认值 | 描述                         |
-| ---------- | -------- | -------- | ------ | ---------------------------- |
-| `provider` | object   | 必填     | -      | 配置目标 AI 服务提供商的信息 |
+| Name       | Data Type   | Requirement | Default | Description               |
+|------------|--------|------|-----|------------------|
+| `provider` | object | Required   | -   | Configures information for the target AI service provider |
 
-`provider`的配置字段说明如下：
+**Details for the `provider` configuration fields:**
 
-| 名称                   | 数据类型               | 填写要求 | 默认值 | 描述                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| ---------------------- | ---------------------- | -------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------   |
-| `type`                 | string                 | 必填     | -      | AI 服务提供商名称                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `apiTokens`            | array of string        | 非必填   | -      | 用于在访问 AI 服务时进行认证的令牌。如果配置了多个 token，插件会在请求时随机进行选择。部分服务提供商只支持配置一个 token。                                                                                                                                                                                                                                                                                                                 |
-| `timeout`              | number                 | 非必填   | -      | 访问 AI 服务的超时时间。单位为毫秒。默认值为 120000，即 2 分钟。此项配置目前仅用于获取上下文信息，并不影响实际转发大模型请求。                                                                                                                                                                                                                                                                                                             |
-| `modelMapping`         | map of string          | 非必填   | -      | AI 模型映射表，用于将请求中的模型名称映射为服务提供商支持模型名称。<br/>1. 支持前缀匹配。例如用 "gpt-3-\*" 匹配所有名称以“gpt-3-”开头的模型；<br/>2. 支持使用 "\*" 为键来配置通用兜底映射关系；<br/>3. 如果映射的目标名称为空字符串 ""，则表示保留原模型名称。<br/>4. 支持以 `~` 前缀使用正则匹配。例如用 "~gpt(.\*)" 匹配所有以 "gpt" 开头的模型并支持在目标模型中使用 capture group 引用匹配到的内容。示例: "~gpt(.\*): openai/gpt\$1" |
-| `protocol`             | string                 | 非必填   | -      | 插件对外提供的 API 接口契约。目前支持以下取值：openai（默认值，使用 OpenAI 的接口契约）、original（使用目标服务提供商的原始接口契约）                                                                                                                                                                                                                                                                                                      |
-| `context`              | object                 | 非必填   | -      | 配置 AI 对话上下文信息                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `customSettings`       | array of customSetting | 非必填   | -      | 为 AI 请求指定覆盖或者填充参数                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `failover`             | object                 | 非必填   | -      | 配置 apiToken 的 failover 策略，当 apiToken 不可用时，将其移出 apiToken 列表，待健康检测通过后重新添加回 apiToken 列表                                                                                                                                                                                                                                                                                                                     |
-| `retryOnFailure`       | object                 | 非必填   | -      | 当请求失败时立即进行重试                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `reasoningContentMode` | string                 | 非必填   | -      | 如何处理大模型服务返回的推理内容。目前支持以下取值：passthrough（正常输出推理内容）、ignore（不输出推理内容）、concat（将推理内容拼接在常规输出内容之前）。默认为 passthrough。仅支持通义千问服务。                                                                                                                                                                                                                                        |
-| `capabilities`         | map of string          | 非必填   | -      | 部分 provider 的部分 ai 能力原生兼容 openai/v1 格式，不需要重写，可以直接转发，通过此配置项指定来开启转发, key 表示的是采用的厂商协议能力，values 表示的真实的厂商该能力的 api path, 厂商协议能力当前支持: openai/v1/chatcompletions, openai/v1/embeddings, openai/v1/imagegeneration, openai/v1/audiospeech, cohere/v1/rerank                                                                                                             |
-| `subPath`              | string                 | 非必填   | -      | 如果配置了subPath，将会先移除请求path中该前缀，再进行后续处理                                                                                                                                                                                                                                                                                                                                                                              |
+| Name           | Data Type        | Requirement | Default | Description                                                                                                                                                                                                                                                           |
+| -------------- | --------------- | -------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------                                                                                                  |
+| `type`         | string          | Required     | -      | Name of the AI service provider                                                                                                                                                                                                                                              |
+| `apiTokens`    | array of string | Optional   | -      | Tokens used for authentication when accessing AI services. If multiple tokens are configured, the plugin randomly selects one for each request. Some service providers only support configuring a single token.                                                                                                                                     |
+| `timeout`      | number          | Optional   | -      | Timeout for accessing AI services, in milliseconds. The default value is 120000, which equals 2 minutes. Only used when retrieving context data. Won't affect the request forwarded to the LLM upstream.                                                                                                                                                                              |
+| `modelMapping` | map of string   | Optional   | -      | Mapping table for AI models, used to map model names in requests to names supported by the service provider.<br/>1. Supports prefix matching. For example, "gpt-3-\*" matches all model names starting with “gpt-3-”;<br/>2. Supports using "\*" as a key for a general fallback mapping;<br/>3. If the mapped target name is an empty string "", the original model name is preserved. |
+| `protocol`     | string          | Optional   | -      | API contract provided by the plugin. Currently supports the following values: openai (default, uses OpenAI's interface contract), original (uses the raw interface contract of the target service provider)                                                                                                                          |
+| `context`      | object          | Optional   | -      | Configuration for AI conversation context information                                                                                                                                                                                                                                         |
+| `customSettings` | array of customSetting | Optional   | -      | Specifies overrides or fills parameters for AI requests                                                                                                                                                                                                                                 |
 
-`context`的配置字段说明如下：
+**Details for the `context` configuration fields:**
 
-| 名称          | 数据类型 | 填写要求 | 默认值 | 描述                                                     |
-| ------------- | -------- | -------- | ------ | -------------------------------------------------------- |
-| `fileUrl`     | string   | 必填     | -      | 保存 AI 对话上下文的文件 URL。仅支持纯文本类型的文件内容 |
-| `serviceName` | string   | 必填     | -      | URL 所对应的 Higress 后端服务完整名称                    |
-| `servicePort` | number   | 必填     | -      | URL 所对应的 Higress 后端服务访问端口                    |
+| Name            | Data Type   | Requirement | Default | Description                               |
+|---------------|--------|------|-----|----------------------------------|
+| `fileUrl`     | string | Required   | -   | File URL to save AI conversation context. Only supports file content of plain text type |
+| `serviceName` | string | Required   | -   | Full name of the Higress backend service corresponding to the URL        |
+| `servicePort` | number | Required   | -   | Port for accessing the Higress backend service corresponding to the URL        |
 
-`customSettings`的配置字段说明如下：
+**Details for the `customSettings` configuration fields:**
 
-| 名称        | 数据类型              | 填写要求 | 默认值 | 描述                                                                                                                         |
+| Name        | Data Type              | Requirement | Default | Description                                                                                                                         |
 | ----------- | --------------------- | -------- | ------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| `name`      | string                | 必填     | -      | 想要设置的参数的名称，例如`max_tokens`                                                                                       |
-| `value`     | string/int/float/bool | 必填     | -      | 想要设置的参数的值，例如 0                                                                                                   |
-| `mode`      | string                | 非必填   | "auto" | 参数设置的模式，可以设置为"auto"或者"raw"，如果为"auto"则会自动根据协议对参数名做改写，如果为"raw"则不会有任何改写和限制检查 |
-| `overwrite` | bool                  | 非必填   | true   | 如果为 false 则只在用户没有设置这个参数时填充参数，否则会直接覆盖用户原有的参数设置                                          |
+| `name`      | string                | Required     | -      | Name of the parameter to set, e.g., `max_tokens`                                                                                       |
+| `value`     | string/int/float/bool | Required     | -      | Value of the parameter to set, e.g., 0                                                                                                    |
+| `mode`      | string                | Optional   | "auto" | Mode for setting the parameter, can be set to "auto" or "raw"; if "auto", the parameter name will be automatically rewritten based on the protocol; if "raw", no rewriting or restriction checks will be applied |
+| `overwrite` | bool                  | Optional   | true   | If false, the parameter is only filled if the user has not set it; otherwise, it directly overrides the user's existing parameter settings                                            |
 
-custom-setting 会遵循如下表格，根据`name`和协议来替换对应的字段，用户需要填写表格中`settingName`列中存在的值。例如用户将`name`设置为`max_tokens`，在 openai 协议中会替换`max_tokens`，在 gemini 中会替换`maxOutputTokens`。
-`none`表示该协议不支持此参数。如果`name`不在此表格中或者对应协议不支持此参数，同时没有设置 raw 模式，则配置不会生效。
+The `custom-setting` adheres to the following table, replacing the corresponding field based on `name` and protocol. Users need to fill in values from the `settingName` column that exists in the table. For instance, if a user sets `name` to `max_tokens`, in the openai protocol, it replaces `max_tokens`; for gemini, it replaces `maxOutputTokens`. `"none"` indicates that the protocol does not support this parameter. If `name` is not in this table or the corresponding protocol does not support the parameter, and "raw" mode is not set, the configuration will not take effect.
 
 | settingName | openai      | baidu             | spark       | qwen        | gemini          | hunyuan     | claude      | minimax            |
 | ----------- | ----------- | ----------------- | ----------- | ----------- | --------------- | ----------- | ----------- | ------------------ |
@@ -73,227 +66,155 @@ custom-setting 会遵循如下表格，根据`name`和协议来替换对应的�
 | top_k       | none        | none              | top_k       | none        | topK            | none        | top_k       | none               |
 | seed        | seed        | none              | none        | seed        | none            | none        | none        | none               |
 
-如果启用了 raw 模式，custom-setting 会直接用输入的`name`和`value`去更改请求中的 json 内容，而不对参数名称做任何限制和修改。
-对于大多数协议，custom-setting 都会在 json 内容的根路径修改或者填充参数。对于`qwen`协议，ai-proxy 会在 json 的`parameters`子路径下做配置。对于`gemini`协议，则会在`generation_config`子路径下做配置。
+If raw mode is enabled, `custom-setting` will directly alter the JSON content using the input `name` and `value`, without any restrictions or modifications to the parameter names.
+For most protocols, `custom-setting` modifies or fills parameters at the root path of the JSON content. For the `qwen` protocol, ai-proxy configures under the `parameters` subpath. For the `gemini` protocol, it configures under the `generation_config` subpath.
 
-`failover` 的配置字段说明如下：
-
-| 名称                | 数据类型        | 填写要求             | 默认值         | 描述                                                     |
-| ------------------- | --------------- | -------------------- | -------------- | -------------------------------------------------------- |
-| enabled             | bool            | 非必填               | false          | 是否启用 apiToken 的 failover 机制                       |
-| failureThreshold    | int             | 非必填               | 3              | 触发 failover 连续请求失败的阈值（次数）                 |
-| successThreshold    | int             | 非必填               | 1              | 健康检测的成功阈值（次数）                               |
-| healthCheckInterval | int             | 非必填               | 5000           | 健康检测的间隔时间，单位毫秒                             |
-| healthCheckTimeout  | int             | 非必填               | 5000           | 健康检测的超时时间，单位毫秒                             |
-| healthCheckModel    | string          | 启用 failover 时必填 |                | 健康检测使用的模型                                       |
-| failoverOnStatus    | array of string | 非必填               | ["4.*", "5.*"] | 需要进行 failover 的原始请求的状态码，支持正则表达式匹配 |
-
-`retryOnFailure` 的配置字段说明如下：
-
-目前仅支持对非流式请求进行重试。
-
-| 名称          | 数据类型        | 填写要求 | 默认值         | 描述                                               |
-| ------------- | --------------- | -------- | -------------- | -------------------------------------------------- |
-| enabled       | bool            | 非必填   | false          | 是否启用失败请求重试                               |
-| maxRetries    | int             | 非必填   | 1              | 最大重试次数                                       |
-| retryTimeout  | int             | 非必填   | 30000          | 重试超时时间，单位毫秒                             |
-| retryOnStatus | array of string | 非必填   | ["4.*", "5.*"] | 需要进行重试的原始请求的状态码，支持正则表达式匹配 |
-
-### 提供商特有配置
+### Provider-Specific Configurations
 
 #### OpenAI
 
-OpenAI 所对应的 `type` 为 `openai`。它特有的配置字段如下:
+For OpenAI, the corresponding `type` is `openai`. Its unique configuration fields include:
 
-| 名称                 | 数据类型 | 填写要求 | 默认值 | 描述                                                                               |
-| -------------------- | -------- | -------- | ------ | ---------------------------------------------------------------------------------- |
-| `openaiCustomUrl`    | string   | 非必填   | -      | 基于 OpenAI 协议的自定义后端 URL，例如: <www.example.com/myai/v1/chat/completions> |
-| `responseJsonSchema` | object   | 非必填   | -      | 预先定义 OpenAI 响应需满足的 Json Schema, 注意目前仅特定的几种模型支持该用法       |
+| Name              | Data Type | Requirement | Default | Description                                                                          |
+|-------------------|----------|----------|--------|-------------------------------------------------------------------------------|
+| `openaiCustomUrl` | string   | Optional   | -      | Custom backend URL based on the OpenAI protocol, e.g., www.example.com/myai/v1/chat/completions |
+| `responseJsonSchema` | object | Optional | - | Predefined Json Schema that OpenAI responses must adhere to; note that currently only a few specific models support this usage|
 
 #### Azure OpenAI
 
-Azure OpenAI 所对应的 `type` 为 `azure`。它特有的配置字段如下：
+For Azure OpenAI, the corresponding `type` is `azure`. Its unique configuration field is:
 
-| 名称              | 数据类型 | 填写要求 | 默认值 | 描述                                                     |
-| ----------------- | -------- | -------- | ------ | -------------------------------------------------------- |
-| `azureServiceUrl` | string   | 必填     | -      | Azure OpenAI 服务的 URL，须包含 `api-version` 查询参数。 |
+| Name                 | Data Type   | Filling Requirements | Default Value | Description                                                                                                    |
+|---------------------|-------------|----------------------|---------------|---------------------------------------------------------------------------------------------------------------|
+| `azureServiceUrl`   | string      | Required             | -             | The URL of the Azure OpenAI service, must include the `api-version` query parameter.                           |
 
-**注意：** Azure OpenAI 只支持配置一个 API Token。
+**Note:** Azure OpenAI only supports configuring one API Token.
 
-#### 月之暗面（Moonshot）
+#### Moonshot
 
-月之暗面所对应的 `type` 为 `moonshot`。它特有的配置字段如下：
+For Moonshot, the corresponding `type` is `moonshot`. Its unique configuration field is:
 
-| 名称             | 数据类型 | 填写要求 | 默认值 | 描述                                                                                                 |
-| ---------------- | -------- | -------- | ------ | ---------------------------------------------------------------------------------------------------- |
-| `moonshotFileId` | string   | 非必填   | -      | 通过文件接口上传至月之暗面的文件 ID，其内容将被用做 AI 对话的上下文。不可与 `context` 字段同时配置。 |
+| Name                | Data Type   | Filling Requirements | Default Value | Description                                                                                                      |
+|-------------------|-------------|----------------------|---------------|-----------------------------------------------------------------------------------------------------------------|
+| `moonshotFileId`   | string      | Optional             | -             | The file ID uploaded via the file interface to Moonshot, whose content will be used as context for AI conversations. Cannot be configured with the `context` field. |
 
-#### 通义千问（Qwen）
+#### Qwen (Tongyi Qwen)
 
-通义千问所对应的 `type` 为 `qwen`。它特有的配置字段如下：
+For Qwen (Tongyi Qwen), the corresponding `type` is `qwen`. Its unique configuration fields are:
 
-| 名称                   | 数据类型        | 填写要求 | 默认值 | 描述                                                                                                    |
-| ---------------------- | --------------- | -------- | ------ | ------------------------------------------------------------------------------------------------------- |
-| `qwenEnableSearch`     | boolean         | 非必填   | -      | 是否启用通义千问内置的互联网搜索功能。                                                                  |
-| `qwenFileIds`          | array of string | 非必填   | -      | 通过文件接口上传至 Dashscope 的文件 ID，其内容将被用做 AI 对话的上下文。不可与 `context` 字段同时配置。 |
-| `qwenEnableCompatible` | boolean         | 非必填   | false  | 开启通义千问兼容模式。启用通义千问兼容模式后，将调用千问的兼容模式接口，同时对请求/响应不做修改。       |
+| Name                 | Data Type            | Filling Requirements | Default Value | Description                                                                                                            |
+|--------------------|-----------------|----------------------|---------------|------------------------------------------------------------------------------------------------------------------------|
+| `qwenEnableSearch`  | boolean          | Optional             | -             | Whether to enable the built-in Internet search function provided by Qwen.                                             |
+| `qwenFileIds`       | array of string   | Optional             | -             | The file IDs uploaded via the Dashscope file interface, whose content will be used as context for AI conversations. Cannot be configured with the `context` field. |
+| `qwenEnableCompatible` | boolean          | Optional | false         | Enable Qwen compatibility mode. When Qwen compatibility mode is enabled, the compatible mode interface of Qwen will be called, and the request/response will not be modified. |
 
-#### 百川智能 (Baichuan AI)
+#### Baichuan AI
 
-百川智能所对应的 `type` 为 `baichuan` 。它并无特有的配置字段。
+For Baichuan AI, the corresponding `type` is `baichuan`. It has no unique configuration fields.
 
-#### 零一万物（Yi）
+#### Yi (Zero One Universe)
 
-零一万物所对应的 `type` 为 `yi`。它并无特有的配置字段。
+For Yi (Zero One Universe), the corresponding `type` is `yi`. It has no unique configuration fields.
 
-#### 智谱 AI（Zhipu AI）
+#### Zhipu AI
 
-智谱 AI 所对应的 `type` 为 `zhipuai`。它并无特有的配置字段。
+For Zhipu AI, the corresponding `type` is `zhipuai`. It has no unique configuration fields.
 
-#### DeepSeek（DeepSeek）
+#### DeepSeek
 
-DeepSeek 所对应的 `type` 为 `deepseek`。它并无特有的配置字段。
+For DeepSeek, the corresponding `type` is `deepseek`. It has no unique configuration fields.
 
 #### Groq
 
-Groq 所对应的 `type` 为 `groq`。它并无特有的配置字段。
+For Groq, the corresponding `type` is `groq`. It has no unique configuration fields.
 
-#### 文心一言（Baidu）
+#### ERNIE Bot
 
-文心一言所对应的 `type` 为 `baidu`。它并无特有的配置字段。
+For ERNIE Bot, the corresponding `type` is `baidu`. It has no unique configuration fields.
 
-#### 360 智脑
+### 360 Brain
 
-360 智脑所对应的 `type` 为 `ai360`。它并无特有的配置字段。
+For 360 Brain, the corresponding `type` is `ai360`. It has no unique configuration fields.
 
-#### GitHub 模型
+### Mistral
 
-GitHub 模型所对应的 `type` 为 `github`。它并无特有的配置字段。
-
-#### Mistral
-
-Mistral 所对应的 `type` 为 `mistral`。它并无特有的配置字段。
+For Mistral, the corresponding `type` is `mistral`. It has no unique configuration fields.
 
 #### MiniMax
 
-MiniMax 所对应的 `type` 为 `minimax`。它特有的配置字段如下：
+For MiniMax, the corresponding `type` is `minimax`. Its unique configuration field is:
 
-| 名称             | 数据类型 | 填写要求                       | 默认值 | 描述                                                                    |
-| ---------------- | -------- | ------------------------------ | ------ | ----------------------------------------------------------------------- |
-| `minimaxApiType` | string   | v2 和 pro 中选填一项           | v2     | v2 代表 ChatCompletion v2 API，pro 代表 ChatCompletion Pro API          |
-| `minimaxGroupId` | string   | `minimaxApiType` 为 pro 时必填 | -      | `minimaxApiType` 为 pro 时使用 ChatCompletion Pro API，需要设置 groupID |
+| Name             | Data Type | Filling Requirements | Default Value | Description                                                                                                 |
+| ---------------- | -------- | --------------------- |---------------|------------------------------------------------------------------------------------------------------------|
+| `minimaxGroupId` | string   | Required when using models `abab6.5-chat`, `abab6.5s-chat`, `abab5.5s-chat`, `abab5.5-chat` | -             | When using models `abab6.5-chat`, `abab6.5s-chat`, `abab5.5s-chat`, `abab5.5-chat`, Minimax uses ChatCompletion Pro and requires setting the groupID. |
 
 #### Anthropic Claude
 
-Anthropic Claude 所对应的 `type` 为 `claude`。它特有的配置字段如下：
+For Anthropic Claude, the corresponding `type` is `claude`. Its unique configuration field is:
 
-| 名称            | 数据类型 | 填写要求 | 默认值 | 描述                                      |
-| --------------- | -------- | -------- | ------ | ----------------------------------------- |
-| `claudeVersion` | string   | 可选     | -      | Claude 服务的 API 版本，默认为 2023-06-01 |
+| Name        | Data Type   | Filling Requirements | Default Value | Description                                                                                                    |
+|------------|-------------|----------------------|---------------|---------------------------------------------------------------------------------------------------------------|
+| `claudeVersion` | string | Optional             | -             | The version of the Claude service's API, default is 2023-06-01.                                               |
 
 #### Ollama
 
-Ollama 所对应的 `type` 为 `ollama`。它特有的配置字段如下：
+For Ollama, the corresponding `type` is `ollama`. Its unique configuration field is:
 
-| 名称               | 数据类型 | 填写要求 | 默认值 | 描述                                |
-| ------------------ | -------- | -------- | ------ | ----------------------------------- |
-| `ollamaServerHost` | string   | 必填     | -      | Ollama 服务器的主机地址             |
-| `ollamaServerPort` | number   | 必填     | -      | Ollama 服务器的端口号，默认为 11434 |
+| Name                | Data Type   | Filling Requirements | Default Value | Description                                                                                              |
+|-------------------|-------------|----------------------|---------------|---------------------------------------------------------------------------------------------------------|
+| `ollamaServerHost` | string      | Required             | -             | The host address of the Ollama server.                                                                |
+| `ollamaServerPort` | number      | Required             | -             | The port number of the Ollama server, defaults to 11434.                                              |
 
-#### 混元
+#### Hunyuan
 
-混元所对应的 `type` 为 `hunyuan`。它特有的配置字段如下：
+For Hunyuan, the corresponding `type` is `hunyuan`. Its unique configuration fields are:
 
-| 名称             | 数据类型 | 填写要求 | 默认值 | 描述                       |
-| ---------------- | -------- | -------- | ------ | -------------------------- |
-| `hunyuanAuthId`  | string   | 必填     | -      | 混元用于 v3 版本认证的 id  |
-| `hunyuanAuthKey` | string   | 必填     | -      | 混元用于 v3 版本认证的 key |
+| Name                | Data Type   | Filling Requirements | Default Value | Description                                                                                              |
+|-------------------|-------------|----------------------|---------------|---------------------------------------------------------------------------------------------------------|
+| `hunyuanAuthId`    | string      | Required             | -             | Hunyuan authentication ID for version 3 authentication.                                                |
+| `hunyuanAuthKey`   | string      | Required             | -             | Hunyuan authentication key for version 3 authentication.                                               |
 
-#### 阶跃星辰 (Stepfun)
+#### Stepfun
 
-阶跃星辰所对应的 `type` 为 `stepfun`。它并无特有的配置字段。
+For Stepfun, the corresponding `type` is `stepfun`. It has no unique configuration fields.
 
 #### Cloudflare Workers AI
 
-Cloudflare Workers AI 所对应的 `type` 为 `cloudflare`。它特有的配置字段如下：
+For Cloudflare Workers AI, the corresponding `type` is `cloudflare`. Its unique configuration field is:
 
-| 名称                  | 数据类型 | 填写要求 | 默认值 | 描述                                                                                                                       |
-| --------------------- | -------- | -------- | ------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `cloudflareAccountId` | string   | 必填     | -      | [Cloudflare Account ID](https://developers.cloudflare.com/workers-ai/get-started/rest-api/#1-get-api-token-and-account-id) |
+| Name                | Data Type   | Filling Requirements | Default Value | Description                                                                                              |
+|-------------------|-------------|----------------------|---------------|---------------------------------------------------------------------------------------------------------|
+| `cloudflareAccountId` | string      | Required             | -             | [Cloudflare Account ID](https://developers.cloudflare.com/workers-ai/get-started/rest-api/#1-get-api-token-and-account-id). |
 
-#### 星火 (Spark)
+#### Spark
 
-星火所对应的 `type` 为 `spark`。它并无特有的配置字段。
+For Spark, the corresponding `type` is `spark`. It has no unique configuration fields.
 
-讯飞星火认知大模型的`apiTokens`字段值为`APIKey:APISecret`。即填入自己的 APIKey 与 APISecret，并以`:`分隔。
+The `apiTokens` field value for Xunfei Spark (Xunfei Star) is `APIKey:APISecret`. That is, enter your own APIKey and APISecret, separated by `:`.
 
 #### Gemini
 
-Gemini 所对应的 `type` 为 `gemini`。它特有的配置字段如下：
+For Gemini, the corresponding `type` is `gemini`. Its unique configuration field is:
 
-| 名称                  | 数据类型      | 填写要求 | 默认值   | 描述                                                                                                                                       |
-| --------------------- | ------------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `geminiSafetySetting` | map of string | 非必填   | -        | Gemini AI 内容过滤和安全级别设定。参考[Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings)                             |
-| `apiVersion`          | string        | 非必填   | `v1beta` | 用于指定 API 的版本, 可选择 `v1` 或 `v1beta` 。 版本差异请参考[API versions explained](https://ai.google.dev/gemini-api/docs/api-versions)。 |
+| Name                  | Data Type | Filling Requirements | Default Value | Description                                                                                              |
+|---------------------|----------|----------------------|---------------|---------------------------------------------------------------------------------------------------------|
+| `geminiSafetySetting` | map of string   | Optional             | -             | Gemini AI content filtering and safety level settings. Refer to [Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings). |
 
-#### DeepL
+### DeepL
 
-DeepL 所对应的 `type` 为 `deepl`。它特有的配置字段如下：
+For DeepL, the corresponding `type` is `deepl`. Its unique configuration field is:
 
-| 名称         | 数据类型 | 填写要求 | 默认值 | 描述                         |
-| ------------ | -------- | -------- | ------ | ---------------------------- |
-| `targetLang` | string   | 必填     | -      | DeepL 翻译服务需要的目标语种 |
+| Name         | Data Type | Requirement | Default | Description                         |
+| ------------ | --------- | ----------- | ------- | ------------------------------------ |
+| `targetLang` | string    | Required    | -       | The target language required by the DeepL translation service |
 
-#### Cohere
+## Usage Examples
 
-Cohere 所对应的 `type` 为 `cohere`。它并无特有的配置字段。
+### Using OpenAI Protocol Proxy for Azure OpenAI Service
 
-#### Together-AI
+Using the basic Azure OpenAI service without configuring any context.
 
-Together-AI 所对应的 `type` 为 `together-ai`。它并无特有的配置字段。
-
-#### Dify
-
-Dify 所对应的 `type` 为 `dify`。它特有的配置字段如下:
-
-| 名称             | 数据类型 | 填写要求 | 默认值 | 描述                                                                             |
-| ---------------- | -------- | -------- | ------ | -------------------------------------------------------------------------------- |
-| `difyApiUrl`     | string   | 非必填   | -      | dify 私有化部署的 url                                                            |
-| `botType`        | string   | 非必填   | -      | dify 的应用类型，Chat/Completion/Agent/Workflow                                  |
-| `inputVariable`  | string   | 非必填   | -      | dify 中应用类型为 workflow 时需要设置输入变量，当 botType 为 workflow 时一起使用 |
-| `outputVariable` | string   | 非必填   | -      | dify 中应用类型为 workflow 时需要设置输出变量，当 botType 为 workflow 时一起使用 |
-
-#### Google Vertex AI
-
-Google Vertex AI 所对应的 type 为 vertex。它特有的配置字段如下：
-
-| 名称                         | 数据类型       | 填写要求   | 默认值    | 描述                                                                            |
-|-----------------------------|---------------|--------|--------|-------------------------------------------------------------------------------|
-| `vertexAuthKey`             | string        | 必填     | -      | 用于认证的 Google Service Account JSON Key，格式为 PEM 编码的 PKCS#8 私钥和 client_email 等信息 |
-| `vertexRegion`              | string        | 必填     | -      | Google Cloud 区域（如 us-central1, europe-west4 等），用于构建 Vertex API 地址             |
-| `vertexProjectId`           | string        | 必填     | -      | Google Cloud 项目 ID，用于标识目标 GCP 项目                                              |
-| `vertexAuthServiceName`     | string        | 必填     | -      | 用于 OAuth2 认证的服务名称，该服务为了访问oauth2.googleapis.com                                |
-| `geminiSafetySetting`       | map of string | 非必填   | -      | Gemini AI 内容过滤和安全级别设定。参考[Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings)                             |
-| `vertexTokenRefreshAhead`   | number        | 非必填   | -      | Vertex access token刷新提前时间(单位秒)                                                |
-
-#### AWS Bedrock
-
-AWS Bedrock 所对应的 type 为 bedrock。它特有的配置字段如下：
-
-| 名称                        | 数据类型   | 填写要求 | 默认值 | 描述                           |
-|---------------------------|--------|------|-----|------------------------------|
-| `awsAccessKey`            | string | 必填   | -   | AWS Access Key，用于身份认证        |
-| `awsSecretKey`            | string | 必填   | -   | AWS Secret Access Key，用于身份认证 |
-| `awsRegion`               | string | 必填   | -   | AWS 区域，例如：us-east-1          |
-| `bedrockAdditionalFields` | map    | 非必填  | -   | Bedrock 额外模型请求参数             |
-
-## 用法示例
-
-### 使用 OpenAI 协议代理 Azure OpenAI 服务
-
-使用最基本的 Azure OpenAI 服务，不配置任何上下文。
-
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
@@ -303,7 +224,7 @@ provider:
   azureServiceUrl: "https://YOUR_RESOURCE_NAME.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT_NAME/chat/completions?api-version=2024-02-15-preview",
 ```
 
-**请求示例**
+**Request Example**
 
 ```json
 {
@@ -311,14 +232,14 @@ provider:
   "messages": [
     {
       "role": "user",
-      "content": "你好，你是谁？"
+      "content": "Hello, who are you?"
     }
   ],
   "temperature": 0.3
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
@@ -346,7 +267,7 @@ provider:
       "index": 0,
       "logprobs": null,
       "message": {
-        "content": "你好！我是一个AI助手，可以回答你的问题和提供帮助。有什么我可以帮到你的吗？",
+        "content": "Hello! I am an AI assistant, here to answer your questions and provide assistance. Is there anything I can help you with?",
         "role": "assistant"
       }
     }
@@ -387,32 +308,32 @@ provider:
 }
 ```
 
-### 使用 OpenAI 协议代理通义千问服务
+### Using OpenAI Protocol Proxy for Qwen Service
 
-使用通义千问服务，并配置从 OpenAI 大模型到通义千问的模型映射关系。
+Using Qwen service and configuring the mapping relationship between OpenAI large models and Qwen models.
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: qwen
   apiTokens:
-    - 'YOUR_QWEN_API_TOKEN'
+    - "YOUR_QWEN_API_TOKEN"
   modelMapping:
-    'gpt-3': 'qwen-turbo'
-    'gpt-35-turbo': 'qwen-plus'
-    'gpt-4-turbo': 'qwen-max'
-    'gpt-4-*': 'qwen-max'
-    'gpt-4o': 'qwen-vl-plus'
+    'gpt-3': "qwen-turbo"
+    'gpt-35-turbo': "qwen-plus"
+    'gpt-4-turbo': "qwen-max"
+    'gpt-4-*': "qwen-max"
+    'gpt-4o': "qwen-vl-plus"
     'text-embedding-v1': 'text-embedding-v1'
-    '*': 'qwen-turbo'
+    '*': "qwen-turbo"
 ```
 
-**AI 对话请求示例**
+**AI Conversation Request Example**
 
-URL: <http://your-domain/v1/chat/completions>
+URL: http://your-domain/v1/chat/completions
 
-请求示例：
+Request Example:
 
 ```json
 {
@@ -420,14 +341,14 @@ URL: <http://your-domain/v1/chat/completions>
   "messages": [
     {
       "role": "user",
-      "content": "你好，你是谁？"
+      "content": "Hello, who are you?"
     }
   ],
   "temperature": 0.3
 }
 ```
 
-响应示例：
+Response Example:
 
 ```json
 {
@@ -437,7 +358,7 @@ URL: <http://your-domain/v1/chat/completions>
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "我是通义千问，由阿里云开发的AI助手。我可以回答各种问题、提供信息和与用户进行对话。有什么我可以帮助你的吗？"
+        "content": "I am Qwen, an AI assistant developed by Alibaba Cloud. I can answer various questions, provide information, and engage in conversations with users. How can I assist you?"
       },
       "finish_reason": "stop"
     }
@@ -453,70 +374,70 @@ URL: <http://your-domain/v1/chat/completions>
 }
 ```
 
-**多模态模型 API 请求示例（适用于 `qwen-vl-plus` 和 `qwen-vl-max` 模型）**
+**Multimodal Model API Request Example (Applicable to `qwen-vl-plus` and `qwen-vl-max` Models)**
 
-URL: <http://your-domain/v1/chat/completions>
+URL: http://your-domain/v1/chat/completions
 
-请求示例：
+Request Example:
 
 ```json
 {
-  "model": "gpt-4o",
-  "messages": [
-    {
-      "role": "user",
-      "content": [
+    "model": "gpt-4o",
+    "messages": [
         {
-          "type": "image_url",
-          "image_url": {
-            "url": "https://dashscope.oss-cn-beijing.aliyuncs.com/images/dog_and_girl.jpeg"
-          }
-        },
-        {
-          "type": "text",
-          "text": "这个图片是哪里？"
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://dashscope.oss-cn-beijing.aliyuncs.com/images/dog_and_girl.jpeg"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "Where is this picture from?"
+                }
+            ]
         }
-      ]
-    }
-  ],
-  "temperature": 0.3
+    ],
+    "temperature": 0.3
 }
 ```
 
-响应示例：
+Response Example:
 
 ```json
 {
-  "id": "17c5955d-af9c-9f28-bbde-293a9c9a3515",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": [
-          {
-            "text": "这张照片显示的是一位女士和一只狗在海滩上。由于我无法获取具体的地理位置信息，所以不能确定这是哪个地方的海滩。但是从视觉内容来看，它可能是一个位于沿海地区的沙滩海岸线，并且有海浪拍打着岸边。这样的场景在全球许多美丽的海滨地区都可以找到。如果您需要更精确的信息，请提供更多的背景或细节描述。"
-          }
-        ]
-      },
-      "finish_reason": "stop"
+    "id": "17c5955d-af9c-9f28-bbde-293a9c9a3515",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "text": "This photo depicts a woman and a dog on a beach. As I cannot access specific geographical information, I cannot pinpoint the exact location of this beach. However, visually, it appears to be a sandy coastline along a coastal area with waves breaking on the shore. Such scenes can be found in many beautiful seaside locations worldwide. If you need more precise information, please provide additional context or descriptive details."
+                    }
+                ]
+            },
+            "finish_reason": "stop"
+        }
+    ],
+    "created": 1723949230,
+    "model": "qwen-vl-plus",
+    "object": "chat.completion",
+    "usage": {
+        "prompt_tokens": 1279,
+        "completion_tokens": 78
     }
-  ],
-  "created": 1723949230,
-  "model": "qwen-vl-plus",
-  "object": "chat.completion",
-  "usage": {
-    "prompt_tokens": 1279,
-    "completion_tokens": 78
-  }
 }
 ```
 
-**文本向量请求示例**
+**Text Embedding Request Example**
 
-URL: <http://your-domain/v1/embeddings>
+URL: http://your-domain/v1/embeddings
 
-请求示例：
+Request Example:
 
 ```json
 {
@@ -525,7 +446,7 @@ URL: <http://your-domain/v1/embeddings>
 }
 ```
 
-响应示例：
+Response Example:
 
 ```json
 {
@@ -557,11 +478,11 @@ URL: <http://your-domain/v1/embeddings>
 }
 ```
 
-### 使用通义千问配合纯文本上下文信息
+### Using Qwen Service with Pure Text Context Information
 
-使用通义千问服务，同时配置纯文本上下文信息。
+Using Qwen service while configuring pure text context information.
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
@@ -576,7 +497,7 @@ provider:
       servicePort: 80
 ```
 
-**请求示例**
+**Request Example**
 
 ```json
 {
@@ -584,14 +505,14 @@ provider:
   "messages": [
     {
       "role": "user",
-      "content": "请概述文案内容"
+      "content": "Please summarize the content"
     }
   ],
   "temperature": 0.3
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
@@ -604,7 +525,7 @@ provider:
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "这份文案是一份关于..."
+        "content": "The content of this document is about..."
       },
       "finish_reason": "stop"
     }
@@ -617,25 +538,25 @@ provider:
 }
 ```
 
-### 使用通义千问配合其原生的文件上下文
+### Using Qwen Service with Native File Context
 
-提前上传文件至通义千问，以文件内容作为上下文使用其 AI 服务。
+Uploading files to Qwen in advance to use them as context when utilizing its AI service.
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: qwen
   apiTokens:
-    - 'YOUR_QWEN_API_TOKEN'
+    - "YOUR_QWEN_API_TOKEN"
   modelMapping:
-    '*': 'qwen-long' # 通义千问的文件上下文只能在 qwen-long 模型下使用
+    "*": "qwen-long" # Qwen's file context can only be used in the qwen-long model
   qwenFileIds:
-    - 'file-fe-xxx'
-    - 'file-fe-yyy'
+  - "file-fe-xxx"
+  - "file-fe-yyy"
 ```
 
-**请求示例**
+**Request Example**
 
 ```json
 {
@@ -643,14 +564,14 @@ provider:
   "messages": [
     {
       "role": "user",
-      "content": "请概述文案内容"
+      "content": "Please summarize the content"
     }
   ],
   "temperature": 0.3
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
@@ -660,7 +581,7 @@ provider:
         "finish_reason": "stop",
         "message": {
           "role": "assistant",
-          "content": "您上传了两个文件，`context.txt` 和 `context_2.txt`，它们似乎都包含了关于xxxx"
+          "content": "You uploaded two files, `context.txt` and `context_2.txt`, which seem to contain information about..."
         }
       }
     ]
@@ -674,38 +595,40 @@ provider:
 }
 ```
 
-### 使用 original 协议代理百炼智能体应用
+### Forwards requests to AliCloud Bailian with the "original" protocol
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
-provider:
-  type: qwen
-  apiTokens:
-    - 'YOUR_DASHSCOPE_API_TOKEN'
-  protocol: original
+activeProviderId: my-qwen
+providers:
+  - id: my-qwen
+    type: qwen
+    apiTokens:
+      - "YOUR_DASHSCOPE_API_TOKEN"
+    protocol: original
 ```
 
-**请求实例**
+**Example Request**
 
 ```json
 {
   "input": {
-    "prompt": "介绍一下Dubbo"
+    "prompt": "What is Dubbo?"
   },
   "parameters": {},
   "debug": {}
 }
 ```
 
-**响应实例**
+**Example Response**
 
 ```json
 {
   "output": {
     "finish_reason": "stop",
     "session_id": "677e7e8fbb874e1b84792b65042e1599",
-    "text": "Apache Dubbo 是一个..."
+    "text": "Apache Dubbo is a..."
   },
   "usage": {
     "models": [
@@ -720,12 +643,12 @@ provider:
 }
 ```
 
-### 使用 OpenAI 协议代理豆包大模型服务
-
-**配置信息**
+### Using OpenAI Protocol Proxy for Doubao Service
 
 ```yaml
-provider:
+activeProviderId: my-doubao
+providers:
+- id: my-doubao
   type: doubao
   apiTokens:
     - YOUR_DOUBAO_API_KEY
@@ -734,9 +657,7 @@ provider:
   timeout: 1200000
 ```
 
-### 使用 original 协议代理 Coze 应用
-
-**配置信息**
+### Using original Protocol Proxy for Coze applications
 
 ```yaml
 provider:
@@ -746,11 +667,11 @@ provider:
   protocol: original
 ```
 
-### 使用月之暗面配合其原生的文件上下文
+### Utilizing Moonshot with its Native File Context
 
-提前上传文件至月之暗面，以文件内容作为上下文使用其 AI 服务。
+Upload files to Moonshot in advance and use its AI services based on file content.
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
@@ -762,7 +683,7 @@ provider:
     '*': "moonshot-v1-32k"
 ```
 
-**请求示例**
+**Example Request**
 
 ```json
 {
@@ -770,14 +691,14 @@ provider:
   "messages": [
     {
       "role": "user",
-      "content": "请概述文案内容"
+      "content": "Please summarize the content"
     }
   ],
   "temperature": 0.3
 }
 ```
 
-**响应示例**
+**Example Response**
 
 ```json
 {
@@ -790,7 +711,7 @@ provider:
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "文案内容是关于一个名为“xxxx”的支付平台..."
+        "content": "The content of the text is about a payment platform named ‘xxxx’..."
       },
       "finish_reason": "stop"
     }
@@ -803,18 +724,18 @@ provider:
 }
 ```
 
-### 使用 OpenAI 协议代理 Groq 服务
+### Using OpenAI Protocol Proxy for Groq Service
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: groq
   apiTokens:
-    - 'YOUR_GROQ_API_TOKEN'
+    - "YOUR_GROQ_API_TOKEN"
 ```
 
-**请求示例**
+**Example Request**
 
 ```json
 {
@@ -822,13 +743,13 @@ provider:
   "messages": [
     {
       "role": "user",
-      "content": "你好，你是谁？"
+      "content": "Hello, who are you?"
     }
   ]
 }
 ```
 
-**响应示例**
+**Example Response**
 
 ```json
 {
@@ -862,19 +783,19 @@ provider:
 }
 ```
 
-### 使用 OpenAI 协议代理 Claude 服务
+### Using OpenAI Protocol Proxy for Claude Service
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: claude
   apiTokens:
-    - 'YOUR_CLAUDE_API_TOKEN'
-  version: '2023-06-01'
+    - "YOUR_CLAUDE_API_TOKEN"
+  version: "2023-06-01"
 ```
 
-**请求示例**
+**Example Request**
 
 ```json
 {
@@ -883,13 +804,13 @@ provider:
   "messages": [
     {
       "role": "user",
-      "content": "你好，你是谁？"
+      "content": "Hello, who are you?"
     }
   ]
 }
 ```
 
-**响应示例**
+**Example Response**
 
 ```json
 {
@@ -899,7 +820,7 @@ provider:
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "您好,我是一个由人工智能公司Anthropic开发的聊天助手。我的名字叫Claude,是一个聪明友善、知识渊博的对话系统。很高兴认识您!我可以就各种话题与您聊天,回答问题,提供建议和帮助。我会尽最大努力给您有帮助的回复。希望我们能有个愉快的交流!"
+        "content": "Hello, I am a conversation system developed by Anthropic, a company specializing in artificial intelligence. My name is Claude, a friendly and knowledgeable chatbot. Nice to meet you! I can engage in discussions on various topics, answer questions, provide suggestions, and assist you. I'll do my best to give you helpful responses. I hope we have a pleasant exchange!"
       },
       "finish_reason": "stop"
     }
@@ -915,25 +836,25 @@ provider:
 }
 ```
 
-### 使用 OpenAI 协议代理混元服务
+### Using OpenAI Protocol Proxy for Hunyuan Service
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
-  type: 'hunyuan'
-  hunyuanAuthKey: '<YOUR AUTH KEY>'
+  type: "hunyuan"
+  hunyuanAuthKey: "<YOUR AUTH KEY>"
   apiTokens:
-    - ''
-  hunyuanAuthId: '<YOUR AUTH ID>'
+    - ""
+  hunyuanAuthId: "<YOUR AUTH ID>"
   timeout: 1200000
   modelMapping:
-    '*': 'hunyuan-lite'
+    "*": "hunyuan-lite"
 ```
 
-**请求示例**
+**Example Request**
 
-请求脚本：
+Request script:
 
 ```shell
 curl --location 'http://<your higress domain>/v1/chat/completions' \
@@ -943,11 +864,11 @@ curl --location 'http://<your higress domain>/v1/chat/completions' \
   "messages": [
     {
       "role": "system",
-      "content": "你是一个名专业的开发人员！"
+      "content": "You are a professional developer!"
     },
     {
       "role": "user",
-      "content": "你好，你是谁？"
+      "content": "Hello, who are you?"
     }
   ],
   "temperature": 0.3,
@@ -955,275 +876,168 @@ curl --location 'http://<your higress domain>/v1/chat/completions' \
 }'
 ```
 
-**响应示例**
+**Example Response**
 
 ```json
 {
-  "id": "fd140c3e-0b69-4b19-849b-d354d32a6162",
-  "choices": [
-    {
-      "index": 0,
-      "delta": {
-        "role": "assistant",
-        "content": "你好！我是一名专业的开发人员。"
-      },
-      "finish_reason": "stop"
+    "id": "fd140c3e-0b69-4b19-849b-d354d32a6162",
+    "choices": [
+        {
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "content": "Hello! I am a professional developer."
+            },
+            "finish_reason": "stop"
+        }
+    ],
+    "created": 1717493117,
+    "model": "hunyuan-lite",
+    "object": "chat.completion",
+    "usage": {
+        "prompt_tokens": 15,
+        "completion_tokens": 9,
+        "total_tokens": 24
     }
-  ],
-  "created": 1717493117,
-  "model": "hunyuan-lite",
-  "object": "chat.completion",
-  "usage": {
-    "prompt_tokens": 15,
-    "completion_tokens": 9,
-    "total_tokens": 24
-  }
 }
 ```
 
-### 使用 OpenAI 协议代理百度文心一言服务
+### Using OpenAI Protocol Proxy for ERNIE Bot Service
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: baidu
   apiTokens:
-    - 'YOUR_BAIDU_API_TOKEN'
+    - "YOUR_BAIDU_API_TOKEN"
   modelMapping:
-    'gpt-3': 'ERNIE-4.0'
-    '*': 'ERNIE-4.0'
+    'gpt-3': "ERNIE-4.0"
+    '*': "ERNIE-4.0"
 ```
 
-**请求示例**
+**Request Example**
 
 ```json
 {
-  "model": "gpt-4-turbo",
-  "messages": [
-    {
-      "role": "user",
-      "content": "你好，你是谁？"
-    }
-  ],
-  "stream": false
+    "model": "gpt-4-turbo",
+    "messages": [
+        {
+            "role": "user",
+            "content": "Hello, who are you?"
+        }
+    ],
+    "stream": false
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
-  "id": "as-e90yfg1pk1",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "你好，我是文心一言，英文名是ERNIE Bot。我能够与人对话互动，回答问题，协助创作，高效便捷地帮助人们获取信息、知识和灵感。"
-      },
-      "finish_reason": "stop"
+    "id": "as-e90yfg1pk1",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Hello, I am ERNIE Bot. I can interact with people, answer questions, assist in creation, and efficiently provide information, knowledge, and inspiration."
+            },
+            "finish_reason": "stop"
+        }
+    ],
+    "created": 1717251488,
+    "model": "ERNIE-4.0",
+    "object": "chat.completion",
+    "usage": {
+        "prompt_tokens": 4,
+        "completion_tokens": 33,
+        "total_tokens": 37
     }
-  ],
-  "created": 1717251488,
-  "model": "ERNIE-4.0",
-  "object": "chat.completion",
-  "usage": {
-    "prompt_tokens": 4,
-    "completion_tokens": 33,
-    "total_tokens": 37
-  }
 }
 ```
 
-### 使用 OpenAI 协议代理 MiniMax 服务
+### Using OpenAI Protocol Proxy for MiniMax Service
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: minimax
   apiTokens:
-    - 'YOUR_MINIMAX_API_TOKEN'
+    - "YOUR_MINIMAX_API_TOKEN"
   modelMapping:
-    'gpt-3': 'abab6.5s-chat'
-    'gpt-4': 'abab6.5g-chat'
-    '*': 'abab6.5t-chat'
+    "gpt-3": "abab6.5g-chat"
+    "gpt-4": "abab6.5-chat"
+    "*": "abab6.5g-chat"
+  minimaxGroupId: "YOUR_MINIMAX_GROUP_ID"
 ```
 
-**请求示例**
+**Request Example**
 
 ```json
 {
-  "model": "gpt-3",
-  "messages": [
-    {
-      "role": "user",
-      "content": "你好，你是谁？"
-    }
-  ],
-  "stream": false
+    "model": "gpt-4-turbo",
+    "messages": [
+        {
+            "role": "user",
+            "content": "Hello, who are you?"
+        }
+    ],
+    "stream": false
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
-  "id": "03ac4fcfe1c6cc9c6a60f9d12046e2b4",
-  "choices": [
-    {
-      "finish_reason": "stop",
-      "index": 0,
-      "message": {
-        "content": "你好，我是一个由MiniMax公司研发的大型语言模型，名为MM智能助理。我可以帮助回答问题、提供信息、进行对话和执行多种语言处理任务。如果你有任何问题或需要帮助，请随时告诉我！",
-        "role": "assistant",
-        "name": "MM智能助理",
-        "audio_content": ""
-      }
-    }
-  ],
-  "created": 1734155471,
-  "model": "abab6.5s-chat",
-  "object": "chat.completion",
-  "usage": {
-    "total_tokens": 116,
-    "total_characters": 0,
-    "prompt_tokens": 70,
-    "completion_tokens": 46
-  },
-  "input_sensitive": false,
-  "output_sensitive": false,
-  "input_sensitive_type": 0,
-  "output_sensitive_type": 0,
-  "output_sensitive_int": 0,
-  "base_resp": {
-    "status_code": 0,
-    "status_msg": ""
-  }
-}
-```
-
-### 使用 OpenAI 协议代理 GitHub 模型服务
-
-**配置信息**
-
-```yaml
-provider:
-  type: github
-  apiTokens:
-    - 'YOUR_GITHUB_ACCESS_TOKEN'
-  modelMapping:
-    'gpt-4o': 'gpt-4o'
-    'gpt-4': 'Phi-3.5-MoE-instruct'
-    'gpt-3.5': 'cohere-command-r-08-2024'
-    'text-embedding-3-large': 'text-embedding-3-large'
-```
-
-**请求示例**
-
-```json
-{
-  "messages": [
-    {
-      "role": "system",
-      "content": "You are a helpful assistant."
+    "id": "02b2251f8c6c09d68c1743f07c72afd7",
+    "choices": [
+        {
+            "finish_reason": "stop",
+            "index": 0,
+            "message": {
+                "content": "Hello! I am MM Intelligent Assistant, a large language model developed by MiniMax. I can help answer questions, provide information, and engage in conversations. How can I assist you?",
+                "role": "assistant"
+            }
+        }
+    ],
+    "created": 1717760544,
+    "model": "abab6.5s-chat",
+    "object": "chat.completion",
+    "usage": {
+        "total_tokens": 106
     },
-    {
-      "role": "user",
-      "content": "What is the capital of France?"
+    "input_sensitive": false,
+    "output_sensitive": false,
+    "input_sensitive_type": 0,
+    "output_sensitive_type": 0,
+    "base_resp": {
+        "status_code": 0,
+        "status_msg": ""
     }
-  ],
-  "stream": true,
-  "temperature": 1.0,
-  "top_p": 1.0,
-  "max_tokens": 1000,
-  "model": "gpt-4o"
 }
 ```
 
-**响应示例**
+### Using OpenAI Protocol Proxy for 360 Brain Services
 
-```json
-{
-  "choices": [
-    {
-      "finish_reason": "stop",
-      "index": 0,
-      "logprobs": null,
-      "message": {
-        "content": "The capital of France is Paris.",
-        "role": "assistant"
-      }
-    }
-  ],
-  "created": 1728131051,
-  "id": "chatcmpl-AEy7PU2JImdsD1W6Jw8GigZSEnM2u",
-  "model": "gpt-4o-2024-08-06",
-  "object": "chat.completion",
-  "system_fingerprint": "fp_67802d9a6d",
-  "usage": {
-    "completion_tokens": 7,
-    "prompt_tokens": 24,
-    "total_tokens": 31
-  }
-}
-```
-
-**文本向量请求示例**
-
-```json
-{
-  "input": ["first phrase", "second phrase", "third phrase"],
-  "model": "text-embedding-3-large"
-}
-```
-
-响应示例：
-
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "object": "embedding",
-      "index": 0,
-      "embedding": [
-        -0.0012583479,
-        0.0020349282,
-        ...
-        0.012051377,
-        -0.0053306012,
-        0.0060688322
-      ]
-    }
-  ],
-  "model": "text-embedding-3-large",
-  "usage": {
-    "prompt_tokens": 6,
-    "total_tokens": 6
-  }
-}
-```
-
-### 使用 OpenAI 协议代理 360 智脑服务
-
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: ai360
   apiTokens:
-    - 'YOUR_360_API_TOKEN'
+    - "YOUR_AI360_API_TOKEN"
   modelMapping:
-    'gpt-4o': '360gpt-turbo-responsibility-8k'
-    'gpt-4': '360gpt2-pro'
-    'gpt-3.5': '360gpt-turbo'
-    'text-embedding-3-small': 'embedding_s1_v1.2'
-    '*': '360gpt-pro'
+    "gpt-4o": "360gpt-turbo-responsibility-8k"
+    "gpt-4": "360gpt2-pro"
+    "gpt-3.5": "360gpt-turbo"
+    "text-embedding-3-small": "embedding_s1_v1.2"
+    "*": "360gpt-pro"
 ```
 
-**请求示例**
+**Request Example**
 
 ```json
 {
@@ -1231,17 +1045,17 @@ provider:
   "messages": [
     {
       "role": "system",
-      "content": "你是一个专业的开发人员！"
+      "content": "You are a professional developer!"
     },
     {
       "role": "user",
-      "content": "你好，你是谁？"
+      "content": "Hello, who are you?"
     }
   ]
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
@@ -1249,7 +1063,7 @@ provider:
     {
       "message": {
         "role": "assistant",
-        "content": "你好，我是360智脑，一个大型语言模型。我可以帮助回答各种问题、提供信息、进行对话等。有什么可以帮助你的吗？"
+        "content": "Hello, I am 360 Brain, a large language model. I can assist with answering various questions, providing information, engaging in conversations, and more. How can I assist you?"
       },
       "finish_reason": "",
       "index": 0
@@ -1267,31 +1081,31 @@ provider:
   "messages": [
     {
       "role": "system",
-      "content": "你是一个专业的开发人员！"
+      "content": "You are a professional developer!"
     },
     {
       "role": "user",
-      "content": "你好，你是谁？"
+      "content": "Hello, who are you?"
     }
   ],
   "context": null
 }
 ```
 
-**文本向量请求示例**
+**Text Embedding Request Example**
 
-URL: <http://your-domain/v1/embeddings>
+**URL**: http://your-domain/v1/embeddings
 
-请求示例：
+**Request Example**
 
 ```json
 {
-  "input": ["你好"],
-  "model": "text-embedding-3-small"
+  "input":["Hello"],
+  "model":"text-embedding-3-small"
 }
 ```
 
-响应示例：
+**Response Example**
 
 ```json
 {
@@ -1320,21 +1134,21 @@ URL: <http://your-domain/v1/embeddings>
 }
 ```
 
-### 使用 OpenAI 协议代理 Cloudflare Workers AI 服务
+### Using OpenAI Protocol Proxy for Cloudflare Workers AI Service
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: cloudflare
   apiTokens:
-    - 'YOUR_WORKERS_AI_API_TOKEN'
-  cloudflareAccountId: 'YOUR_CLOUDFLARE_ACCOUNT_ID'
+    - "YOUR_WORKERS_AI_API_TOKEN"
+  cloudflareAccountId: "YOUR_CLOUDFLARE_ACCOUNT_ID"
   modelMapping:
-    '*': '@cf/meta/llama-3-8b-instruct'
+    "*": "@cf/meta/llama-3-8b-instruct"
 ```
 
-**请求示例**
+**Request Example**
 
 ```json
 {
@@ -1349,7 +1163,7 @@ provider:
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
@@ -1362,7 +1176,7 @@ provider:
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "I am LLaMA, an AI assistant developed by Meta AI that can understand and respond to human input in a conversational manner. I'm not a human, but a computer program designed to simulate conversation and answer questions to the best of my knowledge. I can be used to generate text on a wide range of topics, from science and history to entertainment and culture.\n\nI'm a large language model, which means I've been trained on a massive dataset of text from the internet and can generate human-like responses. I can understand natural language and respond accordingly, making me suitable for tasks such as:\n\n* Answering questions on various topics\n* Generating text based on a given prompt\n* Translating text from one language to another\n* Summarizing long pieces of text\n* Creating chatbot dialogues\n\nI'm constantly learning and improving, so the more conversations I have with users like you, the better I'll become."
+        "content": "I am LLaMA, an AI assistant developed by Meta AI that can understand and respond to human input in a conversational manner. I'm not a human, but a computer program designed to simulate conversation and answer questions to the best of my knowledge. I can be used to generate text on a wide range of topics, from science and history to entertainment and culture."
       },
       "logprobs": null,
       "finish_reason": "stop"
@@ -1371,68 +1185,68 @@ provider:
 }
 ```
 
-### 使用 OpenAI 协议代理 Spark 服务
+### Using OpenAI Protocol Proxy for Spark Service
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: spark
   apiTokens:
-    - 'APIKey:APISecret'
+    - "APIKey:APISecret"
   modelMapping:
-    'gpt-4o': 'generalv3.5'
-    'gpt-4': 'generalv3'
-    '*': 'general'
+    "gpt-4o": "generalv3.5"
+    "gpt-4": "generalv3"
+    "*": "general"
 ```
 
-**请求示例**
+**Request Example**
 
 ```json
 {
-  "model": "gpt-4o",
-  "messages": [
-    {
-      "role": "system",
-      "content": "你是一名专业的开发人员！"
-    },
-    {
-      "role": "user",
-      "content": "你好，你是谁？"
-    }
-  ],
-  "stream": false
+    "model": "gpt-4o",
+    "messages": [
+        {
+            "role": "system",
+            "content": "You are a professional developer!"
+        },
+        {
+            "role": "user",
+            "content": "Hello, who are you?"
+        }
+    ],
+    "stream": false
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
-  "id": "cha000c23c6@dx190ef0b4b96b8f2532",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "你好！我是一名专业的开发人员，擅长编程和解决技术问题。有什么我可以帮助你的吗？"
-      }
+    "id": "cha000c23c6@dx190ef0b4b96b8f2532",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Hello! I am a professional developer skilled in programming and problem-solving. What can I assist you with?"
+            }
+        }
+    ],
+    "created": 1721997415,
+    "model": "generalv3.5",
+    "object": "chat.completion",
+    "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 19,
+        "total_tokens": 29
     }
-  ],
-  "created": 1721997415,
-  "model": "generalv3.5",
-  "object": "chat.completion",
-  "usage": {
-    "prompt_tokens": 10,
-    "completion_tokens": 19,
-    "total_tokens": 29
-  }
 }
 ```
 
-### 使用 OpenAI 协议代理 Gemini 服务
+### Utilizing OpenAI Protocol Proxy for Gemini Services
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
@@ -1448,61 +1262,61 @@ provider:
     "HARM_CATEGORY_DANGEROUS_CONTENT" :"BLOCK_NONE"
 ```
 
-**请求示例**
+**Request Example**
 
 ```json
 {
-  "model": "gpt-3.5",
-  "messages": [
-    {
-      "role": "user",
-      "content": "Who are you?"
-    }
-  ],
-  "stream": false
+    "model": "gpt-3.5",
+    "messages": [
+        {
+            "role": "user",
+            "content": "Who are you?"
+        }
+    ],
+    "stream": false
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
-  "id": "chatcmpl-b010867c-0d3f-40ba-95fd-4e8030551aeb",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "I am a large multi-modal model, trained by Google. I am designed to provide information and answer questions to the best of my abilities."
-      },
-      "finish_reason": "stop"
+    "id": "chatcmpl-b010867c-0d3f-40ba-95fd-4e8030551aeb",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "I am a large multi-modal model, trained by Google. I am designed to provide information and answer questions to the best of my abilities."
+            },
+            "finish_reason": "stop"
+        }
+    ],
+    "created": 1722756984,
+    "model": "gemini-pro",
+    "object": "chat.completion",
+    "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 29,
+        "total_tokens": 34
     }
-  ],
-  "created": 1722756984,
-  "model": "gemini-pro",
-  "object": "chat.completion",
-  "usage": {
-    "prompt_tokens": 5,
-    "completion_tokens": 29,
-    "total_tokens": 34
-  }
 }
 ```
 
-### 使用 OpenAI 协议代理 DeepL 文本翻译服务
+### Utilizing OpenAI Protocol Proxy for DeepL Text Translation Service
 
-**配置信息**
+**Configuration Information**
 
 ```yaml
 provider:
   type: deepl
   apiTokens:
-    - 'YOUR_DEEPL_API_TOKEN'
-  targetLang: 'ZH'
+    - "YOUR_DEEPL_API_TOKEN"
+  targetLang: "ZH"
 ```
 
-**请求示例**
-此处 `model` 表示 DeepL 的服务类型，只能填 `Free` 或 `Pro`。`content` 中设置需要翻译的文本；在 `role: system` 的 `content` 中可以包含可能影响翻译但本身不会被翻译的上下文，例如翻译产品名称时，可以将产品描述作为上下文传递，这种额外的上下文可能会提高翻译的质量。
+**Request Example**
+Here, `model` denotes the service tier of DeepL and can only be either `Free` or `Pro`. The `content` field contains the text to be translated; within `role: system`, `content` may include context that influences the translation but isn't translated itself. For instance, when translating product names, including a product description as context could enhance translation quality.
 
 ```json
 {
@@ -1522,18 +1336,18 @@ provider:
 }
 ```
 
-**响应示例**
+**Response Example**
 
 ```json
 {
   "choices": [
     {
       "index": 0,
-      "message": { "name": "EN", "role": "assistant", "content": "坐庄" }
+      "message": { "name": "EN", "role": "assistant", "content": "operate a gambling establishment" }
     },
     {
       "index": 1,
-      "message": { "name": "EN", "role": "assistant", "content": "中国银行" }
+      "message": { "name": "EN", "role": "assistant", "content": "Bank of China" }
     }
   ],
   "created": 1722747752,
@@ -1543,35 +1357,32 @@ provider:
 }
 ```
 
-### 使用 OpenAI 协议代理 Together-AI 服务
+### Utilizing OpenAI Protocol Proxy for Together-AI Services
 
-**配置信息**
-
+**Configuration Information**
 ```yaml
 provider:
   type: together-ai
   apiTokens:
-    - 'YOUR_TOGETHER_AI_API_TOKEN'
+    - "YOUR_TOGETHER_AI_API_TOKEN"
   modelMapping:
-    '*': 'Qwen/Qwen2.5-72B-Instruct-Turbo'
+    "*": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
 ```
 
-**请求示例**
-
+**Request Example**
 ```json
 {
-  "model": "Qwen/Qwen2.5-72B-Instruct-Turbo",
-  "messages": [
-    {
-      "role": "user",
-      "content": "Who are you?"
-    }
-  ]
+    "model": "Qwen/Qwen2.5-72B-Instruct-Turbo",
+    "messages": [
+        {
+            "role": "user",
+            "content": "Who are you?"
+        }
+    ]
 }
 ```
 
-**响应示例**
-
+**Response Example**
 ```json
 {
   "id": "8f5809d54b73efac",
@@ -1600,183 +1411,11 @@ provider:
 }
 ```
 
-### 使用 OpenAI 协议代理 Dify 服务
+## Full Configuration Example
 
-**配置信息**
+### Kubernetes Example
 
-```yaml
-provider:
-  type: dify
-  apiTokens:
-    - 'YOUR_DIFY_API_TOKEN'
-  modelMapping:
-    '*': 'dify'
-```
-
-**请求示例**
-
-```json
-{
-  "model": "gpt-4-turbo",
-  "messages": [
-    {
-      "role": "user",
-      "content": "你好，你是谁？"
-    }
-  ],
-  "stream": false
-}
-```
-
-**响应示例**
-
-```json
-{
-  "id": "e33fc636-f9e8-4fae-8d5e-fbd0acb09401",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "你好！我是ChatGPT，由OpenAI开发的人工智能语言模型。我可以帮助回答问题、提供建议或进行各种对话。如果你有任何需要，随时告诉我哦！"
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "created": 1736657752,
-  "model": "dify",
-  "object": "chat.completion",
-  "usage": {
-    "prompt_tokens": 16,
-    "completion_tokens": 243,
-    "total_tokens": 259
-  }
-}
-```
-
-### 使用 OpenAI 协议代理 Google Vertex 服务
-
-**配置信息**
-
-```yaml
-provider:
-  type: vertex
-  vertexAuthKey: |
-    {
-      "type": "service_account",
-      "project_id": "your-project-id",
-      "private_key_id": "your-private-key-id",
-      "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
-      "client_email": "your-service-account@your-project.iam.gserviceaccount.com",
-      "token_uri": "https://oauth2.googleapis.com/token"
-    }
-  vertexRegion: us-central1
-  vertexProjectId: your-project-id
-  vertexAuthServiceName: your-auth-service-name
-```
-
-**请求示例**
-
-```json
-{
-  "model": "gemini-2.0-flash-001",
-  "messages": [
-    {
-      "role": "user",
-      "content": "你好，你是谁？"
-    }
-  ],
-  "stream": false
-}
-```
-
-**响应示例**
-
-```json
-{
-  "id": "chatcmpl-0000000000000",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "你好！我是 Vertex AI 提供的 Gemini 模型，由 Google 开发的人工智能助手。我可以回答问题、提供信息和帮助完成各种任务。有什么我可以帮您的吗？"
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "created": 1729986750,
-  "model": "gemini-2.0-flash-001",
-  "object": "chat.completion",
-  "usage": {
-    "prompt_tokens": 15,
-    "completion_tokens": 43,
-    "total_tokens": 58
-  }
-}
-```
-
-### 使用 OpenAI 协议代理 AWS Bedrock 服务
-
-**配置信息**
-
-```yaml
-provider:
-  type: bedrock
-  awsAccessKey: "YOUR_AWS_ACCESS_KEY_ID"
-  awsSecretKey: "YOUR_AWS_SECRET_ACCESS_KEY"
-  awsRegion: "YOUR_AWS_REGION"
-  bedrockAdditionalFields:
-    top_k: 200
-```
-
-**请求示例**
-
-```json
-{
-  "model": "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0",
-  "messages": [
-    {
-      "role": "user",
-      "content": "你好，你是谁？"
-    }
-  ],
-  "stream": false
-}
-```
-
-**响应示例**
-
-```json
-{
-  "id": "dc5812e2-6a62-49d6-829e-5c327b15e4e2",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "你好!我是Claude,一个由Anthropic开发的AI助手。很高兴认识你!我的目标是以诚实、有益且有意义的方式与人类交流。我会尽力提供准确和有帮助的信息,同时保持诚实和正直。请问我今天能为你做些什么呢?"
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "created": 1749657608,
-  "model": "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0",
-  "object": "chat.completion",
-  "usage": {
-    "prompt_tokens": 16,
-    "completion_tokens": 101,
-    "total_tokens": 117
-  }
-}
-```
-
-
-## 完整配置示例
-
-### Kubernetes 示例
-
-以下以使用 OpenAI 协议代理 Groq 服务为例，展示完整的插件配置示例。
+Here's a full plugin configuration example using the OpenAI protocol proxy for Groq services.
 
 ```yaml
 apiVersion: extensions.higress.io/v1alpha1
@@ -1786,13 +1425,13 @@ metadata:
   namespace: higress-system
 spec:
   matchRules:
-    - config:
-        provider:
-          type: groq
-          apiTokens:
-            - 'YOUR_API_TOKEN'
-      ingress:
-        - groq
+  - config:
+      provider:
+        type: groq
+        apiTokens:
+          - "YOUR_API_TOKEN"
+    ingress:
+    - groq
   url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:1.0.0
 ---
 apiVersion: networking.k8s.io/v1
@@ -1802,7 +1441,7 @@ metadata:
     higress.io/backend-protocol: HTTPS
     higress.io/destination: groq.dns
     higress.io/proxy-ssl-name: api.groq.com
-    higress.io/proxy-ssl-server-name: 'on'
+    higress.io/proxy-ssl-server-name: "on"
   labels:
     higress.io/resource-definer: higress
   name: groq
@@ -1810,16 +1449,16 @@ metadata:
 spec:
   ingressClassName: higress
   rules:
-    - host: <YOUR-DOMAIN>
-      http:
-        paths:
-          - backend:
-              resource:
-                apiGroup: networking.higress.io
-                kind: McpBridge
-                name: default
-            path: /
-            pathType: Prefix
+  - host: <YOUR-DOMAIN>
+    http:
+      paths:
+      - backend:
+          resource:
+            apiGroup: networking.higress.io
+            kind: McpBridge
+            name: default
+        path: /
+        pathType: Prefix
 ---
 apiVersion: networking.higress.io/v1
 kind: McpBridge
@@ -1828,13 +1467,13 @@ metadata:
   namespace: higress-system
 spec:
   registries:
-    - domain: api.groq.com
-      name: groq
-      port: 443
-      type: dns
+  - domain: api.groq.com
+    name: groq
+    port: 443
+    type: dns
 ```
 
-访问示例：
+Access Example:
 
 ```bash
 curl "http://<YOUR-DOMAIN>/v1/chat/completions" -H "Content-Type: application/json" -d '{
@@ -1842,15 +1481,15 @@ curl "http://<YOUR-DOMAIN>/v1/chat/completions" -H "Content-Type: application/js
   "messages": [
     {
       "role": "user",
-      "content": "你好，你是谁？"
+      "content": "hello, who are you?"
     }
   ]
 }'
 ```
 
-### Docker-Compose 示例
+### Docker-Compose Example
 
-`docker-compose.yml` 配置文件：
+`docker-compose.yml` configuration file:
 
 ```yaml
 version: '3.7'
@@ -1858,12 +1497,12 @@ services:
   envoy:
     image: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/envoy:1.20
     entrypoint: /usr/local/bin/envoy
-    # 开启了 debug 级别日志方便调试
+    # Enables debug level logging for easier debugging
     command: -c /etc/envoy/envoy.yaml --component-log-level wasm:debug
     networks:
       - higress-net
     ports:
-      - '10000:10000'
+      - "10000:10000"
     volumes:
       - ./envoy.yaml:/etc/envoy/envoy.yaml
       - ./plugin.wasm:/etc/envoy/plugin.wasm
@@ -1871,7 +1510,7 @@ networks:
   higress-net: {}
 ```
 
-`envoy.yaml` 配置文件：
+`envoy.yaml` configuration file:
 
 ```yaml
 admin:
@@ -1892,31 +1531,31 @@ static_resources:
         - filters:
             - name: envoy.filters.network.http_connection_manager
               typed_config:
-                '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 scheme_header_transformation:
                   scheme_to_overwrite: https
                 stat_prefix: ingress_http
-                # Output envoy logs to stdout
+                # Outputs envoy logs to stdout
                 access_log:
                   - name: envoy.access_loggers.stdout
                     typed_config:
-                      '@type': type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
-                # Modify as required
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                # Modify as needed
                 route_config:
                   name: local_route
                   virtual_hosts:
                     - name: local_service
-                      domains: ['*']
+                      domains: [ "*" ]
                       routes:
                         - match:
-                            prefix: '/'
+                            prefix: "/"
                           route:
                             cluster: claude
                             timeout: 300s
                 http_filters:
                   - name: claude
                     typed_config:
-                      '@type': type.googleapis.com/udpa.type.v1.TypedStruct
+                      "@type": type.googleapis.com/udpa.type.v1.TypedStruct
                       type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
                       value:
                         config:
@@ -1927,14 +1566,14 @@ static_resources:
                               local:
                                 filename: /etc/envoy/plugin.wasm
                           configuration:
-                            '@type': 'type.googleapis.com/google.protobuf.StringValue'
-                            value: | # 插件配置
+                            "@type": "type.googleapis.com/google.protobuf.StringValue"
+                            value: | # Plugin configuration
                               {
                                 "provider": {
-                                  "type": "claude",                                
+                                  "type": "claude",
                                   "apiTokens": [
                                     "YOUR_API_TOKEN"
-                                  ]                  
+                                  ]
                                 }
                               }
                   - name: envoy.filters.http.router
@@ -1951,16 +1590,16 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: api.anthropic.com # API 服务地址
+                      address: api.anthropic.com # Service address
                       port_value: 443
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:
-          '@type': type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          'sni': 'api.anthropic.com'
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          "sni": "api.anthropic.com"
 ```
 
-访问示例：
+Access Example:
 
 ```bash
 curl "http://localhost:10000/v1/chat/completions"  -H "Content-Type: application/json"  -d '{
@@ -1969,7 +1608,7 @@ curl "http://localhost:10000/v1/chat/completions"  -H "Content-Type: application
   "messages": [
     {
       "role": "user",
-      "content": "你好，你是谁？"
+      "content": "hello, who are you?"
     }
   ]
 }'
