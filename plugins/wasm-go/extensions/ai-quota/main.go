@@ -26,6 +26,9 @@ const (
 	wildcard   = "*"
 )
 
+// Default request/response body buffer limit to ensure full body can be read when plugin is used alone
+const defaultMaxBodyBytes uint32 = 100 * 1024 * 1024
+
 // Redis key prefix for per-user request counting (independent from existing prefixes)
 const quotaReqCountPrefix = "chat_quota_req_count:"
 
@@ -1328,9 +1331,14 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 	context.SetContext("userId", userId)
 	context.SetContext("employeeNumber", employeeNumber)
 
-	// Buffer request body to extract model info
-	// Note: ai-proxy plugin (priority 100) may have already buffered the request body
-	// This call is safe and won't conflict with existing buffering
+	// Ensure request body is buffered like ai-proxy so this plugin can work standalone
+	// - Disable reroute before modifying headers
+	// - Remove headers that may interfere with body buffering/replacement
+	// - Set a large enough buffer limit for request body
+	context.DisableReroute()
+	_ = proxywasm.RemoveHttpRequestHeader("Accept-Encoding")
+	_ = proxywasm.RemoveHttpRequestHeader("Content-Length")
+	context.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
 	context.BufferRequestBody()
 	return types.HeaderStopIteration
 }
