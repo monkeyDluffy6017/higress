@@ -1,10 +1,12 @@
-module ai-llm-router
+module github.com/alibaba/higress/plugins/wasm-go/extensions/ai-llm-router
 
 go 1.24.1
 
+toolchain go1.24.3
+
 require (
-	github.com/monkeyDluffy6017/proxy-wasm-go-sdk v0.0.0-20250809050325-76d64f332157
-	github.com/monkeyDluffy6017/wasm-go v0.0.0-20250809060223-480f9756e05e
+	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20250611100342-5654e89a7a80
+	github.com/higress-group/wasm-go v1.0.1-0.20250628101008-bea7da01a545
 	github.com/tidwall/gjson v1.18.0
 )
 
