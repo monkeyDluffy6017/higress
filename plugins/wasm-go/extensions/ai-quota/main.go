@@ -26,6 +26,9 @@ const (
 	wildcard   = "*"
 )
 
+// Redis key prefix for per-user request counting (independent from existing prefixes)
+const quotaReqCountPrefix = "chat_quota_req_count:"
+
 // Provider types for AI services
 const (
 	ProviderTypeOpenAI   = "openai"
@@ -246,6 +249,7 @@ type QuotaManagementConfig struct {
 	RedisQuotaPrefix  string             `yaml:"redis_quota_prefix"`
 	ModelQuotaWeights map[string]float64 `yaml:"model_quota_weights"`
 	CacheTTLSeconds   int                `yaml:"cache_ttl_seconds"` // Cache TTL in seconds, default 60s
+	DeductReqNum      int                `yaml:"deduct_req_num"`    // Trigger deduction on every N-th request when header not present; 0 disables
 }
 
 type QuotaConfig struct {
@@ -871,6 +875,12 @@ func parseConfig(json gjson.Result, config *QuotaConfig, log wrapper.Log) error 
 	config.QuotaManagement.CacheTTLSeconds = int(quotaManagement.Get("cache_ttl_seconds").Int())
 	if config.QuotaManagement.CacheTTLSeconds <= 0 {
 		config.QuotaManagement.CacheTTLSeconds = 60 // Default 60 seconds
+	}
+
+	// Parse deduct request number (times-based deduction). 0 or negative disables this channel
+	config.QuotaManagement.DeductReqNum = int(quotaManagement.Get("deduct_req_num").Int())
+	if config.QuotaManagement.DeductReqNum < 0 {
+		config.QuotaManagement.DeductReqNum = 0
 	}
 
 	// Parse star check management configuration
@@ -1604,7 +1614,7 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 
 	// Check if sufficient quota is available
 	if remainingQuota >= quotaWeight {
-		// Check if we need to deduct quota based on header
+		// First channel: header-based deduction
 		deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.QuotaManagement.DeductHeader)
 		shouldDeduct := err == nil && deductHeaderValue == config.QuotaManagement.DeductHeaderValue
 
@@ -1612,15 +1622,50 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 			// Use Redis native INCRBYFLOAT for atomic quota deduction
 			usedKey := config.QuotaManagement.RedisUsedPrefix + userId
 			config.redisClient.IncrByFloat(usedKey, quotaWeight, func(response resp.Value) {
-				handleQuotaDeductionResponse(ctx, response, userId, quotaWeight, modelName, remainingQuota, log)
+				handleQuotaDeductionResponse(ctx, config, response, userId, quotaWeight, modelName, remainingQuota, log)
 			})
-		} else {
-			// No quota deduction needed: allow request to continue without Redis queries
-			log.Debugf("Quota deduction not required for user %s (header: %s != %s), allowing request",
-				userId, deductHeaderValue, config.QuotaManagement.DeductHeaderValue)
-			proxywasm.ResumeHttpRequest()
 			return
 		}
+
+		// Second channel: times-based deduction (only if enabled)
+		if config.QuotaManagement.DeductReqNum > 0 {
+			countKey := quotaReqCountPrefix + userId
+			config.redisClient.Incr(countKey, func(incrResp resp.Value) {
+				if wrapper.IsRedisErrorResponse(incrResp) {
+					// Counting error: do not block the request; allow it to continue
+					log.Warnf("Failed to increment request count for user %s: %v. Allowing request without deduction.",
+						userId, wrapper.GetRedisErrorFromResponse(incrResp))
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+
+				// Read counter as integer for exact modulus
+				cntStr := incrResp.String()
+				newCountInt, parseErr := strconv.ParseInt(cntStr, 10, 64)
+				if parseErr != nil {
+					log.Warnf("Failed to parse request count '%s' for user %s: %v. Allowing request without deduction.", cntStr, userId, parseErr)
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+				a := int64(config.QuotaManagement.DeductReqNum)
+				if a > 0 && newCountInt%a == 0 {
+					// Hit the threshold on an exact multiple; perform deduction
+					usedKey := config.QuotaManagement.RedisUsedPrefix + userId
+					config.redisClient.IncrByFloat(usedKey, quotaWeight, func(response resp.Value) {
+						handleQuotaDeductionResponse(ctx, config, response, userId, quotaWeight, modelName, remainingQuota, log)
+					})
+				} else {
+					// Not the threshold request; allow request without deduction
+					proxywasm.ResumeHttpRequest()
+				}
+			})
+			return
+		}
+
+		// No deduction channel matched; allow request to continue
+		log.Debugf("Quota deduction not required for user %s (no header and deduct_req_num disabled), allowing request", userId)
+		proxywasm.ResumeHttpRequest()
+		return
 	} else {
 		log.Warnf("Insufficient quota for user %s: remaining=%f, required=%f", userId, remainingQuota, quotaWeight)
 		sendJSONResponse(http.StatusForbidden, "quota-check.insufficient_quota",
@@ -1644,7 +1689,7 @@ func incrementFloatValue(redisClient wrapper.RedisClient, key string, delta floa
 	})
 }
 
-func handleQuotaDeductionResponse(ctx wrapper.HttpContext, incrResponse resp.Value, userId string, quotaWeight float64, modelName string, remainingQuota float64, log wrapper.Log) {
+func handleQuotaDeductionResponse(ctx wrapper.HttpContext, config QuotaConfig, incrResponse resp.Value, userId string, quotaWeight float64, modelName string, remainingQuota float64, log wrapper.Log) {
 	if wrapper.IsRedisErrorResponse(incrResponse) {
 		redisErr := wrapper.GetRedisErrorFromResponse(incrResponse)
 		log.Errorf("Failed to deduct quota for user %s: %v", userId, redisErr)
@@ -1672,9 +1717,11 @@ func handleQuotaDeductionResponse(ctx wrapper.HttpContext, incrResponse resp.Val
 	log.Infof("Successfully deducted %f quota for user %s, model %s. Previous used: %f, New used: %f",
 		quotaWeight, userId, modelName, expectedPreviousUsed, newUsedQuotaFloat)
 
-	// Additional debug information
-	log.Debugf("Quota deduction details for user %s: deducted=%f, new_used=%f, expected_previous=%f",
-		userId, quotaWeight, newUsedQuotaFloat, expectedPreviousUsed)
+	// If times-based deduction is enabled, clear the request counter after a successful deduction
+	if config.QuotaManagement.DeductReqNum > 0 {
+		countKey := quotaReqCountPrefix + userId
+		_ = config.redisClient.Set(countKey, 0, func(_ resp.Value) {})
+	}
 
 	proxywasm.ResumeHttpRequest()
 }
