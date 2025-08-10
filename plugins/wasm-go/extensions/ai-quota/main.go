@@ -147,6 +147,7 @@ func main() {
 		wrapper.ParseConfigBy(parseConfig),
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
+		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBodyBy(onHttpStreamingResponseBody),
 	)
 }
@@ -1614,56 +1615,19 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 
 	// Check if sufficient quota is available
 	if remainingQuota >= quotaWeight {
-		// First channel: header-based deduction
+		// Record deduction intent only; real deduction happens on 2xx response
 		deductHeaderValue, err := proxywasm.GetHttpRequestHeader(config.QuotaManagement.DeductHeader)
-		shouldDeduct := err == nil && deductHeaderValue == config.QuotaManagement.DeductHeaderValue
+		headerMatched := err == nil && deductHeaderValue == config.QuotaManagement.DeductHeaderValue
 
-		if shouldDeduct {
-			// Use Redis native INCRBYFLOAT for atomic quota deduction
-			usedKey := config.QuotaManagement.RedisUsedPrefix + userId
-			config.redisClient.IncrByFloat(usedKey, quotaWeight, func(response resp.Value) {
-				handleQuotaDeductionResponse(ctx, config, response, userId, quotaWeight, modelName, remainingQuota, log)
-			})
-			return
-		}
+		ctx.SetContext("quota_deduct_amount", quotaWeight)
+		ctx.SetContext("quota_header_matched", headerMatched)
+		ctx.SetContext("quota_model", modelName)
+		ctx.SetContext("quota_finalized", false)
 
-		// Second channel: times-based deduction (only if enabled)
-		if config.QuotaManagement.DeductReqNum > 0 {
-			countKey := quotaReqCountPrefix + userId
-			config.redisClient.Incr(countKey, func(incrResp resp.Value) {
-				if wrapper.IsRedisErrorResponse(incrResp) {
-					// Counting error: do not block the request; allow it to continue
-					log.Warnf("Failed to increment request count for user %s: %v. Allowing request without deduction.",
-						userId, wrapper.GetRedisErrorFromResponse(incrResp))
-					proxywasm.ResumeHttpRequest()
-					return
-				}
+		log.Debugf("[request] marked deduction intent for user %s, model %s, amount %f, headerMatched=%t, timesEnabled=%t",
+			userId, modelName, quotaWeight, headerMatched, config.QuotaManagement.DeductReqNum > 0)
 
-				// Read counter as integer for exact modulus
-				cntStr := incrResp.String()
-				newCountInt, parseErr := strconv.ParseInt(cntStr, 10, 64)
-				if parseErr != nil {
-					log.Warnf("Failed to parse request count '%s' for user %s: %v. Allowing request without deduction.", cntStr, userId, parseErr)
-					proxywasm.ResumeHttpRequest()
-					return
-				}
-				a := int64(config.QuotaManagement.DeductReqNum)
-				if a > 0 && newCountInt%a == 0 {
-					// Hit the threshold on an exact multiple; perform deduction
-					usedKey := config.QuotaManagement.RedisUsedPrefix + userId
-					config.redisClient.IncrByFloat(usedKey, quotaWeight, func(response resp.Value) {
-						handleQuotaDeductionResponse(ctx, config, response, userId, quotaWeight, modelName, remainingQuota, log)
-					})
-				} else {
-					// Not the threshold request; allow request without deduction
-					proxywasm.ResumeHttpRequest()
-				}
-			})
-			return
-		}
-
-		// No deduction channel matched; allow request to continue
-		log.Debugf("Quota deduction not required for user %s (no header and deduct_req_num disabled), allowing request", userId)
+		// Always allow request to continue; deduction will be finalized on response (2xx only)
 		proxywasm.ResumeHttpRequest()
 		return
 	} else {
@@ -1717,26 +1681,80 @@ func handleQuotaDeductionResponse(ctx wrapper.HttpContext, config QuotaConfig, i
 	log.Infof("Successfully deducted %f quota for user %s, model %s. Previous used: %f, New used: %f",
 		quotaWeight, userId, modelName, expectedPreviousUsed, newUsedQuotaFloat)
 
-	// If times-based deduction is enabled, clear the request counter after a successful deduction
-	if config.QuotaManagement.DeductReqNum > 0 {
-		countKey := quotaReqCountPrefix + userId
-		_ = config.redisClient.Set(countKey, 0, func(_ resp.Value) {})
-	}
-
 	proxywasm.ResumeHttpRequest()
 }
 
 func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool, log wrapper.Log) []byte {
+	return data
+}
+
+// onHttpResponseHeaders finalizes quota deduction based on upstream HTTP status code
+func onHttpResponseHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Action {
 	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
-	if !ok {
-		return data
-	}
-	if chatMode == ChatModeNone || chatMode == ChatModeAdmin {
-		return data
+	if !ok || chatMode == ChatModeNone || chatMode == ChatModeAdmin {
+		return types.ActionContinue
 	}
 
-	// chat completion mode - no longer need to deduct quota here as it's handled in request headers
-	return data
+	// Avoid duplicate finalization
+	if finalized, _ := ctx.GetContext("quota_finalized").(bool); finalized {
+		return types.ActionContinue
+	}
+
+	statusStr, err := proxywasm.GetHttpResponseHeader(":status")
+	if err != nil || statusStr == "" {
+		return types.ActionContinue
+	}
+	statusCode, err := strconv.Atoi(statusStr)
+	if err != nil {
+		return types.ActionContinue
+	}
+
+	amountAny, hasAmount := ctx.GetContext("quota_deduct_amount")
+	if !hasAmount {
+		ctx.SetContext("quota_finalized", true)
+		return types.ActionContinue
+	}
+	quotaWeight, _ := amountAny.(float64)
+	if quotaWeight <= 0 {
+		ctx.SetContext("quota_finalized", true)
+		return types.ActionContinue
+	}
+
+	userId, _ := ctx.GetContext("userId").(string)
+	headerMatched, _ := ctx.GetContext("quota_header_matched").(bool)
+
+	if statusCode >= 200 && statusCode < 300 {
+		usedKey := config.QuotaManagement.RedisUsedPrefix + userId
+		if headerMatched {
+			config.redisClient.IncrByFloat(usedKey, quotaWeight, func(response resp.Value) {
+				// best effort; errors are logged in streaming code path
+			})
+			// 当启用按次数通道时，命中 header 扣减需重置计数器
+			if config.QuotaManagement.DeductReqNum > 0 {
+				countKey := quotaReqCountPrefix + userId
+				_ = config.redisClient.Set(countKey, 0, func(_ resp.Value) {})
+			}
+		} else if config.QuotaManagement.DeductReqNum > 0 {
+			countKey := quotaReqCountPrefix + userId
+			n := int64(config.QuotaManagement.DeductReqNum)
+			config.redisClient.Incr(countKey, func(incrResp resp.Value) {
+				if incrResp.Error() != nil {
+					return
+				}
+				cntStr := incrResp.String()
+				newCountInt, parseErr := strconv.ParseInt(cntStr, 10, 64)
+				if parseErr != nil {
+					return
+				}
+				if n > 0 && newCountInt%n == 0 {
+					config.redisClient.IncrByFloat(usedKey, quotaWeight, func(_ resp.Value) {})
+				}
+			})
+		}
+	}
+
+	ctx.SetContext("quota_finalized", true)
+	return types.ActionContinue
 }
 
 func getOperationMode(path string, adminPath string, log wrapper.Log) (ChatMode, AdminMode) {
