@@ -174,6 +174,7 @@ jobs:
     env:
       GATEWAY_IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY || 'higress-registry.cn-hangzhou.cr.aliyuncs.com' }}
       GATEWAY_IMAGE_NAME: ${{ vars.GATEWAY_IMAGE_NAME || 'higress/gateway' }}
+      ENVOY_PACKAGE_URL_PATTERN: ${{ vars.ENVOY_PACKAGE_URL_PATTERN }}
     steps:
       - name: "Checkout ${{ github.ref }}"
         uses: actions/checkout@v4
@@ -250,7 +251,11 @@ jobs:
               HUB=${image%:*}
               HUB=${HUB%/*}
               BUILT_IMAGE="$HUB/proxyv2:$TAG"
-              GOPROXY="https://proxy.golang.org,direct" IMG_URL="$BUILT_IMAGE" ISTIO_ENVOY_LINUX_RELEASE_URL="" make build-gateway
+              GOPROXY="https://proxy.golang.org,direct" \
+              IMG_URL="$BUILT_IMAGE" \
+              BUILDX_PLATFORM="linux/amd64" \
+              ENVOY_PACKAGE_URL_PATTERN="${{ env.ENVOY_PACKAGE_URL_PATTERN }}" \
+              make build-gateway
             fi
             if [ "$BUILT_IMAGE" != "$image" ]; then
               docker buildx imagetools create $BUILT_IMAGE --tag $image
