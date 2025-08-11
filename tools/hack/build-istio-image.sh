@@ -22,8 +22,6 @@ cd ${ROOT}/external/istio
 rm -rf out/linux_${TARGET_ARCH};
 
 CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${ROOT}/external/package,destination=/home/package "
-# # 挂载本地 envoy 源码以配合 external/proxy 的本地仓库覆盖
-# CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${ROOT}/external/envoy,destination=/home/envoy "
 
 DOCKER_RUN_OPTIONS+="-e HTTP_PROXY -e HTTPS_PROXY"
 
@@ -45,18 +43,12 @@ fi
 echo "HUB=$HUB"
 echo "TAG=$TAG"
 
-# Limit build to single arch (default to TARGET_ARCH) and single platform to avoid arm64 artifacts
-# These envs are honored by Istio's makefiles (tools/istio-docker.mk and related scripts)
-ARCHS=${ARCHS:-${TARGET_ARCH}}
-DOCKERX_PLATFORMS=${DOCKERX_PLATFORMS:-linux/${TARGET_ARCH}}
-
 GOOS_LOCAL=linux TARGET_OS=linux TARGET_ARCH=${TARGET_ARCH} \
     ISTIO_ENVOY_LINUX_RELEASE_URL=${ISTIO_ENVOY_LINUX_RELEASE_URL} \
     BUILD_WITH_CONTAINER=1 \
     USE_REAL_USER=${USE_REAL_USER:-0} \
     CONDITIONAL_HOST_MOUNTS=${CONDITIONAL_HOST_MOUNTS} \
     DOCKER_BUILD_VARIANTS=default DOCKER_TARGETS="${DOCKER_TARGETS}" \
-    ARCHS="${ARCHS}" DOCKERX_PLATFORMS="${DOCKERX_PLATFORMS}" \
     ISTIO_BASE_REGISTRY="${ORIGINAL_HUB}" \
     BASE_VERSION="${HIGRESS_BASE_VERSION}" \
     DOCKER_RUN_OPTIONS=${DOCKER_RUN_OPTIONS} \

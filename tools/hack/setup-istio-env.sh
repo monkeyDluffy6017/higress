@@ -20,10 +20,7 @@ TARGET_ARCH=${TARGET_ARCH-"amd64"}
 
 ROOT=$(cd "$(dirname -- "$0")/../.." > /dev/null && pwd -P)
 
-# 仅在未定义时设置默认下载地址；如果外部显式设置为空，表示禁用下载并转为源码构建
-if [ -z "${ISTIO_ENVOY_LINUX_RELEASE_URL+x}" ]; then
 ISTIO_ENVOY_LINUX_RELEASE_URL="${ENVOY_PACKAGE_URL_PATTERN/ARCH/${TARGET_ARCH}}"
-fi
 
 CONDITIONAL_HOST_MOUNTS="\
     --mount "type=bind,source=${ROOT},destination=/parent" \

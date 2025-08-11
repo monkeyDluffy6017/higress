@@ -239,11 +239,6 @@ jobs:
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
-      # - name: Build Envoy binaries with local changes (amd64)
-      #   run: |
-      #     echo "Building Envoy (amd64) from external/envoy with local patches..."
-      #     TARGET_ARCH=amd64 make build-envoy
-
       - name: Build Gateway Image and Push
         run: |
           BUILT_IMAGE=""

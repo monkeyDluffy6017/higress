@@ -147,19 +147,21 @@ export PARENT_GIT_REVISION:=$(TAG)
 export ENVOY_PACKAGE_URL_PATTERN?=https://github.com/higress-group/proxy/releases/download/v2.1.8/envoy-symbol-ARCH.tar.gz
 
 build-envoy: prebuild
-	TARGET_ARCH=amd64 ./tools/hack/build-envoy.sh
+	./tools/hack/build-envoy.sh
 
 build-pilot: prebuild
 	TARGET_ARCH=amd64 ./tools/hack/build-istio-pilot.sh
+	TARGET_ARCH=arm64 ./tools/hack/build-istio-pilot.sh
 
 build-pilot-local: prebuild
 	TARGET_ARCH=${TARGET_ARCH} ./tools/hack/build-istio-pilot.sh
 
 buildx-prepare:
-	docker buildx inspect multi-arch >/dev/null 2>&1 || docker buildx create --name multi-arch --platform linux/amd64 --use
+	docker buildx inspect multi-arch >/dev/null 2>&1 || docker buildx create --name multi-arch --platform linux/amd64,linux/arm64 --use
 
 build-gateway: prebuild buildx-prepare build-golang-filter
-	USE_REAL_USER=1 ISTIO_ENVOY_LINUX_RELEASE_URL="" TARGET_ARCH=amd64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh init
+	USE_REAL_USER=1 TARGET_ARCH=amd64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh init
+	USE_REAL_USER=1 TARGET_ARCH=arm64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh init
 	DOCKER_TARGETS="docker.proxyv2" IMG_URL="${IMG_URL}" ./tools/hack/build-istio-image.sh docker.buildx
 
 build-gateway-local: prebuild build-golang-filter
@@ -167,6 +169,7 @@ build-gateway-local: prebuild build-golang-filter
 
 build-golang-filter:
 	TARGET_ARCH=amd64 ./tools/hack/build-golang-filters.sh
+	TARGET_ARCH=arm64 ./tools/hack/build-golang-filters.sh
 
 build-istio: prebuild buildx-prepare
 	DOCKER_TARGETS="docker.pilot" IMG_URL="${IMG_URL}" ./tools/hack/build-istio-image.sh docker.buildx
