@@ -166,7 +166,11 @@ build-gateway: prebuild buildx-prepare build-golang-filter
 	if echo "$(BUILDX_PLATFORM)" | grep -q "linux/arm64"; then \
 		USE_REAL_USER=1 TARGET_ARCH=arm64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh init; \
 	fi
-	DOCKER_TARGETS="docker.proxyv2" IMG_URL="${IMG_URL}" ./tools/hack/build-istio-image.sh docker.buildx
+	@if [ "$(BUILDX_PLATFORM)" = "linux/amd64" ]; then \
+		DOCKER_TARGETS="docker.proxyv2" IMG_URL="${IMG_URL}" DOCKER_ARCHITECTURES="linux/amd64" ./tools/hack/build-istio-image.sh push.docker.proxyv2; \
+	else \
+		DOCKER_TARGETS="docker.proxyv2" IMG_URL="${IMG_URL}" DOCKER_ARCHITECTURES="$(BUILDX_PLATFORM)" ./tools/hack/build-istio-image.sh docker.buildx; \
+	fi
 
 build-gateway-local: prebuild build-golang-filter
 	TARGET_ARCH=${TARGET_ARCH} DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh docker
