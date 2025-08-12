@@ -30,7 +30,7 @@ RELEASE_LDFLAGS='$(GO_LDFLAGS) -extldflags -static -s -w'
 export OUT:=$(TARGET_OUT)
 export OUT_LINUX:=$(TARGET_OUT_LINUX)
 
-BUILDX_PLATFORM ?=
+BUILDX_PLATFORM ?= linux/amd64,linux/arm64
 
 # If tag not explicitly set in users' .istiorc.mk or command line, default to the git sha.
 TAG ?= $(shell git rev-parse --verify HEAD)
@@ -157,19 +157,27 @@ build-pilot-local: prebuild
 	TARGET_ARCH=${TARGET_ARCH} ./tools/hack/build-istio-pilot.sh
 
 buildx-prepare:
-	docker buildx inspect multi-arch >/dev/null 2>&1 || docker buildx create --name multi-arch --platform linux/amd64,linux/arm64 --use
+    docker buildx inspect multi-arch >/dev/null 2>&1 || docker buildx create --name multi-arch --platform $(BUILDX_PLATFORM) --use
 
 build-gateway: prebuild buildx-prepare build-golang-filter
-	USE_REAL_USER=1 TARGET_ARCH=amd64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh init
-	USE_REAL_USER=1 TARGET_ARCH=arm64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh init
-	DOCKER_TARGETS="docker.proxyv2" IMG_URL="${IMG_URL}" ./tools/hack/build-istio-image.sh docker.buildx
+    if echo "$(BUILDX_PLATFORM)" | grep -q "linux/amd64"; then \
+        USE_REAL_USER=1 TARGET_ARCH=amd64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh init; \
+    fi
+    if echo "$(BUILDX_PLATFORM)" | grep -q "linux/arm64"; then \
+        USE_REAL_USER=1 TARGET_ARCH=arm64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh init; \
+    fi
+    DOCKER_TARGETS="docker.proxyv2" IMG_URL="${IMG_URL}" ./tools/hack/build-istio-image.sh docker.buildx
 
 build-gateway-local: prebuild build-golang-filter
 	TARGET_ARCH=${TARGET_ARCH} DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh docker
 
 build-golang-filter:
-	TARGET_ARCH=amd64 ./tools/hack/build-golang-filters.sh
-	TARGET_ARCH=arm64 ./tools/hack/build-golang-filters.sh
+    if echo "$(BUILDX_PLATFORM)" | grep -q "linux/amd64"; then \
+        TARGET_ARCH=amd64 ./tools/hack/build-golang-filters.sh; \
+    fi
+    if echo "$(BUILDX_PLATFORM)" | grep -q "linux/arm64"; then \
+        TARGET_ARCH=arm64 ./tools/hack/build-golang-filters.sh; \
+    fi
 
 build-istio: prebuild buildx-prepare
 	DOCKER_TARGETS="docker.pilot" IMG_URL="${IMG_URL}" ./tools/hack/build-istio-image.sh docker.buildx
