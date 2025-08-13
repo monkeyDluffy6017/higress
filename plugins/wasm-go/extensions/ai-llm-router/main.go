@@ -138,6 +138,10 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 		}
 	}
 
+	// summary logs for debugging
+	log.Infof("[ai-llm-router] analyzer.enabled=%v baseUrl=%s model=%s timeoutMs=%d maxInputBytes=%d protocol=%s",
+		config.analyzer.enabled, config.analyzer.baseUrl, config.analyzer.model, config.analyzer.timeoutMs, config.analyzer.maxInputBytes, config.analyzer.protocol)
+
 	// input extraction
 	config.inputExtraction.protocol = j.Get("inputExtraction.protocol").String()
 	if config.inputExtraction.protocol == "" {
@@ -182,11 +186,14 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 			config.routing.candidates = append(config.routing.candidates, c)
 		}
 	}
+	log.Infof("[ai-llm-router] routing candidates=%d providerIdHeader=%s fallback=%s minScore=%d",
+		len(config.routing.candidates), config.routing.providerIdHeader, config.routing.fallbackProviderId, config.routing.minScore)
 	return nil
 }
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config, log logs.Log) types.Action {
 	// 我们需要读取请求体进行语义分析
+	log.Debug("[ai-llm-router] onHttpRequestHeaders: disable reroute and buffer body")
 	ctx.DisableReroute()
 	ctx.SetRequestBodyBufferLimit(1024 * 1024)
 	return types.HeaderStopIteration
@@ -195,14 +202,17 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config, log logs.Log) 
 func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) types.Action {
 	// 若未启用 analyzer 或缺少必要配置，直接继续
 	if !config.analyzer.enabled || config.analyzer.client == nil || config.analyzer.path == "" || config.analyzer.apiToken == "" || config.analyzer.model == "" {
+		logs.Debugf("[ai-llm-router] analyzer disabled or not configured, skip routing")
 		return types.ActionContinue
 	}
 
 	// 提取用户输入
 	userText := extractUserInput(body, config.inputExtraction, config.analyzer.maxInputBytes)
 	if strings.TrimSpace(userText) == "" {
+		logs.Debugf("[ai-llm-router] empty user text after extraction, skip routing")
 		return types.ActionContinue
 	}
+	logs.Debugf("[ai-llm-router] extracted user text bytes=%d protocol=%s", len([]byte(userText)), config.inputExtraction.protocol)
 
 	// 组织请求体
 	prompt := buildPrompt(config.analyzer.promptTemplate, userText)
@@ -222,6 +232,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	send = func() {
 		remaining := time.Until(deadline) / time.Millisecond
 		if remaining <= 0 {
+			logs.Warnf("[ai-llm-router] analyzer deadline reached, stop retrying")
 			_ = proxywasm.ResumeHttpRequest()
 			return
 		}
@@ -229,6 +240,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 		if callTimeout == 0 || int64(callTimeout) > int64(remaining) {
 			callTimeout = uint32(remaining)
 		}
+		logs.Debugf("[ai-llm-router] analyzer attempt=%d timeoutMs=%d remainingMs=%d path=%s", attempt+1, callTimeout, remaining, config.analyzer.path)
 		err := config.analyzer.client.Post(
 			config.analyzer.path,
 			headers,
@@ -236,25 +248,30 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 			func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 				label := classifyLabel(statusCode, responseBody)
 				if label != "other" {
+					logs.Infof("[ai-llm-router] analyzer classified label=%s", label)
 					selected := selectProvider(label, config.routing)
 					if selected != "" {
 						_ = proxywasm.ReplaceHttpRequestHeader(config.routing.providerIdHeader, selected)
 						ctx.SetContext("selectedProviderId", selected)
+						logs.Infof("[ai-llm-router] selected provider=%s", selected)
 					}
 					_ = proxywasm.ResumeHttpRequest()
 					return
 				}
 				// 非成功或无法解析到标签 -> 重试
 				if attempt < maxRetries && time.Until(deadline) > 0 {
+					logs.Warnf("[ai-llm-router] analyzer classify failed (status=%d), retrying... attempt=%d", statusCode, attempt+2)
 					attempt++
 					send()
 					return
 				}
+				logs.Warnf("[ai-llm-router] analyzer classify failed and no more retries, status=%d", statusCode)
 				_ = proxywasm.ResumeHttpRequest()
 			},
 			callTimeout,
 		)
 		if err != nil {
+			logs.Warnf("[ai-llm-router] analyzer http error: %v", err)
 			if attempt < maxRetries && time.Until(deadline) > 0 {
 				attempt++
 				send()
@@ -272,6 +289,7 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config Config) types.Action 
 	if v := ctx.GetContext("selectedProviderId"); v != nil {
 		if id, _ := v.(string); id != "" {
 			_ = proxywasm.ReplaceHttpResponseHeader("x-select-llm", id)
+			logs.Debugf("[ai-llm-router] response header x-select-llm=%s", id)
 		}
 	}
 	return types.ActionContinue
