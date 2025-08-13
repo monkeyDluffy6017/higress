@@ -82,6 +82,16 @@ strategy:
       fallbackProviderId: "openai"
       tieBreakOrder: ["deepseek", "openai"]
 
+      # 动态指标（可选）：以 dy_ 开头的模型指标，仅用于规则引擎过滤
+      dynamicMetrics:
+        redisPrefix: "llm_metrics"       # Redis Key 前缀
+        serviceName: "redis.svc"         # Higress DNS 服务名
+        servicePort: 6379                 # 端口，默认 6379（.static 服务默认 80）
+        username: ""                      # 可选
+        password: ""                      # 可选
+        timeout: 1000                     # 毫秒，可选，默认 1000
+        database: 0                       # 可选，默认 0
+
     # 规则引擎（声明式模型资格筛选，先于偏好策略执行）
     ruleEngine:
       enabled: true
@@ -101,6 +111,10 @@ strategy:
               - { fact: "model.quality_benchmark_scores.human_eval", order: desc }
               - { fact: "model.provider", order: asc }
       # 规则文件加载已移除，不再支持 rulesFile
+      # 使用说明：
+      # - 规则里凡是引用到 `model.dy_xxx` 的条件，都会在评估前从 Redis 拉取该指标。
+      # - Redis Key 结构：`<redisPrefix>:dy_xxx:<model_id>`，值支持数字或字符串。
+      # - 拉取到的值会注入到模型对象中（字段名仍为 dy_xxx），仅用于 FILTER_MODELS 过滤，不参与 analyzer 标签。
 ```
 
  重要约束

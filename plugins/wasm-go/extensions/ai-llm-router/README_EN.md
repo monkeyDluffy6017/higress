@@ -22,8 +22,8 @@ Configuration (now strategy-based)
 ```yaml
 strategy:
   type: semantic                  # Strategy type; currently supports "semantic" (semantic-based selection)
-  semantic:
-    analyzer:
+    semantic:
+      analyzer:
       enabled: true
       # Access analyzer via service-source (DNS). The upstream must be registered as a Higress service.
       serviceName: "analyzer.dns"     # required, Higress DNS service name
@@ -36,9 +36,9 @@ strategy:
       totalTimeoutMs: 10000
       maxInputBytes: 10240
       promptTemplate: ""
-      protocol: "openai"
+        protocol: "openai"
       # Optional: labels used for provider scoring and rule engine references
-      labels:
+        labels:
         - build_new_project
         - add_new_feature
         - fix_bug
@@ -46,7 +46,17 @@ strategy:
       # Required when labels are provided: subset used strictly for semantic classification.
       # When labels are not provided, this can be omitted and defaults to the built-in set.
       # If labels are provided but analysisLabels are missing, the plugin will return an error.
-      analysisLabels:
+        analysisLabels:
+
+        # Dynamic metrics (optional): model metrics starting with dy_ only for rule engine filtering
+        dynamicMetrics:
+          redisPrefix: "llm_metrics"       # Redis key prefix
+          serviceName: "redis.svc"         # Higress DNS service name
+          servicePort: 6379                 # Port, default 6379 (80 for .static service)
+          username: ""                      # Optional
+          password: ""                      # Optional
+          timeout: 1000                     # Milliseconds, optional, default 1000
+          database: 0                       # Optional, default 0
         - build_new_project
         - add_new_feature
         - fix_bug
@@ -100,7 +110,10 @@ strategy:
             sortBy:
               - { fact: "model.quality_benchmark_scores.human_eval", order: desc }
               - { fact: "model.provider", order: asc }
-      # Loading rules from file has been removed (rulesFile is no longer supported)
+      # Notes:
+      # - Any condition that references `model.dy_xxx` will trigger a Redis fetch before evaluation.
+      # - Redis key format: `<redisPrefix>:dy_xxx:<model_id>`, value can be number or string.
+      # - The fetched value is injected into the model map under the same `dy_xxx` field, used only for FILTER_MODELS, not for analyzer labels.
 ```
 
 Constraints

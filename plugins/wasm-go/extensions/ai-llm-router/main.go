@@ -14,6 +14,7 @@ import (
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/resp"
 
 	ruleengine "github.com/monkeyDluffy6017/ai-llm-rule-engine/pkg/ruleengine"
 )
@@ -86,6 +87,15 @@ type AnalyzerConfig struct {
 	port   int64
 	path   string
 	client wrapper.HttpClient
+	// dynamic metrics for rule engine filtering
+	dynamicMetricsPrefix string
+	redisServiceName     string
+	redisServicePort     int
+	redisUsername        string
+	redisPassword        string
+	redisTimeoutMs       int
+	redisDatabase        int
+	redisClient          wrapper.RedisClient
 }
 
 type InputExtractionConfig struct {
@@ -286,6 +296,37 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 			}
 		}
 	}
+	// dynamic metrics (optional) now under analyzer
+	dm := j.Get("analyzer.dynamicMetrics")
+	s.analyzer.dynamicMetricsPrefix = strings.TrimSpace(dm.Get("redisPrefix").String())
+	if s.analyzer.dynamicMetricsPrefix != "" {
+		s.analyzer.redisServiceName = dm.Get("serviceName").String()
+		s.analyzer.redisServicePort = int(dm.Get("servicePort").Int())
+		if s.analyzer.redisServicePort == 0 {
+			if strings.HasSuffix(s.analyzer.redisServiceName, ".static") {
+				s.analyzer.redisServicePort = 80
+			} else {
+				s.analyzer.redisServicePort = 6379
+			}
+		}
+		s.analyzer.redisUsername = dm.Get("username").String()
+		s.analyzer.redisPassword = dm.Get("password").String()
+		s.analyzer.redisTimeoutMs = int(dm.Get("timeout").Int())
+		if s.analyzer.redisTimeoutMs == 0 {
+			s.analyzer.redisTimeoutMs = 1000
+		}
+		s.analyzer.redisDatabase = int(dm.Get("database").Int())
+		if s.analyzer.redisServiceName != "" {
+			s.analyzer.redisClient = wrapper.NewRedisClusterClient(wrapper.FQDNCluster{
+				FQDN: s.analyzer.redisServiceName,
+				Port: int64(s.analyzer.redisServicePort),
+			})
+			_ = s.analyzer.redisClient.Init(s.analyzer.redisUsername, s.analyzer.redisPassword, int64(s.analyzer.redisTimeoutMs), wrapper.WithDataBase(s.analyzer.redisDatabase))
+			log.Infof("[ai-llm-router] dynamic metrics redis ready: service=%s port=%d prefix=%s", s.analyzer.redisServiceName, s.analyzer.redisServicePort, s.analyzer.dynamicMetricsPrefix)
+		} else {
+			log.Warnf("[ai-llm-router] dynamicMetrics.redisPrefix is set but serviceName is empty; dynamic metrics disabled")
+		}
+	}
 	log.Infof("[ai-llm-router] ruleEngine.enabled=%v inlineRules=%d",
 		s.ruleEngine.enabled, len(s.ruleEngine.inlineRules))
 	return nil
@@ -302,6 +343,18 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 	// 规则引擎第一阶段：若启用，则优先使用规则引擎对 available models 进行资格筛选
 	var prefiltered []map[string]any
 	if s.ruleEngine.enabled {
+		// If dynamic metrics are needed, handle asynchronously
+		if needsDynamicMetrics(s.analyzer) {
+			startRuleEngineWithDynamic(ctx, s.analyzer, s.ruleEngine, body, func(qms []map[string]any) {
+				if len(qms) > 0 {
+					bs, _ := json.Marshal(map[string]any{"qualified_models": qms})
+					_ = proxywasm.ReplaceHttpRequestHeader("x-qualified-models", string(bs))
+				}
+				// continue analyzer flow after rule engine completes
+				continueAnalyzerFlow(ctx, s, body)
+			})
+			return types.ActionPause
+		}
 		if qms, err := runRuleEngine(s.ruleEngine, body, nil, nil); err != nil {
 			logs.Warnf("[ai-llm-router] rule engine evaluate error: %v", err)
 		} else if len(qms) > 0 {
@@ -695,6 +748,194 @@ func runRuleEngine(cfg RuleEngineConfig, body []byte, extraRequestContext map[st
 		qms = append(qms, m)
 	}
 	return qms, nil
+}
+
+// needsDynamicMetrics checks if dynamic metrics are configured
+func needsDynamicMetrics(a AnalyzerConfig) bool {
+	return a.dynamicMetricsPrefix != "" && a.redisClient != nil
+}
+
+// startRuleEngineWithDynamic loads dy_ metrics from Redis and evaluates rules asynchronously
+func startRuleEngineWithDynamic(ctx wrapper.HttpContext, a AnalyzerConfig, cfg RuleEngineConfig, body []byte, done func([]map[string]any)) {
+	// Build reqCtx and models same as runRuleEngine
+	reqCtx := ruleengine.RequestContext{
+		"task_type": gjson.GetBytes(body, "task_type").String(),
+		"mode":      gjson.GetBytes(body, "mode").String(),
+		"language":  gjson.GetBytes(body, "language").String(),
+	}
+	// available models
+	var models []ruleengine.Model
+	if arr := gjson.GetBytes(body, "routing.available_models"); arr.Exists() && arr.IsArray() {
+		a := arr.Array()
+		models = make([]ruleengine.Model, 0, len(a))
+		for _, m := range a {
+			models = append(models, mapFromGJSON(m))
+		}
+	}
+	rules := cfg.inlineRules
+	if len(models) == 0 || len(rules) == 0 {
+		done(nil)
+		return
+	}
+
+	// Scan dynamic metrics in rules: look for facts with prefix model.dy_
+	dynSet := map[string]struct{}{}
+	for _, r := range rules {
+		// all/any/not conditions
+		for _, c := range r.Conditions.All {
+			if strings.HasPrefix(c.Fact, "model.dy_") {
+				dynSet[c.Fact[len("model."):]] = struct{}{}
+			}
+		}
+		for _, c := range r.Conditions.Any {
+			if strings.HasPrefix(c.Fact, "model.dy_") {
+				dynSet[c.Fact[len("model."):]] = struct{}{}
+			}
+		}
+		if r.Conditions.Not != nil && strings.HasPrefix(r.Conditions.Not.Fact, "model.dy_") {
+			dynSet[r.Conditions.Not.Fact[len("model."):]] = struct{}{}
+		}
+	}
+	if len(dynSet) == 0 {
+		// No dynamic metrics needed, evaluate directly
+		res, err := ruleengine.New().Evaluate(reqCtx, models, rules)
+		if err != nil || len(res.QualifiedModels) == 0 {
+			done(nil)
+			return
+		}
+		qms := make([]map[string]any, 0, len(res.QualifiedModels))
+		for _, m := range res.QualifiedModels {
+			qms = append(qms, m)
+		}
+		done(qms)
+		return
+	}
+
+	// Collect metrics list
+	metrics := make([]string, 0, len(dynSet))
+	for k := range dynSet {
+		metrics = append(metrics, k) // k like dy_xxx
+	}
+
+	// For each model and each metric, fetch from Redis: prefix:metric:modelId
+	// Assume a model id field exists: model_id
+	pending := 0
+	// Protect when no async calls scheduled
+	scheduled := false
+	for i := range models {
+		modelId, _ := models[i]["model_id"].(string)
+		if modelId == "" {
+			continue
+		}
+		for _, mname := range metrics {
+			key := a.dynamicMetricsPrefix + ":" + mname + ":" + modelId
+			pending++
+			scheduled = true
+			a.redisClient.Get(key, func(respVal resp.Value) {
+				// On response
+				if err := respVal.Error(); err == nil && !respVal.IsNull() {
+					// Try parse float first, else keep string
+					valStr := respVal.String()
+					// store as float if possible
+					if f := respVal.Float(); !(f == 0 && (valStr != "0" && valStr != "0.0")) {
+						models[i]["dy_"+mname[len("dy_"):]] = f
+					} else {
+						models[i]["dy_"+mname[len("dy_"):]] = valStr
+					}
+				}
+				pending--
+				if pending == 0 {
+					// All loaded, evaluate
+					res, err := ruleengine.New().Evaluate(reqCtx, models, rules)
+					if err != nil || len(res.QualifiedModels) == 0 {
+						done(nil)
+						return
+					}
+					qms := make([]map[string]any, 0, len(res.QualifiedModels))
+					for _, m := range res.QualifiedModels {
+						qms = append(qms, m)
+					}
+					done(qms)
+				}
+			})
+		}
+	}
+	if !scheduled {
+		// No valid model ids or nothing scheduled; evaluate directly
+		res, err := ruleengine.New().Evaluate(reqCtx, models, rules)
+		if err != nil || len(res.QualifiedModels) == 0 {
+			done(nil)
+			return
+		}
+		qms := make([]map[string]any, 0, len(res.QualifiedModels))
+		for _, m := range res.QualifiedModels {
+			qms = append(qms, m)
+		}
+		done(qms)
+	}
+}
+
+// continueAnalyzerFlow continues analyzer flow after async rule engine completes
+func continueAnalyzerFlow(ctx wrapper.HttpContext, s *SemanticStrategy, body []byte) {
+	if !s.analyzer.enabled || s.analyzer.client == nil || s.analyzer.path == "" || s.analyzer.apiToken == "" || s.analyzer.model == "" {
+		logs.Debugf("[ai-llm-router] analyzer disabled or not configured, skip routing")
+		_ = proxywasm.ResumeHttpRequest()
+		return
+	}
+	userText := extractUserInput(body, s.inputExtraction, s.analyzer.maxInputBytes)
+	if strings.TrimSpace(userText) == "" {
+		logs.Debugf("[ai-llm-router] empty user text after extraction, skip routing")
+		_ = proxywasm.ResumeHttpRequest()
+		return
+	}
+	prompt := buildPrompt(s.analyzer.promptTemplate, userText, s.analyzer.analysisLabels)
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":    s.analyzer.model,
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+	})
+	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + s.analyzer.apiToken}}
+	deadline := time.Now().Add(time.Duration(s.analyzer.totalTimeoutMs) * time.Millisecond)
+	attempt := 0
+	var send func()
+	send = func() {
+		remaining := time.Until(deadline) / time.Millisecond
+		if remaining <= 0 {
+			_ = proxywasm.ResumeHttpRequest()
+			return
+		}
+		callTimeout := s.analyzer.timeoutMs
+		if callTimeout == 0 || int64(callTimeout) > int64(remaining) {
+			callTimeout = uint32(remaining)
+		}
+		err := s.analyzer.client.Post(
+			s.analyzer.path,
+			headers,
+			reqBody,
+			func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+				label := classifyLabel(statusCode, responseBody, s.analyzer.labelRegex, s.analyzer.analysisLabels)
+				if label != "" {
+					selected := selectProvider(label, s.routing)
+					if selected != "" {
+						_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, selected)
+					}
+					_ = proxywasm.ResumeHttpRequest()
+					return
+				}
+				if attempt < 3 && time.Until(deadline) > 0 {
+					attempt++
+					send()
+					return
+				}
+				_ = proxywasm.ResumeHttpRequest()
+			},
+			callTimeout,
+		)
+		if err != nil {
+			_ = proxywasm.ResumeHttpRequest()
+			return
+		}
+	}
+	send()
 }
 
 func classifyLabel(statusCode int, resp []byte, re *regexp.Regexp, fallbackLabels []string) string {
