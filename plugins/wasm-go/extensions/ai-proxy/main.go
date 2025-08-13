@@ -120,7 +120,17 @@ func saveContextsToHeaders(ctx wrapper.HttpContext) {
 }
 
 func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConfig) types.Action {
-	activeProvider := pluginConfig.GetProvider()
+	// read possible request-scoped provider override from header
+	// this enables upstream plugins to control the target provider per request
+	if overrideId, _ := proxywasm.GetHttpRequestHeader("X-HI-Provider-Id"); overrideId != "" {
+		if ok := pluginConfig.SetChosenProviderForRequest(ctx, overrideId); ok {
+			log.Debugf("[onHttpRequestHeader] provider override by header: %s", overrideId)
+		} else {
+			log.Warnf("[onHttpRequestHeader] unknown provider override id: %s", overrideId)
+		}
+	}
+
+	activeProvider := pluginConfig.GetProviderForRequest(ctx)
 
 	if activeProvider == nil {
 		log.Debugf("[onHttpRequestHeader] no active provider, skip processing")
@@ -143,7 +153,7 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 
 	path, _ := url.Parse(rawPath)
 	apiName := getApiName(path.Path)
-	providerConfig := pluginConfig.GetProviderConfig()
+	providerConfig := pluginConfig.GetProviderConfigForRequest(ctx)
 	if providerConfig.IsOriginal() {
 		if handler, ok := activeProvider.(provider.ApiNameHandler); ok {
 			apiName = handler.GetApiName(path.Path)
@@ -198,7 +208,12 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 }
 
 func onHttpRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, body []byte) types.Action {
-	activeProvider := pluginConfig.GetProvider()
+	// prefer request-scoped provider if any
+	if overrideId, _ := proxywasm.GetHttpRequestHeader("X-HI-Provider-Id"); overrideId != "" {
+		// ensure chosen provider is set, in case body arrived before headers completed
+		_ = pluginConfig.SetChosenProviderForRequest(ctx, overrideId)
+	}
+	activeProvider := pluginConfig.GetProviderForRequest(ctx)
 
 	if activeProvider == nil {
 		log.Debugf("[onHttpRequestBody] no active provider, skip processing")
@@ -212,7 +227,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig
 
 	if handler, ok := activeProvider.(provider.RequestBodyHandler); ok {
 		apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
-		providerConfig := pluginConfig.GetProviderConfig()
+		providerConfig := pluginConfig.GetProviderConfigForRequest(ctx)
 		// If retryOnFailure is enabled, save the transformed body to the context in case of retry
 		if providerConfig.IsRetryOnFailureEnabled() {
 			ctx.SetContext(provider.CtxRequestBody, body)
@@ -243,7 +258,7 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, pluginConfig config.PluginCo
 		return types.ActionContinue
 	}
 
-	activeProvider := pluginConfig.GetProvider()
+	activeProvider := pluginConfig.GetProviderForRequest(ctx)
 
 	if activeProvider == nil {
 		log.Debugf("[onHttpResponseHeaders] no active provider, skip processing")
@@ -253,7 +268,7 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, pluginConfig config.PluginCo
 
 	log.Debugf("[onHttpResponseHeaders] provider=%s", activeProvider.GetProviderType())
 
-	providerConfig := pluginConfig.GetProviderConfig()
+	providerConfig := pluginConfig.GetProviderConfigForRequest(ctx)
 	apiTokenInUse := providerConfig.GetApiTokenInUse(ctx)
 	apiTokens := providerConfig.GetAvailableApiToken(ctx)
 
@@ -296,7 +311,7 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, pluginConfig config.PluginCo
 }
 
 func onStreamingResponseBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, chunk []byte, isLastChunk bool) []byte {
-	activeProvider := pluginConfig.GetProvider()
+	activeProvider := pluginConfig.GetProviderForRequest(ctx)
 
 	if activeProvider == nil {
 		log.Debugf("[onStreamingResponseBody] no active provider, skip processing")
@@ -350,7 +365,7 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, pluginConfig config.Plugin
 }
 
 func onHttpResponseBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, body []byte) types.Action {
-	activeProvider := pluginConfig.GetProvider()
+	activeProvider := pluginConfig.GetProviderForRequest(ctx)
 
 	if activeProvider == nil {
 		log.Debugf("[onHttpResponseBody] no active provider, skip processing")

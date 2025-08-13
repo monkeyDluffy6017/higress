@@ -2,6 +2,7 @@ package config
 
 import (
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/provider"
+	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
 )
 
@@ -28,9 +29,17 @@ type PluginConfig struct {
 
 	activeProviderConfig *provider.ProviderConfig `yaml:"-"`
 	activeProvider       provider.Provider        `yaml:"-"`
+
+	// internal indexes for request-scoped provider override
+	providerIdToConfig   map[string]*provider.ProviderConfig `yaml:"-"`
+	providerIdToInstance map[string]provider.Provider        `yaml:"-"`
 }
 
 func (c *PluginConfig) FromJson(json gjson.Result) {
+	// reset indexes
+	c.providerIdToConfig = make(map[string]*provider.ProviderConfig)
+	c.providerIdToInstance = make(map[string]provider.Provider)
+
 	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
 		c.providerConfigs = make([]provider.ProviderConfig, 0)
 		for _, providerJson := range providersJson.Array() {
@@ -46,6 +55,13 @@ func (c *PluginConfig) FromJson(json gjson.Result) {
 		providerConfig.FromJson(providerJson)
 		c.providerConfigs = []provider.ProviderConfig{providerConfig}
 		c.activeProviderConfig = &providerConfig
+		// build indexes for legacy config
+		for i := range c.providerConfigs {
+			pc := &c.providerConfigs[i]
+			if pc.GetId() != "" {
+				c.providerIdToConfig[pc.GetId()] = pc
+			}
+		}
 		// Legacy configuration is used and the active provider is determined.
 		// We don't need to continue with the new configuration style.
 		return
@@ -60,6 +76,14 @@ func (c *PluginConfig) FromJson(json gjson.Result) {
 				c.activeProviderConfig = &providerConfig
 				break
 			}
+		}
+	}
+
+	// build indexes for providers
+	for i := range c.providerConfigs {
+		pc := &c.providerConfigs[i]
+		if pc.GetId() != "" {
+			c.providerIdToConfig[pc.GetId()] = pc
 		}
 	}
 }
@@ -96,5 +120,67 @@ func (c *PluginConfig) GetProvider() provider.Provider {
 }
 
 func (c *PluginConfig) GetProviderConfig() *provider.ProviderConfig {
+	return c.activeProviderConfig
+}
+
+// ===== Request-scoped provider override support =====
+
+const (
+	ctxKeyChosenProviderId = "ai-proxy.chosenProviderId"
+)
+
+// GetProviderById returns (instance, config, ok). It lazily creates provider instance if needed.
+func (c *PluginConfig) GetProviderById(id string) (provider.Provider, *provider.ProviderConfig, bool) {
+	if id == "" {
+		return nil, nil, false
+	}
+	pc, ok := c.providerIdToConfig[id]
+	if !ok || pc == nil {
+		return nil, nil, false
+	}
+	if p, ok := c.providerIdToInstance[id]; ok && p != nil {
+		return p, pc, true
+	}
+	// lazily create
+	p, err := provider.CreateProvider(*pc)
+	if err != nil {
+		return nil, nil, false
+	}
+	c.providerIdToInstance[id] = p
+	// initialize token failover settings for this instance
+	_ = pc.SetApiTokensFailover(p)
+	return p, pc, true
+}
+
+// SetChosenProviderForRequest sets the chosen provider id into the request context if exists in config.
+func (c *PluginConfig) SetChosenProviderForRequest(ctx wrapper.HttpContext, id string) bool {
+	if _, _, ok := c.GetProviderById(id); !ok {
+		return false
+	}
+	ctx.SetContext(ctxKeyChosenProviderId, id)
+	return true
+}
+
+// GetProviderForRequest returns the request-scoped provider if set, otherwise the active provider.
+func (c *PluginConfig) GetProviderForRequest(ctx wrapper.HttpContext) provider.Provider {
+	if v := ctx.GetContext(ctxKeyChosenProviderId); v != nil {
+		if id, _ := v.(string); id != "" {
+			if p, _, ok := c.GetProviderById(id); ok {
+				return p
+			}
+		}
+	}
+	return c.activeProvider
+}
+
+// GetProviderConfigForRequest returns the request-scoped provider config if set, otherwise the active provider config.
+func (c *PluginConfig) GetProviderConfigForRequest(ctx wrapper.HttpContext) *provider.ProviderConfig {
+	if v := ctx.GetContext(ctxKeyChosenProviderId); v != nil {
+		if id, _ := v.(string); id != "" {
+			if _, pc, ok := c.GetProviderById(id); ok {
+				return pc
+			}
+		}
+	}
 	return c.activeProviderConfig
 }
