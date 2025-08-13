@@ -10,9 +10,10 @@ How it works
   - build_new_project, add_new_feature, fix_bug, use_tool, other.
 - Pick the provider with the highest score for that label:
   - Tie-breaking by `tieBreakOrder` or declaration order.
-  - Fallback to `fallbackProviderId` if the best score is below `minScore` or no candidate is available.
-- Set request header `X-HI-Provider-Id` (or custom name) for ai-proxy to route.
+  - Always fallback to `fallbackProviderId` when the best score is below `minScore` or no candidate is available.
+- Set request header `X-HI-Provider-Id` (or custom name) for ai-proxy to route; meanwhile, override the `model` field in request body to the selected provider id.
 - Add response header `x-select-llm: <providerId>` for observability.
+- Failures and timeouts: within `timeoutMs` (per call) and `totalTimeoutMs` (overall deadline), perform limited retries (up to 3 attempts). If no label is obtained finally, resume the request without setting the header (default path).
 
 Deployment order
 - Ensure ai-llm-router runs before ai-proxy, otherwise the selection cannot take effect.
@@ -21,10 +22,15 @@ Configuration
 ```yaml
 analyzer:
   enabled: true
-  baseUrl: "https://host/v1/chat/completions"
+  # Access analyzer via service-source (DNS). The upstream must be registered as a Higress service.
+  serviceName: "analyzer.dns"       # required, Higress DNS service name
+  servicePort: 443                   # optional, default 443
+  serviceDomain: "api.example.com"  # required, used as Host/SNI
+  path: "/v1/chat/completions"      # required, request path
   apiToken: "sk-***"
   model: "qwen2.5-coder-32b"
   timeoutMs: 3000
+  totalTimeoutMs: 10000
   maxInputBytes: 10240
   promptTemplate: ""
   protocol: "openai"
@@ -64,6 +70,25 @@ Constraints
 - `routing.candidates[].id` must match `providers[].id` from ai-proxy configuration.
 - Only effective for requests with `Content-Type: application/json` and supported protocols.
 - To protect sensitive data, code blocks are stripped and the analyzer input is truncated to `maxInputBytes`.
+- Analyzer currently supports DNS service-source only. For HTTPS, use a domain as `serviceDomain` to satisfy certificate/SNI; if you must connect to an IP directly, use HTTP or bind a domain to that IP.
+
+When `serviceDomain` is an IP
+- You can set `serviceDomain` to an IP address. It will be used as the request Host (`:authority`) and SNI in TLS by default.
+- HTTP: works out of the box (e.g., `servicePort: 80`, `serviceDomain: "10.0.0.12"`).
+- HTTPS: unless the upstream certificate's SubjectAltName explicitly includes the IP and the upstream doesn't require a domain for SNI-based routing, you may hit certificate validation errors or SNI routing failures. Common approaches:
+  - Bind a domain to the IP and use the domain as `serviceDomain`; or
+  - Issue a certificate that includes the IP (less common).
+
+Example (IP over HTTP):
+```yaml
+analyzer:
+  serviceName: "analyzer.dns"
+  servicePort: 80
+  serviceDomain: "10.0.0.12"
+  path: "/v1/chat/completions"
+  apiToken: "sk-***"
+  model: "qwen2.5-coder-32b"
+```
 
 Response header
 - `x-select-llm: <providerId>`

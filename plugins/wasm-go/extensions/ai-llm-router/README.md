@@ -10,9 +10,10 @@ ai-llm-router 是一个基于请求语义进行分类，并按照各候选大模
   - 标签集合：build_new_project、add_new_feature、fix_bug、use_tool、other。
 - 根据配置的候选 Provider 能力打分，选择该标签下得分最高的 Provider：
   - 如分数相同，按 tieBreakOrder 或声明顺序打破并列。
-  - 如分数低于 minScore 或无可选项，回退到 fallbackProviderId。
-- 写入请求头 X-HI-Provider-Id（或自定义名称），由 ai-proxy 完成最终转发。
+  - 如分数低于 minScore 或无可选项，统一回退到 fallbackProviderId。
+- 写入请求头 X-HI-Provider-Id（或自定义名称），由 ai-proxy 完成最终转发；同时覆盖请求体中的 model 字段为所选 providerId。
 - 在响应头返回 x-select-llm: <providerId> 便于观测。
+- 失败与超时：在 analyzer 的单次调用超时（timeoutMs）与总时间窗（totalTimeoutMs）内进行有限重试（最多 3 次）；若最终无法得到标签，则不设置头部，直接恢复请求走默认链路。
 
 部署关系与顺序
 - 必须保证 ai-llm-router 在 ai-proxy 之前执行（优先级更小的数字/更前置的阶段），否则路由结果无法生效。
@@ -21,10 +22,15 @@ ai-llm-router 是一个基于请求语义进行分类，并按照各候选大模
 ```yaml
 analyzer:
   enabled: true
-  baseUrl: "https://host/v1/chat/completions"
+  # 通过服务源（DNS）访问 analyzer，上游需在 Higress 中注册服务
+  serviceName: "analyzer.dns"         # 必填，Higress 服务名（DNS 类型）
+  servicePort: 443                     # 选填，默认 443
+  serviceDomain: "api.example.com"    # 必填，用于 Host/SNI
+  path: "/v1/chat/completions"        # 必填，请求路径
   apiToken: "sk-***"
   model: "qwen2.5-coder-32b"
   timeoutMs: 3000
+  totalTimeoutMs: 10000
   maxInputBytes: 10240
   promptTemplate: ""
   protocol: "openai"
@@ -64,6 +70,25 @@ routing:
 - routing.candidates[].id 必须与 ai-proxy 的 providers[].id 对齐。
 - 仅对 Content-Type: application/json 且符合协议的请求生效。
 - 为保护敏感信息，发送给分析模型前会移除成对代码块并做长度截断。
+- analyzer 仅支持基于服务源（DNS）的访问方式。HTTPS 场景下需使用域名作为 serviceDomain 以满足证书与 SNI 要求；如必须直连 IP，请在 HTTP 场景或为该 IP 配置对应的域名。
+
+serviceDomain 为 IP 的情况
+- 支持将 `serviceDomain` 配置为 IP。此时默认会使用该值作为请求的 Host（:authority），并在 TLS 中作为 SNI 发送。
+- HTTP 场景：可以直接使用 IP（如 `servicePort: 80`，`serviceDomain: "10.0.0.12"`）。
+- HTTPS 场景：除非上游证书的 SubjectAltName 显式包含该 IP，且上游对 SNI 不强制域名，否则会出现证书校验或基于 SNI 的路由失败。常见做法：
+  - 给该 IP 绑定一个域名，并在 `serviceDomain` 中填写该域名；或
+  - 为该服务签发包含该 IP 的证书（较少见）。
+
+配置示例（IP 直连 HTTP）：
+```yaml
+analyzer:
+  serviceName: "analyzer.dns"
+  servicePort: 80
+  serviceDomain: "10.0.0.12"
+  path: "/v1/chat/completions"
+  apiToken: "sk-***"
+  model: "qwen2.5-coder-32b"
+```
 
 响应头
 - x-select-llm: <providerId>

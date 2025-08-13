@@ -49,6 +49,7 @@ type AnalyzerConfig struct {
 	apiToken       string
 	model          string
 	timeoutMs      uint32
+	totalTimeoutMs uint32
 	maxInputBytes  int
 	promptTemplate string
 	protocol       string
@@ -113,7 +114,7 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 	if config.analyzer.protocol == "" {
 		config.analyzer.protocol = "openai"
 	}
-	// only support service-source by name (DNS). FQDN direct is removed.
+
 	if config.analyzer.enabled {
 		// read service-source fields
 		config.analyzer.serviceName = j.Get("analyzer.serviceName").String()
@@ -139,6 +140,7 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 			}
 			config.analyzer.domain = config.analyzer.serviceDomain
 			config.analyzer.port = port
+			// 如果是IP，serviceName 指向你的静态服务条目（后台解析到 IP），serviceDomain 填 IP
 			config.analyzer.client = wrapper.NewClusterClient(wrapper.DnsCluster{
 				ServiceName: config.analyzer.serviceName,
 				Port:        port,
@@ -148,8 +150,14 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 	}
 
 	// summary logs for debugging
-	log.Infof("[ai-llm-router] analyzer.enabled=%v model=%s timeoutMs=%d maxInputBytes=%d protocol=%s domain=%s port=%d path=%s",
-		config.analyzer.enabled, config.analyzer.model, config.analyzer.timeoutMs, config.analyzer.maxInputBytes, config.analyzer.protocol, config.analyzer.domain, config.analyzer.port, config.analyzer.path)
+	// totalTimeoutMs 默认 10000 ms
+	config.analyzer.totalTimeoutMs = uint32(j.Get("analyzer.totalTimeoutMs").Uint())
+	if config.analyzer.totalTimeoutMs == 0 {
+		config.analyzer.totalTimeoutMs = 10000
+	}
+
+	log.Infof("[ai-llm-router] analyzer.enabled=%v model=%s timeoutMs=%d totalTimeoutMs=%d maxInputBytes=%d protocol=%s domain=%s port=%d path=%s",
+		config.analyzer.enabled, config.analyzer.model, config.analyzer.timeoutMs, config.analyzer.totalTimeoutMs, config.analyzer.maxInputBytes, config.analyzer.protocol, config.analyzer.domain, config.analyzer.port, config.analyzer.path)
 
 	// input extraction
 	config.inputExtraction.protocol = j.Get("inputExtraction.protocol").String()
@@ -234,9 +242,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	// 调用前打印关键信息
 	logs.Debugf("[ai-llm-router] analyzer request: host=%s port=%d path=%s body=%s", config.analyzer.domain, config.analyzer.port, config.analyzer.path, string(reqBody))
 
-	// 异步调用 + 重试，最多重试3次，总时间不超过2s
+	// 异步调用 + 重试，最多重试3次，总时间不超过 totalTimeoutMs
 	maxRetries := 3
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(time.Duration(config.analyzer.totalTimeoutMs) * time.Millisecond)
 	attempt := 0
 
 	var send func()
