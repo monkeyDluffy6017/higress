@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -32,18 +31,31 @@ func init() {
 		// wrapper.ProcessResponseBody(onHttpResponseBody),
 		// wrapper.ProcessStreamDone(onHttpStreamDone),
 	)
+
 }
+
+const defaultPromptTemplate = "You are a highly-specialized classification expert. Your ONLY purpose is to classify a user's development request into one of five labels based on the detailed definitions below.\n\n" +
+	"Here are the definitions for each label:\n\n" +
+	"1.  build_new_project: creating a brand-new, standalone application/service/module/system from scratch.\n" +
+	"2.  add_new_feature: adding a new capability to an existing application/service/module.\n" +
+	"3.  fix_bug: fixing errors/defects or unexpected behavior in existing functionality.\n" +
+	"4.  other: anything else (refactoring, docs, performance, analysis, etc.).\n\n" +
+	"Instructions: respond with ONE label only: build_new_project, add_new_feature, fix_bug, use_tool, or other. No explanations.\n\n" +
+	"User Request: {USER_INPUT}"
 
 // 自定义插件配置
 type AnalyzerConfig struct {
 	enabled        bool
-	baseUrl        string
 	apiToken       string
 	model          string
 	timeoutMs      uint32
 	maxInputBytes  int
 	promptTemplate string
 	protocol       string
+	// service-source based fields (optional). If serviceName is set, prefer DNS service source.
+	serviceName   string
+	servicePort   int64
+	serviceDomain string
 	// parsed for client
 	domain string
 	port   int64
@@ -86,7 +98,6 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 	if !j.Get("analyzer.enabled").Exists() {
 		config.analyzer.enabled = true
 	}
-	config.analyzer.baseUrl = j.Get("analyzer.baseUrl").String()
 	config.analyzer.apiToken = j.Get("analyzer.apiToken").String()
 	config.analyzer.model = j.Get("analyzer.model").String()
 	config.analyzer.timeoutMs = uint32(j.Get("analyzer.timeoutMs").Uint())
@@ -102,45 +113,43 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 	if config.analyzer.protocol == "" {
 		config.analyzer.protocol = "openai"
 	}
-	// build analyzer client if enabled and baseUrl present
-	if config.analyzer.enabled && config.analyzer.baseUrl != "" {
-		u, err := url.Parse(config.analyzer.baseUrl)
-		if err == nil {
-			config.analyzer.path = u.Path
-			host := u.Hostname()
-			port := int64(80)
-			if u.Scheme == "https" {
+	// only support service-source by name (DNS). FQDN direct is removed.
+	if config.analyzer.enabled {
+		// read service-source fields
+		config.analyzer.serviceName = j.Get("analyzer.serviceName").String()
+		if j.Get("analyzer.servicePort").Exists() {
+			config.analyzer.servicePort = int64(j.Get("analyzer.servicePort").Int())
+		}
+		config.analyzer.serviceDomain = j.Get("analyzer.serviceDomain").String()
+
+		// derive path (and defaults) from baseUrl if provided
+		// no baseUrl anymore; require explicit path/domain/port in config
+		config.analyzer.path = j.Get("analyzer.path").String()
+		if config.analyzer.servicePort == 0 {
+			// default https 443 if not specified
+			config.analyzer.servicePort = 443
+		}
+
+		// require serviceName and serviceDomain to build client
+		if config.analyzer.serviceName != "" && config.analyzer.serviceDomain != "" {
+			port := config.analyzer.servicePort
+			if port == 0 {
+				// default to 443 if not specified and cannot be derived
 				port = 443
 			}
-			if u.Port() != "" {
-				// best-effort parse
-				// ignore error -> keep default
-				if p := u.Port(); p != "" {
-					// convert
-					// simple manual parse to avoid extra import
-					var acc int64
-					for i := 0; i < len(p); i++ {
-						ch := p[i]
-						if ch < '0' || ch > '9' {
-							acc = 0
-							break
-						}
-						acc = acc*10 + int64(ch-'0')
-					}
-					if acc > 0 {
-						port = acc
-					}
-				}
-			}
-			config.analyzer.domain = host
+			config.analyzer.domain = config.analyzer.serviceDomain
 			config.analyzer.port = port
-			config.analyzer.client = wrapper.NewClusterClient(wrapper.FQDNCluster{FQDN: host, Host: host, Port: port})
+			config.analyzer.client = wrapper.NewClusterClient(wrapper.DnsCluster{
+				ServiceName: config.analyzer.serviceName,
+				Port:        port,
+				Domain:      config.analyzer.serviceDomain,
+			})
 		}
 	}
 
 	// summary logs for debugging
-	log.Infof("[ai-llm-router] analyzer.enabled=%v baseUrl=%s model=%s timeoutMs=%d maxInputBytes=%d protocol=%s",
-		config.analyzer.enabled, config.analyzer.baseUrl, config.analyzer.model, config.analyzer.timeoutMs, config.analyzer.maxInputBytes, config.analyzer.protocol)
+	log.Infof("[ai-llm-router] analyzer.enabled=%v model=%s timeoutMs=%d maxInputBytes=%d protocol=%s domain=%s port=%d path=%s",
+		config.analyzer.enabled, config.analyzer.model, config.analyzer.timeoutMs, config.analyzer.maxInputBytes, config.analyzer.protocol, config.analyzer.domain, config.analyzer.port, config.analyzer.path)
 
 	// input extraction
 	config.inputExtraction.protocol = j.Get("inputExtraction.protocol").String()
@@ -193,7 +202,6 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config, log logs.Log) types.Action {
 	// 我们需要读取请求体进行语义分析
-	log.Debug("[ai-llm-router] onHttpRequestHeaders: disable reroute and buffer body")
 	ctx.DisableReroute()
 	ctx.SetRequestBodyBufferLimit(1024 * 1024)
 	return types.HeaderStopIteration
@@ -213,6 +221,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 		return types.ActionContinue
 	}
 	logs.Debugf("[ai-llm-router] extracted user text bytes=%d protocol=%s", len([]byte(userText)), config.inputExtraction.protocol)
+	logs.Debugf("[ai-llm-router] extracted user text content: %s", userText)
 
 	// 组织请求体
 	prompt := buildPrompt(config.analyzer.promptTemplate, userText)
@@ -222,14 +231,18 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	})
 
 	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.analyzer.apiToken}}
+	// 调用前打印关键信息
+	logs.Debugf("[ai-llm-router] analyzer request: host=%s port=%d path=%s body=%s", config.analyzer.domain, config.analyzer.port, config.analyzer.path, string(reqBody))
 
 	// 异步调用 + 重试，最多重试3次，总时间不超过2s
 	maxRetries := 3
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	attempt := 0
+	fallbackUsed := false
 
 	var send func()
 	send = func() {
+		logs.Debugf("[ai-llm-router] analyzer httpcall: timeoutMs=%d", config.analyzer.timeoutMs)
 		remaining := time.Until(deadline) / time.Millisecond
 		if remaining <= 0 {
 			logs.Warnf("[ai-llm-router] analyzer deadline reached, stop retrying")
@@ -241,13 +254,15 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 			callTimeout = uint32(remaining)
 		}
 		logs.Debugf("[ai-llm-router] analyzer attempt=%d timeoutMs=%d remainingMs=%d path=%s", attempt+1, callTimeout, remaining, config.analyzer.path)
+		// Always use path when calling cluster client so that service-source based routing works
 		err := config.analyzer.client.Post(
 			config.analyzer.path,
 			headers,
 			reqBody,
 			func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+				logs.Debugf("[ai-llm-router] analyzer response: status=%d body=%s", statusCode, string(responseBody))
 				label := classifyLabel(statusCode, responseBody)
-				if label != "other" {
+				if label != "" {
 					logs.Infof("[ai-llm-router] analyzer classified label=%s", label)
 					selected := selectProvider(label, config.routing)
 					if selected != "" {
@@ -271,7 +286,41 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 			callTimeout,
 		)
 		if err != nil {
-			logs.Warnf("[ai-llm-router] analyzer http error: %v", err)
+			// Host 层错误（如集群不存在、参数非法）不会进入回调，这里尽量打印上下文
+			logs.Warnf("[ai-llm-router] analyzer http error: %v, path=%s host=%s port=%d", err, config.analyzer.path, config.analyzer.domain, config.analyzer.port)
+			// 针对 bad argument 进行一次降级重试：改用 path 形式发起（与其他插件一致）
+			if !fallbackUsed && strings.Contains(strings.ToLower(err.Error()), "bad argument") {
+				fallbackUsed = true
+				logs.Warnf("[ai-llm-router] analyzer fallback to path request once: %s", config.analyzer.path)
+				_ = config.analyzer.client.Post(
+					config.analyzer.path,
+					headers,
+					reqBody,
+					func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+						logs.Debugf("[ai-llm-router] analyzer fallback response: status=%d body=%s", statusCode, string(responseBody))
+						for k, v := range responseHeaders {
+							if len(v) > 0 {
+								logs.Debugf("[ai-llm-router] analyzer fallback resp header: %s=%s", k, v[0])
+							}
+						}
+						label := classifyLabel(statusCode, responseBody)
+						if label != "" {
+							logs.Infof("[ai-llm-router] analyzer (fallback) classified label=%s", label)
+							selected := selectProvider(label, config.routing)
+							if selected != "" {
+								_ = proxywasm.ReplaceHttpRequestHeader(config.routing.providerIdHeader, selected)
+								ctx.SetContext("selectedProviderId", selected)
+								logs.Infof("[ai-llm-router] selected provider=%s", selected)
+							}
+							_ = proxywasm.ResumeHttpRequest()
+							return
+						}
+						_ = proxywasm.ResumeHttpRequest()
+					},
+					callTimeout,
+				)
+				return
+			}
 			if attempt < maxRetries && time.Until(deadline) > 0 {
 				attempt++
 				send()
@@ -370,16 +419,13 @@ var labelRegex = regexp.MustCompile(`\b(build_new_project|add_new_feature|fix_bu
 
 func classifyLabel(statusCode int, resp []byte) string {
 	if statusCode != 200 || len(resp) == 0 {
-		return "other"
+		return ""
 	}
 	content := gjson.GetBytes(resp, "choices.0.message.content").String()
 	if content == "" {
-		return "other"
+		return ""
 	}
 	m := labelRegex.FindString(content)
-	if m == "" {
-		return "other"
-	}
 	return m
 }
 
@@ -410,12 +456,3 @@ func selectProvider(label string, r RoutingConfig) string {
 	}
 	return bestId
 }
-
-const defaultPromptTemplate = "You are a highly-specialized classification expert. Your ONLY purpose is to classify a user's development request into one of five labels based on the detailed definitions below.\n\n" +
-	"Here are the definitions for each label:\n\n" +
-	"1.  build_new_project: creating a brand-new, standalone application/service/module/system from scratch.\n" +
-	"2.  add_new_feature: adding a new capability to an existing application/service/module.\n" +
-	"3.  fix_bug: fixing errors/defects or unexpected behavior in existing functionality.\n" +
-	"4.  other: anything else (refactoring, docs, performance, analysis, etc.).\n\n" +
-	"Instructions: respond with ONE label only: build_new_project, add_new_feature, fix_bug, use_tool, or other. No explanations.\n\n" +
-	"User Request: {USER_INPUT}"
