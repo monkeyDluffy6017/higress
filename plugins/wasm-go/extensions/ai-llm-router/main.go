@@ -13,6 +13,8 @@ import (
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/tidwall/gjson"
+
+	ruleengine "github.com/monkeyDluffy6017/ai-llm-rule-engine/pkg/ruleengine"
 )
 
 func main() {}
@@ -106,10 +108,19 @@ type RoutingConfig struct {
 	tieBreakOrder      []string
 }
 
+// RuleEngineConfig 控制规则引擎（声明式筛选）
+type RuleEngineConfig struct {
+	enabled bool
+	// inlineRules 与 rulesFile 二选一；若两者都有，优先 inlineRules
+	inlineRules []ruleengine.Rule
+	rulesFile   string
+}
+
 type SemanticStrategy struct {
 	analyzer        AnalyzerConfig
 	inputExtraction InputExtractionConfig
 	routing         RoutingConfig
+	ruleEngine      RuleEngineConfig
 }
 
 func (s *SemanticStrategy) Name() string { return "semantic" }
@@ -241,6 +252,24 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 	}
 	logs.Infof("[ai-llm-router] routing candidates=%d providerIdHeader=%s fallback=%s minScore=%d",
 		len(s.routing.candidates), s.routing.providerIdHeader, s.routing.fallbackProviderId, s.routing.minScore)
+
+	// rule engine
+	s.ruleEngine.enabled = j.Get("ruleEngine.enabled").Bool()
+	// inline rules (JSON/YAML 已转换为 JSON 数组)
+	if arr := j.Get("ruleEngine.inlineRules"); arr.Exists() && arr.IsArray() {
+		s.ruleEngine.inlineRules = make([]ruleengine.Rule, 0, len(arr.Array()))
+		for _, it := range arr.Array() {
+			var r ruleengine.Rule
+			if err := json.Unmarshal([]byte(it.Raw), &r); err == nil {
+				s.ruleEngine.inlineRules = append(s.ruleEngine.inlineRules, r)
+			} else {
+				log.Warnf("[ai-llm-router] invalid inline rule: %v", err)
+			}
+		}
+	}
+	s.ruleEngine.rulesFile = j.Get("ruleEngine.rulesFile").String()
+	log.Infof("[ai-llm-router] ruleEngine.enabled=%v inlineRules=%d rulesFile=%s",
+		s.ruleEngine.enabled, len(s.ruleEngine.inlineRules), s.ruleEngine.rulesFile)
 	return nil
 }
 
@@ -252,6 +281,18 @@ func (s *SemanticStrategy) OnRequestHeaders(ctx wrapper.HttpContext, log logs.Lo
 }
 
 func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) types.Action {
+	// 规则引擎第一阶段：若启用，则优先使用规则引擎对 available models 进行资格筛选
+	var prefiltered []map[string]any
+	if s.ruleEngine.enabled {
+		if qms, err := runRuleEngine(s.ruleEngine, body, nil, nil); err != nil {
+			logs.Warnf("[ai-llm-router] rule engine evaluate error: %v", err)
+		} else if len(qms) > 0 {
+			prefiltered = qms
+			bs, _ := json.Marshal(map[string]any{"qualified_models": prefiltered})
+			_ = proxywasm.ReplaceHttpRequestHeader("x-qualified-models", string(bs))
+		}
+	}
+
 	if !s.analyzer.enabled || s.analyzer.client == nil || s.analyzer.path == "" || s.analyzer.apiToken == "" || s.analyzer.model == "" {
 		logs.Debugf("[ai-llm-router] analyzer disabled or not configured, skip routing")
 		return types.ActionContinue
@@ -299,6 +340,7 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 				label := classifyLabel(statusCode, responseBody, s.analyzer.labelRegex, s.analyzer.labels)
 				if label != "" {
 					logs.Infof("[ai-llm-router] analyzer classified label=%s", label)
+					// 第二阶段策略：基于候选模型（若有规则引擎预筛选）选择 provider
 					selected := selectProvider(label, s.routing)
 					if selected != "" {
 						_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, selected)
@@ -530,6 +572,120 @@ func indexOf(haystack []byte, needle []byte) int {
 	return -1
 }
 
+// mapFromGJSON 将 gjson.Result 转 map[string]any（只做浅层转换，嵌套 map/array 递归）
+func mapFromGJSON(r gjson.Result) map[string]any {
+	if !r.Exists() {
+		return map[string]any{}
+	}
+	switch {
+	case r.IsArray():
+		return map[string]any{"_": arrayFromGJSON(r)}
+	case r.IsObject():
+		m := make(map[string]any)
+		r.ForEach(func(k, v gjson.Result) bool {
+			m[k.String()] = valueFromGJSON(v)
+			return true
+		})
+		return m
+	default:
+		return map[string]any{"_": valueFromGJSON(r)}
+	}
+}
+
+func arrayFromGJSON(r gjson.Result) []any {
+	arr := make([]any, 0, len(r.Array()))
+	for _, v := range r.Array() {
+		arr = append(arr, valueFromGJSON(v))
+	}
+	return arr
+}
+
+func valueFromGJSON(v gjson.Result) any {
+	switch {
+	case v.IsObject():
+		m := make(map[string]any)
+		v.ForEach(func(k, vv gjson.Result) bool {
+			m[k.String()] = valueFromGJSON(vv)
+			return true
+		})
+		return m
+	case v.IsArray():
+		return arrayFromGJSON(v)
+	default:
+		if v.Type == gjson.Number {
+			return v.Num
+		}
+		if v.Type == gjson.True || v.Type == gjson.False {
+			return v.Bool()
+		}
+		return v.String()
+	}
+}
+
+// runRuleEngine 将规则引擎执行过程封装，便于不同策略复用
+// - cfg: 规则引擎配置（开关、内联规则、文件路径）
+// - body: 原始请求体（用于尝试提取 request_context 与 available_models）
+// - extraRequestContext: 额外补充/覆盖到 request_context 的键值
+// - defaultAvailableModels: 当请求体未提供 routing.available_models 时，使用该缺省集合
+// 返回：合格模型的对象数组（已按规则 sortBy 排序），或 nil
+func runRuleEngine(cfg RuleEngineConfig, body []byte, extraRequestContext map[string]any, defaultAvailableModels []map[string]any) ([]map[string]any, error) {
+	if !cfg.enabled {
+		return nil, nil
+	}
+
+	// 1) 构建 request_context
+	reqCtx := ruleengine.RequestContext{
+		"task_type": gjson.GetBytes(body, "task_type").String(),
+		"mode":      gjson.GetBytes(body, "mode").String(),
+		"language":  gjson.GetBytes(body, "language").String(),
+	}
+	for k, v := range extraRequestContext {
+		reqCtx[k] = v
+	}
+
+	// 2) 构建 available_models
+	var models []ruleengine.Model
+	if arr := gjson.GetBytes(body, "routing.available_models"); arr.Exists() && arr.IsArray() {
+		a := arr.Array()
+		models = make([]ruleengine.Model, 0, len(a))
+		for _, m := range a {
+			models = append(models, mapFromGJSON(m))
+		}
+	} else if len(defaultAvailableModels) > 0 {
+		models = make([]ruleengine.Model, 0, len(defaultAvailableModels))
+		for _, m := range defaultAvailableModels {
+			models = append(models, ruleengine.Model(m))
+		}
+	}
+
+	// 3) 加载规则（优先内联，其次文件）
+	rules := cfg.inlineRules
+	if len(rules) == 0 && cfg.rulesFile != "" {
+		if rs, err := ruleengine.LoadRulesFromFile(cfg.rulesFile); err == nil {
+			rules = rs
+		} else {
+			return nil, err
+		}
+	}
+	if len(models) == 0 || len(rules) == 0 {
+		return nil, nil
+	}
+
+	// 4) 评估
+	res, err := ruleengine.New().Evaluate(reqCtx, models, rules)
+	if err != nil {
+		return nil, err
+	}
+	if len(res.QualifiedModels) == 0 {
+		return nil, nil
+	}
+	qms := make([]map[string]any, 0, len(res.QualifiedModels))
+	for _, m := range res.QualifiedModels {
+		qms = append(qms, m)
+	}
+	return qms, nil
+}
+
 func classifyLabel(statusCode int, resp []byte, re *regexp.Regexp, fallbackLabels []string) string {
 	if statusCode != 200 || len(resp) == 0 {
 		return ""
@@ -553,6 +709,8 @@ func classifyLabel(statusCode int, resp []byte, re *regexp.Regexp, fallbackLabel
 }
 
 func selectProvider(label string, r RoutingConfig) string {
+	// 若上游通过请求头注入了合格模型集合，可在此扩展结合合格集合进行再过滤
+	// 本次保持与既有策略兼容，仅据 label/分数及 tieBreakOrder 选择
 	// build tie map
 	order := map[string]int{}
 	for i, id := range r.tieBreakOrder {

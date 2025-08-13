@@ -74,6 +74,27 @@ strategy:
       minScore: 1
       fallbackProviderId: "openai"
       tieBreakOrder: ["deepseek", "openai"]
+
+    # 规则引擎（声明式模型资格筛选，先于偏好策略执行）
+    ruleEngine:
+      enabled: true
+      # 二选一：inlineRules（内联规则）或 rulesFile（文件路径）。若两者同时存在，优先使用 inlineRules。
+      inlineRules:
+        - rule_name: "Route Code Review to Expert Models"
+          priority: 100
+          conditions:
+            all:
+              - { fact: "request.task_type", operator: eq, value: "code_review" }
+              - { fact: "model.tags", operator: contains, value: "code-review-expert" }
+              - { fact: "model.availability_status", operator: eq, value: "UP" }
+          action:
+            type: FILTER_MODELS
+            result: ALLOW
+            sortBy:
+              - { fact: "model.quality_benchmark_scores.human_eval", order: desc }
+              - { fact: "model.provider", order: asc }
+      # 或者通过文件加载（容器内/挂载路径）：
+      # rulesFile: "/etc/higress/rules/llm_rules.yaml"
 ```
 
 重要约束
@@ -119,5 +140,35 @@ strategy:
 限制与建议
 - 首版未内置缓存；如调用分析模型开销较大，可后续引入缓存（键为输入文本 hash）。
 - 如请求体不是标准 OpenAI 结构，可用 contentJsonPath 自定义提取路径，或扩展 protocol。
+
+规则引擎：请求体可选字段示例（用于构建 request_context 与 available_models）
+```json
+{
+  "task_type": "code_review",
+  "mode": "code_mode",
+  "language": "java",
+  "routing": {
+    "available_models": [
+      {
+        "model_id": "claude-3-opus-20240229",
+        "provider": "anthropic",
+        "tags": ["code-review-expert", "multi-lingual"],
+        "availability_status": "UP",
+        "quality_benchmark_scores": { "human_eval": 92.0 }
+      },
+      {
+        "model_id": "m2",
+        "provider": "internal",
+        "tags": ["code-review-expert"],
+        "availability_status": "DOWN"
+      }
+    ]
+  }
+}
+```
+
+备注
+- 规则引擎负责“资格筛选”（哪些模型能做这件事），策略负责“偏好选择”（在合格集合中选谁）。
+- 引擎输出的合格集合会写入请求头 `x-qualified-models` 便于观测或在后续策略中引用。
 
 

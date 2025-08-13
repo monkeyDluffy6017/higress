@@ -74,6 +74,27 @@ strategy:
       minScore: 1
       fallbackProviderId: "openai"
       tieBreakOrder: ["deepseek", "openai"]
+
+    # Rule Engine (declarative eligibility filtering, runs before preference strategy)
+    ruleEngine:
+      enabled: true
+      # Choose one: inlineRules or rulesFile. If both are present, inlineRules takes precedence.
+      inlineRules:
+        - rule_name: "Route Code Review to Expert Models"
+          priority: 100
+          conditions:
+            all:
+              - { fact: "request.task_type", operator: eq, value: "code_review" }
+              - { fact: "model.tags", operator: contains, value: "code-review-expert" }
+              - { fact: "model.availability_status", operator: eq, value: "UP" }
+          action:
+            type: FILTER_MODELS
+            result: ALLOW
+            sortBy:
+              - { fact: "model.quality_benchmark_scores.human_eval", order: desc }
+              - { fact: "model.provider", order: asc }
+      # Or load from file (in-container or mounted path):
+      # rulesFile: "/etc/higress/rules/llm_rules.yaml"
 ```
 
 Constraints
@@ -119,5 +140,35 @@ Usage with ai-proxy
 Notes
 - No cache by default. If the analyzer cost is high, consider adding a cache (keyed by hashed input) later.
 - If your request is not in OpenAI format, use `contentJsonPath` or extend `protocol` to customize extraction.
+
+Rule Engine: optional request body fields (for building request_context and available_models)
+```json
+{
+  "task_type": "code_review",
+  "mode": "code_mode",
+  "language": "java",
+  "routing": {
+    "available_models": [
+      {
+        "model_id": "claude-3-opus-20240229",
+        "provider": "anthropic",
+        "tags": ["code-review-expert", "multi-lingual"],
+        "availability_status": "UP",
+        "quality_benchmark_scores": { "human_eval": 92.0 }
+      },
+      {
+        "model_id": "m2",
+        "provider": "internal",
+        "tags": ["code-review-expert"],
+        "availability_status": "DOWN"
+      }
+    ]
+  }
+}
+```
+
+Remarks
+- The rule engine handles eligibility (which models can do the job), while the strategy handles preference (which is best among eligible ones).
+- The engine output is written to request header `x-qualified-models` for observability or further strategy usage.
 
 
