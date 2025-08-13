@@ -238,7 +238,6 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	maxRetries := 3
 	deadline := time.Now().Add(10 * time.Second)
 	attempt := 0
-	fallbackUsed := false
 
 	var send func()
 	send = func() {
@@ -267,6 +266,28 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 					selected := selectProvider(label, config.routing)
 					if selected != "" {
 						_ = proxywasm.ReplaceHttpRequestHeader(config.routing.providerIdHeader, selected)
+						// 将请求体中的 model 改为选中的 providerId
+						if len(body) > 0 {
+							// 简单替换：若存在 "model":"..."，用 providerId 覆盖；否则不处理
+							bs := body
+							// 寻找 "model":"
+							// 朴素扫描，避免引入额外依赖
+							needle := []byte("\"model\":\"")
+							idx := indexOf(bs, needle)
+							if idx >= 0 {
+								start := idx + len(needle)
+								end := start
+								for end < len(bs) && bs[end] != '"' {
+									end++
+								}
+								var b []byte
+								b = append(b, bs[:start]...)
+								b = append(b, []byte(selected)...)
+								b = append(b, bs[end:]...)
+								_ = proxywasm.ReplaceHttpRequestBody(b)
+								logs.Debugf("[ai-llm-router] override request model to provider id: %s", selected)
+							}
+						}
 						ctx.SetContext("selectedProviderId", selected)
 						logs.Infof("[ai-llm-router] selected provider=%s", selected)
 					}
@@ -286,47 +307,10 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 			callTimeout,
 		)
 		if err != nil {
-			// Host 层错误（如集群不存在、参数非法）不会进入回调，这里尽量打印上下文
+			// Host 层错误（如集群不存在、参数非法）不会进入回调，这里尽量打印上下文，并不做重试
 			logs.Warnf("[ai-llm-router] analyzer http error: %v, path=%s host=%s port=%d", err, config.analyzer.path, config.analyzer.domain, config.analyzer.port)
-			// 针对 bad argument 进行一次降级重试：改用 path 形式发起（与其他插件一致）
-			if !fallbackUsed && strings.Contains(strings.ToLower(err.Error()), "bad argument") {
-				fallbackUsed = true
-				logs.Warnf("[ai-llm-router] analyzer fallback to path request once: %s", config.analyzer.path)
-				_ = config.analyzer.client.Post(
-					config.analyzer.path,
-					headers,
-					reqBody,
-					func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-						logs.Debugf("[ai-llm-router] analyzer fallback response: status=%d body=%s", statusCode, string(responseBody))
-						for k, v := range responseHeaders {
-							if len(v) > 0 {
-								logs.Debugf("[ai-llm-router] analyzer fallback resp header: %s=%s", k, v[0])
-							}
-						}
-						label := classifyLabel(statusCode, responseBody)
-						if label != "" {
-							logs.Infof("[ai-llm-router] analyzer (fallback) classified label=%s", label)
-							selected := selectProvider(label, config.routing)
-							if selected != "" {
-								_ = proxywasm.ReplaceHttpRequestHeader(config.routing.providerIdHeader, selected)
-								ctx.SetContext("selectedProviderId", selected)
-								logs.Infof("[ai-llm-router] selected provider=%s", selected)
-							}
-							_ = proxywasm.ResumeHttpRequest()
-							return
-						}
-						_ = proxywasm.ResumeHttpRequest()
-					},
-					callTimeout,
-				)
-				return
-			}
-			if attempt < maxRetries && time.Until(deadline) > 0 {
-				attempt++
-				send()
-				return
-			}
 			_ = proxywasm.ResumeHttpRequest()
+			return
 		}
 	}
 
@@ -415,6 +399,30 @@ func buildPrompt(tpl string, user string) string {
 	return strings.ReplaceAll(tpl, "{USER_INPUT}", user)
 }
 
+// indexOf returns the first index of needle in haystack, or -1 if not found.
+func indexOf(haystack []byte, needle []byte) int {
+	if len(needle) == 0 || len(haystack) < len(needle) {
+		return -1
+	}
+	first := needle[0]
+	for i := 0; i <= len(haystack)-len(needle); i++ {
+		if haystack[i] != first {
+			continue
+		}
+		match := true
+		for j := 1; j < len(needle); j++ {
+			if haystack[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
 var labelRegex = regexp.MustCompile(`\b(build_new_project|add_new_feature|fix_bug|use_tool|other)\b`)
 
 func classifyLabel(statusCode int, resp []byte) string {
@@ -438,11 +446,17 @@ func selectProvider(label string, r RoutingConfig) string {
 	bestId := ""
 	bestScore := -1 << 30
 	bestRank := 1 << 30
+	foundAny := false
 	for _, c := range r.candidates {
 		if !c.enabled || c.id == "" {
 			continue
 		}
-		score := c.scores[label]
+		score, ok := c.scores[label]
+		if !ok {
+			// 该 provider 未为该标签配置打分，跳过
+			continue
+		}
+		foundAny = true
 		rank := 1 << 29
 		if v, ok := order[c.id]; ok {
 			rank = v
@@ -451,7 +465,7 @@ func selectProvider(label string, r RoutingConfig) string {
 			bestScore, bestRank, bestId = score, rank, c.id
 		}
 	}
-	if bestId == "" || bestScore < r.minScore {
+	if !foundAny || bestId == "" || bestScore < r.minScore {
 		return r.fallbackProviderId
 	}
 	return bestId
