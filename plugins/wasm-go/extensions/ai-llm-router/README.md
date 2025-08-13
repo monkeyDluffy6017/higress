@@ -78,7 +78,7 @@ strategy:
     # 规则引擎（声明式模型资格筛选，先于偏好策略执行）
     ruleEngine:
       enabled: true
-      # 二选一：inlineRules（内联规则）或 rulesFile（文件路径）。若两者同时存在，优先使用 inlineRules。
+      # 仅支持 inlineRules（内联规则）
       inlineRules:
         - rule_name: "Route Code Review to Expert Models"
           priority: 100
@@ -93,8 +93,7 @@ strategy:
             sortBy:
               - { fact: "model.quality_benchmark_scores.human_eval", order: desc }
               - { fact: "model.provider", order: asc }
-      # 或者通过文件加载（容器内/挂载路径）：
-      # rulesFile: "/etc/higress/rules/llm_rules.yaml"
+      # 规则文件加载已移除，不再支持 rulesFile
 ```
 
 重要约束

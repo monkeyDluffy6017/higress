@@ -78,7 +78,7 @@ strategy:
     # Rule Engine (declarative eligibility filtering, runs before preference strategy)
     ruleEngine:
       enabled: true
-      # Choose one: inlineRules or rulesFile. If both are present, inlineRules takes precedence.
+      # Only inlineRules is supported now
       inlineRules:
         - rule_name: "Route Code Review to Expert Models"
           priority: 100
@@ -93,8 +93,7 @@ strategy:
             sortBy:
               - { fact: "model.quality_benchmark_scores.human_eval", order: desc }
               - { fact: "model.provider", order: asc }
-      # Or load from file (in-container or mounted path):
-      # rulesFile: "/etc/higress/rules/llm_rules.yaml"
+      # Loading rules from file has been removed (rulesFile is no longer supported)
 ```
 
 Constraints

@@ -111,9 +111,8 @@ type RoutingConfig struct {
 // RuleEngineConfig 控制规则引擎（声明式筛选）
 type RuleEngineConfig struct {
 	enabled bool
-	// inlineRules 与 rulesFile 二选一；若两者都有，优先 inlineRules
+	// 仅支持内联规则 inlineRules
 	inlineRules []ruleengine.Rule
-	rulesFile   string
 }
 
 type SemanticStrategy struct {
@@ -267,9 +266,8 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 			}
 		}
 	}
-	s.ruleEngine.rulesFile = j.Get("ruleEngine.rulesFile").String()
-	log.Infof("[ai-llm-router] ruleEngine.enabled=%v inlineRules=%d rulesFile=%s",
-		s.ruleEngine.enabled, len(s.ruleEngine.inlineRules), s.ruleEngine.rulesFile)
+	log.Infof("[ai-llm-router] ruleEngine.enabled=%v inlineRules=%d",
+		s.ruleEngine.enabled, len(s.ruleEngine.inlineRules))
 	return nil
 }
 
@@ -658,15 +656,8 @@ func runRuleEngine(cfg RuleEngineConfig, body []byte, extraRequestContext map[st
 		}
 	}
 
-	// 3) 加载规则（优先内联，其次文件）
+	// 3) 加载规则（仅内联）
 	rules := cfg.inlineRules
-	if len(rules) == 0 && cfg.rulesFile != "" {
-		if rs, err := ruleengine.LoadRulesFromFile(cfg.rulesFile); err == nil {
-			rules = rs
-		} else {
-			return nil, err
-		}
-	}
 	if len(models) == 0 || len(rules) == 0 {
 		return nil, nil
 	}
