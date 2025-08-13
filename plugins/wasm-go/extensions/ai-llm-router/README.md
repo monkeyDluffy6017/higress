@@ -18,59 +18,62 @@ ai-llm-router 是一个基于请求语义进行分类，并按照各候选大模
 部署关系与顺序
 - 必须保证 ai-llm-router 在 ai-proxy 之前执行（优先级更小的数字/更前置的阶段），否则路由结果无法生效。
 
-配置说明
+配置说明（已采用策略模式）
 ```yaml
-analyzer:
-  enabled: true
-  # 通过服务源（DNS）访问 analyzer，上游需在 Higress 中注册服务
-  serviceName: "analyzer.dns"         # 必填，Higress 服务名（DNS 类型）
-  servicePort: 443                     # 选填，默认 443
-  serviceDomain: "api.example.com"    # 必填，用于 Host/SNI
-  path: "/v1/chat/completions"        # 必填，请求路径
-  apiToken: "sk-***"
-  model: "qwen2.5-coder-32b"
-  timeoutMs: 3000
-  totalTimeoutMs: 10000
-  maxInputBytes: 10240
-  promptTemplate: ""
-  protocol: "openai"
-  # 可选：自定义标签列表（不配置则使用默认 5 个）
-  labels:
-    - build_new_project
-    - add_new_feature
-    - fix_bug
-    - use_tool
-    - other
-
-inputExtraction:
-  protocol: "openai"
-  userJoinSep: "\n\n"
-  stripCodeFences: true
-  codeFenceRegex: ""
-  contentJsonPath: ""
-
-routing:
-  providerIdHeader: "X-HI-Provider-Id"
-  candidates:
-    - id: "openai"
+strategy:
+  type: semantic                  # 策略类型；目前支持 semantic（语义选择）
+  semantic:
+    analyzer:
       enabled: true
-      scores:
-        build_new_project: 5
-        add_new_feature: 4
-        fix_bug: 3
-        use_tool: 4
-        other: 2
-    - id: "deepseek"
-      enabled: true
-      scores:
-        build_new_project: 3
-        add_new_feature: 5
-        fix_bug: 5
-        use_tool: 3
-        other: 2
-  minScore: 1
-  fallbackProviderId: "openai"
-  tieBreakOrder: ["deepseek", "openai"]
+      # 通过服务源（DNS）访问 analyzer，上游需在 Higress 中注册服务
+      serviceName: "analyzer.dns"   # 必填，Higress 服务名（DNS 类型）
+      servicePort: 443               # 选填，默认 443
+      serviceDomain: "api.example.com"  # 必填，用于 Host/SNI
+      path: "/v1/chat/completions"  # 必填，请求路径
+      apiToken: "sk-***"
+      model: "qwen2.5-coder-32b"
+      timeoutMs: 3000
+      totalTimeoutMs: 10000
+      maxInputBytes: 10240
+      promptTemplate: ""
+      protocol: "openai"
+      # 可选：自定义标签列表（不配置则使用默认 5 个）
+      labels:
+        - build_new_project
+        - add_new_feature
+        - fix_bug
+        - use_tool
+        - other
+
+    inputExtraction:
+      protocol: "openai"
+      userJoinSep: "\n\n"
+      stripCodeFences: true
+      codeFenceRegex: ""
+      contentJsonPath: ""
+
+    routing:
+      providerIdHeader: "X-HI-Provider-Id"
+      candidates:
+        - id: "openai"
+          enabled: true
+          scores:
+            build_new_project: 5
+            add_new_feature: 4
+            fix_bug: 3
+            use_tool: 4
+            other: 2
+        - id: "deepseek"
+          enabled: true
+          scores:
+            build_new_project: 3
+            add_new_feature: 5
+            fix_bug: 5
+            use_tool: 3
+            other: 2
+      minScore: 1
+      fallbackProviderId: "openai"
+      tieBreakOrder: ["deepseek", "openai"]
 ```
 
 重要约束
@@ -89,13 +92,16 @@ serviceDomain 为 IP 的情况
 
 配置示例（IP 直连 HTTP）：
 ```yaml
-analyzer:
-  serviceName: "analyzer.dns"
-  servicePort: 80
-  serviceDomain: "10.0.0.12"
-  path: "/v1/chat/completions"
-  apiToken: "sk-***"
-  model: "qwen2.5-coder-32b"
+strategy:
+  type: semantic
+  semantic:
+    analyzer:
+      serviceName: "analyzer.dns"
+      servicePort: 80
+      serviceDomain: "10.0.0.12"
+      path: "/v1/chat/completions"
+      apiToken: "sk-***"
+      model: "qwen2.5-coder-32b"
 ```
 
 响应头
@@ -107,7 +113,7 @@ analyzer:
 
 示例：与 ai-proxy 一起使用
 1. 在 ai-proxy 的控制面中确保已配置候选 Provider（包含 providers[].id）。
-2. 在 ai-llm-router 配置中：配置 analyzer、inputExtraction、routing.candidates。
+2. 在 ai-llm-router 配置中：配置 strategy.type=semantic 与 strategy.semantic 下的 analyzer、inputExtraction、routing.candidates。
 3. 确保执行顺序：ai-llm-router 在前，ai-proxy 在后。
 
 限制与建议

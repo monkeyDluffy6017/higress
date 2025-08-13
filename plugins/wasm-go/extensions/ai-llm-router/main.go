@@ -43,7 +43,25 @@ const defaultPromptTemplate = "You are a highly-specialized classification exper
 	"Instructions: respond with ONE label only: build_new_project, add_new_feature, fix_bug, use_tool, or other. No explanations.\n\n" +
 	"User Request: {USER_INPUT}"
 
-// 自定义插件配置
+// ===== 策略模式：通用接口与语义策略实现 =====
+
+// Strategy 定义了路由策略的统一接口
+type Strategy interface {
+	Name() string
+	Parse(j gjson.Result, log logs.Log) error
+	OnRequestHeaders(ctx wrapper.HttpContext, log logs.Log) types.Action
+	OnRequestBody(ctx wrapper.HttpContext, body []byte) types.Action
+	OnResponseHeaders(ctx wrapper.HttpContext) types.Action
+	OnResponseBody(ctx wrapper.HttpContext, body []byte) types.Action
+}
+
+// 自定义插件配置（顶层）
+type Config struct {
+	strategyType string
+	strategy     Strategy
+}
+
+// 语义选择策略的内部配置与实现
 type AnalyzerConfig struct {
 	enabled        bool
 	apiToken       string
@@ -88,138 +106,127 @@ type RoutingConfig struct {
 	tieBreakOrder      []string
 }
 
-type Config struct {
+type SemanticStrategy struct {
 	analyzer        AnalyzerConfig
 	inputExtraction InputExtractionConfig
 	routing         RoutingConfig
 }
 
-// 在控制台插件配置中填写的yaml配置会自动转换为json，此处直接从json这个参数里解析配置即可
-func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
+func (s *SemanticStrategy) Name() string { return "semantic" }
+
+func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 	// analyzer
-	config.analyzer.enabled = j.Get("analyzer.enabled").Bool()
+	s.analyzer.enabled = j.Get("analyzer.enabled").Bool()
 	if !j.Get("analyzer.enabled").Exists() {
-		config.analyzer.enabled = true
+		s.analyzer.enabled = true
 	}
-	config.analyzer.apiToken = j.Get("analyzer.apiToken").String()
-	config.analyzer.model = j.Get("analyzer.model").String()
-	config.analyzer.timeoutMs = uint32(j.Get("analyzer.timeoutMs").Uint())
-	if config.analyzer.timeoutMs == 0 {
-		config.analyzer.timeoutMs = 3000
+	s.analyzer.apiToken = j.Get("analyzer.apiToken").String()
+	s.analyzer.model = j.Get("analyzer.model").String()
+	s.analyzer.timeoutMs = uint32(j.Get("analyzer.timeoutMs").Uint())
+	if s.analyzer.timeoutMs == 0 {
+		s.analyzer.timeoutMs = 3000
 	}
-	config.analyzer.maxInputBytes = int(j.Get("analyzer.maxInputBytes").Int())
-	if config.analyzer.maxInputBytes <= 0 {
-		config.analyzer.maxInputBytes = 10 * 1024
+	s.analyzer.maxInputBytes = int(j.Get("analyzer.maxInputBytes").Int())
+	if s.analyzer.maxInputBytes <= 0 {
+		s.analyzer.maxInputBytes = 10 * 1024
 	}
-	config.analyzer.promptTemplate = j.Get("analyzer.promptTemplate").String()
-	config.analyzer.protocol = j.Get("analyzer.protocol").String()
-	if config.analyzer.protocol == "" {
-		config.analyzer.protocol = "openai"
+	s.analyzer.promptTemplate = j.Get("analyzer.promptTemplate").String()
+	s.analyzer.protocol = j.Get("analyzer.protocol").String()
+	if s.analyzer.protocol == "" {
+		s.analyzer.protocol = "openai"
 	}
-	// configurable labels
-	config.analyzer.labels = make([]string, 0)
+	// labels
+	s.analyzer.labels = make([]string, 0)
 	for _, v := range j.Get("analyzer.labels").Array() {
-		s := strings.TrimSpace(v.String())
-		if s != "" {
-			config.analyzer.labels = append(config.analyzer.labels, s)
+		sv := strings.TrimSpace(v.String())
+		if sv != "" {
+			s.analyzer.labels = append(s.analyzer.labels, sv)
 		}
 	}
-	if len(config.analyzer.labels) == 0 {
-		config.analyzer.labels = []string{"build_new_project", "add_new_feature", "fix_bug", "use_tool", "other"}
+	if len(s.analyzer.labels) == 0 {
+		s.analyzer.labels = []string{"build_new_project", "add_new_feature", "fix_bug", "use_tool", "other"}
 	}
-	// compile label regex: \b(l1|l2|...)\b
+	// compile regex
 	{
 		var b strings.Builder
 		b.WriteString("\\b(")
-		for i, s := range config.analyzer.labels {
+		for i, sv := range s.analyzer.labels {
 			if i > 0 {
 				b.WriteString("|")
 			}
-			// labels are literal words
-			b.WriteString(regexp.QuoteMeta(s))
+			b.WriteString(regexp.QuoteMeta(sv))
 		}
 		b.WriteString(")\\b")
 		if re, err := regexp.Compile(b.String()); err == nil {
-			config.analyzer.labelRegex = re
+			s.analyzer.labelRegex = re
 		}
 	}
 
-	if config.analyzer.enabled {
-		// read service-source fields
-		config.analyzer.serviceName = j.Get("analyzer.serviceName").String()
+	if s.analyzer.enabled {
+		// service-source
+		s.analyzer.serviceName = j.Get("analyzer.serviceName").String()
 		if j.Get("analyzer.servicePort").Exists() {
-			config.analyzer.servicePort = int64(j.Get("analyzer.servicePort").Int())
+			s.analyzer.servicePort = int64(j.Get("analyzer.servicePort").Int())
 		}
-		config.analyzer.serviceDomain = j.Get("analyzer.serviceDomain").String()
-
-		// derive path (and defaults) from baseUrl if provided
-		// no baseUrl anymore; require explicit path/domain/port in config
-		config.analyzer.path = j.Get("analyzer.path").String()
-		if config.analyzer.servicePort == 0 {
-			// default https 443 if not specified
-			config.analyzer.servicePort = 443
+		s.analyzer.serviceDomain = j.Get("analyzer.serviceDomain").String()
+		s.analyzer.path = j.Get("analyzer.path").String()
+		if s.analyzer.servicePort == 0 {
+			s.analyzer.servicePort = 443
 		}
-
-		// require serviceName and serviceDomain to build client
-		if config.analyzer.serviceName != "" && config.analyzer.serviceDomain != "" {
-			port := config.analyzer.servicePort
+		if s.analyzer.serviceName != "" && s.analyzer.serviceDomain != "" {
+			port := s.analyzer.servicePort
 			if port == 0 {
-				// default to 443 if not specified and cannot be derived
 				port = 443
 			}
-			config.analyzer.domain = config.analyzer.serviceDomain
-			config.analyzer.port = port
-			// 如果是IP，serviceName 指向你的静态服务条目（后台解析到 IP），serviceDomain 填 IP
-			config.analyzer.client = wrapper.NewClusterClient(wrapper.DnsCluster{
-				ServiceName: config.analyzer.serviceName,
+			s.analyzer.domain = s.analyzer.serviceDomain
+			s.analyzer.port = port
+			s.analyzer.client = wrapper.NewClusterClient(wrapper.DnsCluster{
+				ServiceName: s.analyzer.serviceName,
 				Port:        port,
-				Domain:      config.analyzer.serviceDomain,
+				Domain:      s.analyzer.serviceDomain,
 			})
 		}
 	}
 
-	// summary logs for debugging
-	// totalTimeoutMs 默认 10000 ms
-	config.analyzer.totalTimeoutMs = uint32(j.Get("analyzer.totalTimeoutMs").Uint())
-	if config.analyzer.totalTimeoutMs == 0 {
-		config.analyzer.totalTimeoutMs = 10000
+	s.analyzer.totalTimeoutMs = uint32(j.Get("analyzer.totalTimeoutMs").Uint())
+	if s.analyzer.totalTimeoutMs == 0 {
+		s.analyzer.totalTimeoutMs = 10000
 	}
-
 	log.Infof("[ai-llm-router] analyzer.enabled=%v model=%s timeoutMs=%d totalTimeoutMs=%d maxInputBytes=%d protocol=%s domain=%s port=%d path=%s",
-		config.analyzer.enabled, config.analyzer.model, config.analyzer.timeoutMs, config.analyzer.totalTimeoutMs, config.analyzer.maxInputBytes, config.analyzer.protocol, config.analyzer.domain, config.analyzer.port, config.analyzer.path)
+		s.analyzer.enabled, s.analyzer.model, s.analyzer.timeoutMs, s.analyzer.totalTimeoutMs, s.analyzer.maxInputBytes, s.analyzer.protocol, s.analyzer.domain, s.analyzer.port, s.analyzer.path)
 
 	// input extraction
-	config.inputExtraction.protocol = j.Get("inputExtraction.protocol").String()
-	if config.inputExtraction.protocol == "" {
-		config.inputExtraction.protocol = "openai"
+	s.inputExtraction.protocol = j.Get("inputExtraction.protocol").String()
+	if s.inputExtraction.protocol == "" {
+		s.inputExtraction.protocol = "openai"
 	}
-	config.inputExtraction.userJoinSep = j.Get("inputExtraction.userJoinSep").String()
-	if config.inputExtraction.userJoinSep == "" {
-		config.inputExtraction.userJoinSep = "\n\n"
+	s.inputExtraction.userJoinSep = j.Get("inputExtraction.userJoinSep").String()
+	if s.inputExtraction.userJoinSep == "" {
+		s.inputExtraction.userJoinSep = "\n\n"
 	}
 	if j.Get("inputExtraction.stripCodeFences").Exists() {
-		config.inputExtraction.stripCodeFences = j.Get("inputExtraction.stripCodeFences").Bool()
+		s.inputExtraction.stripCodeFences = j.Get("inputExtraction.stripCodeFences").Bool()
 	} else {
-		config.inputExtraction.stripCodeFences = true
+		s.inputExtraction.stripCodeFences = true
 	}
-	config.inputExtraction.codeFenceRegex = j.Get("inputExtraction.codeFenceRegex").String()
-	config.inputExtraction.contentJsonPath = j.Get("inputExtraction.contentJsonPath").String()
+	s.inputExtraction.codeFenceRegex = j.Get("inputExtraction.codeFenceRegex").String()
+	s.inputExtraction.contentJsonPath = j.Get("inputExtraction.contentJsonPath").String()
 
 	// routing
-	config.routing.providerIdHeader = j.Get("routing.providerIdHeader").String()
-	if config.routing.providerIdHeader == "" {
-		config.routing.providerIdHeader = "X-HI-Provider-Id"
+	s.routing.providerIdHeader = j.Get("routing.providerIdHeader").String()
+	if s.routing.providerIdHeader == "" {
+		s.routing.providerIdHeader = "X-HI-Provider-Id"
 	}
-	config.routing.fallbackProviderId = j.Get("routing.fallbackProviderId").String()
-	config.routing.minScore = int(j.Get("routing.minScore").Int())
-	config.routing.tieBreakOrder = make([]string, 0)
+	s.routing.fallbackProviderId = j.Get("routing.fallbackProviderId").String()
+	s.routing.minScore = int(j.Get("routing.minScore").Int())
+	s.routing.tieBreakOrder = make([]string, 0)
 	for _, v := range j.Get("routing.tieBreakOrder").Array() {
-		s := v.String()
-		if s != "" {
-			config.routing.tieBreakOrder = append(config.routing.tieBreakOrder, s)
+		sv := v.String()
+		if sv != "" {
+			s.routing.tieBreakOrder = append(s.routing.tieBreakOrder, sv)
 		}
 	}
-	config.routing.candidates = make([]Candidate, 0)
+	s.routing.candidates = make([]Candidate, 0)
 	for _, v := range j.Get("routing.candidates").Array() {
 		c := Candidate{id: v.Get("id").String(), enabled: true, scores: map[string]int{}}
 		if v.Get("enabled").Exists() {
@@ -229,86 +236,74 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 			c.scores[k] = int(val.Int())
 		}
 		if c.id != "" {
-			config.routing.candidates = append(config.routing.candidates, c)
+			s.routing.candidates = append(s.routing.candidates, c)
 		}
 	}
-	log.Infof("[ai-llm-router] routing candidates=%d providerIdHeader=%s fallback=%s minScore=%d",
-		len(config.routing.candidates), config.routing.providerIdHeader, config.routing.fallbackProviderId, config.routing.minScore)
+	logs.Infof("[ai-llm-router] routing candidates=%d providerIdHeader=%s fallback=%s minScore=%d",
+		len(s.routing.candidates), s.routing.providerIdHeader, s.routing.fallbackProviderId, s.routing.minScore)
 	return nil
 }
 
-func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config, log logs.Log) types.Action {
-	// 我们需要读取请求体进行语义分析
+func (s *SemanticStrategy) OnRequestHeaders(ctx wrapper.HttpContext, log logs.Log) types.Action {
+	// 读取请求体进行语义分析
 	ctx.DisableReroute()
 	ctx.SetRequestBodyBufferLimit(1024 * 1024)
 	return types.HeaderStopIteration
 }
 
-func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) types.Action {
-	// 若未启用 analyzer 或缺少必要配置，直接继续
-	if !config.analyzer.enabled || config.analyzer.client == nil || config.analyzer.path == "" || config.analyzer.apiToken == "" || config.analyzer.model == "" {
+func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) types.Action {
+	if !s.analyzer.enabled || s.analyzer.client == nil || s.analyzer.path == "" || s.analyzer.apiToken == "" || s.analyzer.model == "" {
 		logs.Debugf("[ai-llm-router] analyzer disabled or not configured, skip routing")
 		return types.ActionContinue
 	}
-
-	// 提取用户输入
-	userText := extractUserInput(body, config.inputExtraction, config.analyzer.maxInputBytes)
+	userText := extractUserInput(body, s.inputExtraction, s.analyzer.maxInputBytes)
 	if strings.TrimSpace(userText) == "" {
 		logs.Debugf("[ai-llm-router] empty user text after extraction, skip routing")
 		return types.ActionContinue
 	}
-	logs.Debugf("[ai-llm-router] extracted user text bytes=%d protocol=%s", len([]byte(userText)), config.inputExtraction.protocol)
+	logs.Debugf("[ai-llm-router] extracted user text bytes=%d protocol=%s", len([]byte(userText)), s.inputExtraction.protocol)
 	logs.Debugf("[ai-llm-router] extracted user text content: %s", userText)
 
-	// 组织请求体
-	prompt := buildPrompt(config.analyzer.promptTemplate, userText, config.analyzer.labels)
+	prompt := buildPrompt(s.analyzer.promptTemplate, userText, s.analyzer.labels)
 	reqBody, _ := json.Marshal(map[string]interface{}{
-		"model":    config.analyzer.model,
+		"model":    s.analyzer.model,
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
 	})
+	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + s.analyzer.apiToken}}
+	logs.Debugf("[ai-llm-router] analyzer request: host=%s port=%d path=%s body=%s", s.analyzer.domain, s.analyzer.port, s.analyzer.path, string(reqBody))
 
-	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.analyzer.apiToken}}
-	// 调用前打印关键信息
-	logs.Debugf("[ai-llm-router] analyzer request: host=%s port=%d path=%s body=%s", config.analyzer.domain, config.analyzer.port, config.analyzer.path, string(reqBody))
-
-	// 异步调用 + 重试，最多重试3次，总时间不超过 totalTimeoutMs
 	maxRetries := 3
-	deadline := time.Now().Add(time.Duration(config.analyzer.totalTimeoutMs) * time.Millisecond)
+	deadline := time.Now().Add(time.Duration(s.analyzer.totalTimeoutMs) * time.Millisecond)
 	attempt := 0
 
 	var send func()
 	send = func() {
-		logs.Debugf("[ai-llm-router] analyzer httpcall: timeoutMs=%d", config.analyzer.timeoutMs)
+		logs.Debugf("[ai-llm-router] analyzer httpcall: timeoutMs=%d", s.analyzer.timeoutMs)
 		remaining := time.Until(deadline) / time.Millisecond
 		if remaining <= 0 {
 			logs.Warnf("[ai-llm-router] analyzer deadline reached, stop retrying")
 			_ = proxywasm.ResumeHttpRequest()
 			return
 		}
-		callTimeout := config.analyzer.timeoutMs
+		callTimeout := s.analyzer.timeoutMs
 		if callTimeout == 0 || int64(callTimeout) > int64(remaining) {
 			callTimeout = uint32(remaining)
 		}
-		logs.Debugf("[ai-llm-router] analyzer attempt=%d timeoutMs=%d remainingMs=%d path=%s", attempt+1, callTimeout, remaining, config.analyzer.path)
-		// Always use path when calling cluster client so that service-source based routing works
-		err := config.analyzer.client.Post(
-			config.analyzer.path,
+		logs.Debugf("[ai-llm-router] analyzer attempt=%d timeoutMs=%d remainingMs=%d path=%s", attempt+1, callTimeout, remaining, s.analyzer.path)
+		err := s.analyzer.client.Post(
+			s.analyzer.path,
 			headers,
 			reqBody,
 			func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 				logs.Debugf("[ai-llm-router] analyzer response: status=%d body=%s", statusCode, string(responseBody))
-				label := classifyLabel(statusCode, responseBody, config.analyzer.labelRegex, config.analyzer.labels)
+				label := classifyLabel(statusCode, responseBody, s.analyzer.labelRegex, s.analyzer.labels)
 				if label != "" {
 					logs.Infof("[ai-llm-router] analyzer classified label=%s", label)
-					selected := selectProvider(label, config.routing)
+					selected := selectProvider(label, s.routing)
 					if selected != "" {
-						_ = proxywasm.ReplaceHttpRequestHeader(config.routing.providerIdHeader, selected)
-						// 将请求体中的 model 改为选中的 providerId
+						_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, selected)
 						if len(body) > 0 {
-							// 简单替换：若存在 "model":"..."，用 providerId 覆盖；否则不处理
 							bs := body
-							// 寻找 "model":"
-							// 朴素扫描，避免引入额外依赖
 							needle := []byte("\"model\":\"")
 							idx := indexOf(bs, needle)
 							if idx >= 0 {
@@ -331,7 +326,6 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 					_ = proxywasm.ResumeHttpRequest()
 					return
 				}
-				// 非成功或无法解析到标签 -> 重试
 				if attempt < maxRetries && time.Until(deadline) > 0 {
 					logs.Warnf("[ai-llm-router] analyzer classify failed (status=%d), retrying... attempt=%d", statusCode, attempt+2)
 					attempt++
@@ -344,8 +338,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 			callTimeout,
 		)
 		if err != nil {
-			// Host 层错误（如集群不存在、参数非法）不会进入回调，这里尽量打印上下文，并不做重试
-			logs.Warnf("[ai-llm-router] analyzer http error: %v, path=%s host=%s port=%d", err, config.analyzer.path, config.analyzer.domain, config.analyzer.port)
+			logs.Warnf("[ai-llm-router] analyzer http error: %v, path=%s host=%s port=%d", err, s.analyzer.path, s.analyzer.domain, s.analyzer.port)
 			_ = proxywasm.ResumeHttpRequest()
 			return
 		}
@@ -355,7 +348,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	return types.ActionPause
 }
 
-func onHttpResponseHeaders(ctx wrapper.HttpContext, config Config) types.Action {
+func (s *SemanticStrategy) OnResponseHeaders(ctx wrapper.HttpContext) types.Action {
 	if v := ctx.GetContext("selectedProviderId"); v != nil {
 		if id, _ := v.(string); id != "" {
 			_ = proxywasm.ReplaceHttpResponseHeader("x-select-llm", id)
@@ -365,8 +358,67 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config Config) types.Action 
 	return types.ActionContinue
 }
 
-func onHttpResponseBody(ctx wrapper.HttpContext, config Config, body []byte) types.Action {
+func (s *SemanticStrategy) OnResponseBody(ctx wrapper.HttpContext, body []byte) types.Action {
 	return types.ActionContinue
+}
+
+// 在控制台插件配置中填写的yaml配置会自动转换为json
+// 新配置结构：
+// strategy:
+//
+//	type: semantic
+//	semantic:
+//	  analyzer: {...}
+//	  inputExtraction: {...}
+//	  routing: {...}
+func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
+	st := strings.TrimSpace(j.Get("strategy.type").String())
+	if st == "" {
+		st = "semantic"
+	}
+	config.strategyType = st
+
+	switch st {
+	case "semantic":
+		s := &SemanticStrategy{}
+		if err := s.Parse(j.Get("strategy.semantic"), log); err != nil {
+			return err
+		}
+		config.strategy = s
+		log.Infof("[ai-llm-router] strategy=%s ready", s.Name())
+	default:
+		log.Warnf("[ai-llm-router] unknown strategy type: %s", st)
+		config.strategy = nil
+	}
+	return nil
+}
+
+func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config, log logs.Log) types.Action {
+	if config.strategy == nil {
+		return types.ActionContinue
+	}
+	return config.strategy.OnRequestHeaders(ctx, log)
+}
+
+func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) types.Action {
+	if config.strategy == nil {
+		return types.ActionContinue
+	}
+	return config.strategy.OnRequestBody(ctx, body)
+}
+
+func onHttpResponseHeaders(ctx wrapper.HttpContext, config Config) types.Action {
+	if config.strategy == nil {
+		return types.ActionContinue
+	}
+	return config.strategy.OnResponseHeaders(ctx)
+}
+
+func onHttpResponseBody(ctx wrapper.HttpContext, config Config, body []byte) types.Action {
+	if config.strategy == nil {
+		return types.ActionContinue
+	}
+	return config.strategy.OnResponseBody(ctx, body)
 }
 
 // ===== Helpers =====

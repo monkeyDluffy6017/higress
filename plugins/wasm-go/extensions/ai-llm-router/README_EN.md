@@ -18,59 +18,62 @@ How it works
 Deployment order
 - Ensure ai-llm-router runs before ai-proxy, otherwise the selection cannot take effect.
 
-Configuration
+Configuration (now strategy-based)
 ```yaml
-analyzer:
-  enabled: true
-  # Access analyzer via service-source (DNS). The upstream must be registered as a Higress service.
-  serviceName: "analyzer.dns"       # required, Higress DNS service name
-  servicePort: 443                   # optional, default 443
-  serviceDomain: "api.example.com"  # required, used as Host/SNI
-  path: "/v1/chat/completions"      # required, request path
-  apiToken: "sk-***"
-  model: "qwen2.5-coder-32b"
-  timeoutMs: 3000
-  totalTimeoutMs: 10000
-  maxInputBytes: 10240
-  promptTemplate: ""
-  protocol: "openai"
-  # Optional: customize labels (defaults to the 5 built-in ones)
-  labels:
-    - build_new_project
-    - add_new_feature
-    - fix_bug
-    - use_tool
-    - other
-
-inputExtraction:
-  protocol: "openai"
-  userJoinSep: "\n\n"
-  stripCodeFences: true
-  codeFenceRegex: ""
-  contentJsonPath: ""
-
-routing:
-  providerIdHeader: "X-HI-Provider-Id"
-  candidates:
-    - id: "openai"
+strategy:
+  type: semantic                  # Strategy type; currently supports "semantic" (semantic-based selection)
+  semantic:
+    analyzer:
       enabled: true
-      scores:
-        build_new_project: 5
-        add_new_feature: 4
-        fix_bug: 3
-        use_tool: 4
-        other: 2
-    - id: "deepseek"
-      enabled: true
-      scores:
-        build_new_project: 3
-        add_new_feature: 5
-        fix_bug: 5
-        use_tool: 3
-        other: 2
-  minScore: 1
-  fallbackProviderId: "openai"
-  tieBreakOrder: ["deepseek", "openai"]
+      # Access analyzer via service-source (DNS). The upstream must be registered as a Higress service.
+      serviceName: "analyzer.dns"     # required, Higress DNS service name
+      servicePort: 443                 # optional, default 443
+      serviceDomain: "api.example.com"# required, used as Host/SNI
+      path: "/v1/chat/completions"    # required, request path
+      apiToken: "sk-***"
+      model: "qwen2.5-coder-32b"
+      timeoutMs: 3000
+      totalTimeoutMs: 10000
+      maxInputBytes: 10240
+      promptTemplate: ""
+      protocol: "openai"
+      # Optional: customize labels (defaults to the 5 built-in ones)
+      labels:
+        - build_new_project
+        - add_new_feature
+        - fix_bug
+        - use_tool
+        - other
+
+    inputExtraction:
+      protocol: "openai"
+      userJoinSep: "\n\n"
+      stripCodeFences: true
+      codeFenceRegex: ""
+      contentJsonPath: ""
+
+    routing:
+      providerIdHeader: "X-HI-Provider-Id"
+      candidates:
+        - id: "openai"
+          enabled: true
+          scores:
+            build_new_project: 5
+            add_new_feature: 4
+            fix_bug: 3
+            use_tool: 4
+            other: 2
+        - id: "deepseek"
+          enabled: true
+          scores:
+            build_new_project: 3
+            add_new_feature: 5
+            fix_bug: 5
+            use_tool: 3
+            other: 2
+      minScore: 1
+      fallbackProviderId: "openai"
+      tieBreakOrder: ["deepseek", "openai"]
 ```
 
 Constraints
@@ -89,13 +92,16 @@ When `serviceDomain` is an IP
 
 Example (IP over HTTP):
 ```yaml
-analyzer:
-  serviceName: "analyzer.dns"
-  servicePort: 80
-  serviceDomain: "10.0.0.12"
-  path: "/v1/chat/completions"
-  apiToken: "sk-***"
-  model: "qwen2.5-coder-32b"
+strategy:
+  type: semantic
+  semantic:
+    analyzer:
+      serviceName: "analyzer.dns"
+      servicePort: 80
+      serviceDomain: "10.0.0.12"
+      path: "/v1/chat/completions"
+      apiToken: "sk-***"
+      model: "qwen2.5-coder-32b"
 ```
 
 Response header
@@ -107,7 +113,7 @@ Integration with ai-proxy
 
 Usage with ai-proxy
 1. Ensure candidates are configured in ai-proxy (including `providers[].id`).
-2. Configure `analyzer`, `inputExtraction`, and `routing.candidates` in ai-llm-router.
+2. In ai-llm-router, set `strategy.type=semantic` and configure `strategy.semantic.analyzer`, `strategy.semantic.inputExtraction`, and `strategy.semantic.routing.candidates`.
 3. Ensure execution order: ai-llm-router first, ai-proxy next.
 
 Notes
