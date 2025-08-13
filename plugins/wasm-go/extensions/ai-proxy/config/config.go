@@ -31,7 +31,6 @@ type PluginConfig struct {
 }
 
 func (c *PluginConfig) FromJson(json gjson.Result) {
-	// Process providers array configuration first
 	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
 		c.providerConfigs = make([]provider.ProviderConfig, 0)
 		for _, providerJson := range providersJson.Array() {
@@ -41,27 +40,24 @@ func (c *PluginConfig) FromJson(json gjson.Result) {
 		}
 	}
 
-	// Process legacy single provider configuration
 	if providerJson := json.Get("provider"); providerJson.Exists() && providerJson.IsObject() {
-		// Legacy single provider configuration
+		// TODO: For legacy config support. To be removed later.
 		providerConfig := provider.ProviderConfig{}
 		providerConfig.FromJson(providerJson)
 		c.providerConfigs = []provider.ProviderConfig{providerConfig}
-		c.activeProviderConfig = &c.providerConfigs[0]
+		c.activeProviderConfig = &providerConfig
 		// Legacy configuration is used and the active provider is determined.
 		// We don't need to continue with the new configuration style.
 		return
 	}
 
-	// Reset active provider config
 	c.activeProviderConfig = nil
 
-	// Process activeProviderId to select from configured providers
 	activeProviderId := json.Get("activeProviderId").String()
 	if activeProviderId != "" {
-		for i := range c.providerConfigs {
-			if c.providerConfigs[i].GetId() == activeProviderId {
-				c.activeProviderConfig = &c.providerConfigs[i]
+		for _, providerConfig := range c.providerConfigs {
+			if providerConfig.GetId() == activeProviderId {
+				c.activeProviderConfig = &providerConfig
 				break
 			}
 		}
@@ -79,10 +75,8 @@ func (c *PluginConfig) Validate() error {
 }
 
 func (c *PluginConfig) Complete() error {
-	// Reset active provider
-	c.activeProvider = nil
-
 	if c.activeProviderConfig == nil {
+		c.activeProvider = nil
 		return nil
 	}
 
@@ -103,39 +97,4 @@ func (c *PluginConfig) GetProvider() provider.Provider {
 
 func (c *PluginConfig) GetProviderConfig() *provider.ProviderConfig {
 	return c.activeProviderConfig
-}
-
-// GetProviderConfigs returns all provider configurations
-func (c *PluginConfig) GetProviderConfigs() []provider.ProviderConfig {
-	return c.providerConfigs
-}
-
-// GetProviderForModel returns the provider that should handle the given model
-// It searches through providers in order and returns the first one that has a mapping for the model
-func (c *PluginConfig) GetProviderForModel(modelName string) (*provider.ProviderConfig, provider.Provider) {
-	// For legacy single provider configuration
-	if c.activeProviderConfig != nil {
-		return c.activeProviderConfig, c.activeProvider
-	}
-
-	// For multi-provider configuration, find the first provider that can handle this model
-	for i := range c.providerConfigs {
-		providerConfig := &c.providerConfigs[i]
-		if providerConfig.CanHandleModel(modelName) {
-			// Create provider instance if not exists
-			if p, err := provider.CreateProvider(*providerConfig); err == nil {
-				return providerConfig, p
-			}
-		}
-	}
-
-	// If no specific provider found, use the first one as fallback
-	if len(c.providerConfigs) > 0 {
-		providerConfig := &c.providerConfigs[0]
-		if p, err := provider.CreateProvider(*providerConfig); err == nil {
-			return providerConfig, p
-		}
-	}
-
-	return nil, nil
 }
