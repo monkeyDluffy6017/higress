@@ -1,3 +1,71 @@
+ai-proxy（大模型网关与协议转换插件）
+
+ai-proxy 是内置的 AI 代理插件，负责：
+- 将“对外统一协议”（默认 OpenAI 兼容）转换为各厂商原生接口；
+- 按配置选择 Provider（厂商）并改写上游域名/路径/鉴权；
+- 处理流式响应、首包超时、失败重试、apiToken 健康度切换等。
+
+本插件可与 `ai-llm-router` 等插件协作：前置插件可以为单次请求指定“目的 LLM”，ai-proxy 负责完成最终转发。
+
+工作原理
+- 解析插件配置 `providers[]` 并按 `activeProviderId` 选择默认 Provider；
+- 进入请求后，按所选 Provider 转换请求头/体（Host/Path/Authorization/模型名映射等）；
+- 执行上游请求；根据 Provider 能力转换返回头/体；
+- 处理流式（SSE）与非流式响应，并按需设置首包超时；
+- 在错误、超时等情况下，按配置执行重试/故障切换。
+
+请求级 Provider 覆写（重要）
+- 支持通过请求头为“单次请求”覆写 Provider：
+  - 请求头：`X-HI-Provider-Id`
+  - 取值：必须与 `providers[].id` 一致（如 `openai`、`deepseek`、`aliyun` 等）
+- 生效顺序：请求头覆写 > `activeProviderId`（默认）
+- 兼容性：未设置或设置未知 id 时，自动回退到 `activeProviderId`
+- 配置层无需变更。推荐搭配 `ai-llm-router` 在其请求头阶段写入该头。
+
+原始头保留
+- 为便于调试/审计，在改写请求头时会保存原始值：
+  - `X-ENVOY-ORIGINAL-HOST`：原始 `:authority`
+  - `X-ENVOY-ORIGINAL-PATH`：原始 `:path`
+  - `X-HI-ORIGINAL-AUTH`：原始 `Authorization`
+
+流式与首包超时
+- 流式（SSE）请求：当 `stream=true` 或 Provider 判定为流式接口时，设置 `Accept: text/event-stream`；
+- 非流式时移除 `Content-Length`，由网关重算；
+- 可在配置中为流式接口开启首包超时：通过请求头 `x-envoy-upstream-rq-first-byte-timeout-ms` 注入。
+
+失败重试与 apiToken 故障切换
+- 支持对失败请求立即重试；
+- 支持 apiToken 级健康度管理：连续失败达到阈值后临时移出，健康检查通过后再加入。
+
+配置概览（片段）
+```yaml
+defaultConfig:
+  providers:
+    - id: openai
+      type: openai
+      apiTokens: ["sk-***"]
+      openaiCustomUrl: "https://your.domain/api/v1"   # 可选，自定义后端地址
+      # ... 其他厂商 ...
+matchRules:
+  - config:
+      activeProviderId: openai
+    service:
+      - llm-openai.internal.dns
+```
+
+与 ai-llm-router 协作
+- 将 `ai-llm-router` 放在 ai-proxy 之前；
+- 在 `ai-llm-router` 中根据语义/能力分选择目的 LLM，并写入：
+  - `X-HI-Provider-Id: <providers[].id>`
+- ai-proxy 读取该头后使用对应 Provider 完成转发。
+
+注意事项
+- 仅对 `Content-Type: application/json` 的请求体进行语义转换；
+- 为确保可观察性，插件会移除 `Accept-Encoding`；
+- 当请求体或路径被修改时会移除 `Content-Length`；
+- 插件初始化阶段会禁用“路由重算”，以避免改写头部后被重新路由；
+- 未知 Provider 覆写将被忽略并回退到默认 Provider。
+
 ---
 title: AI 代理
 keywords: [AI网关, AI代理]
@@ -2006,10 +2074,10 @@ static_resources:
                             value: | # 插件配置
                               {
                                 "provider": {
-                                  "type": "claude",                                
+                                  "type": "claude",
                                   "apiTokens": [
                                     "YOUR_API_TOKEN"
-                                  ]                  
+                                  ]
                                 }
                               }
                   - name: envoy.filters.http.router

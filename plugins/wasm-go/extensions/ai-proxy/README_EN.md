@@ -1,3 +1,70 @@
+ai-proxy (LLM gateway and protocol adapter)
+
+ai-proxy is the built-in AI proxy plugin that:
+- Converts the external unified protocol (OpenAI-compatible by default) to vendor-native APIs;
+- Selects a provider (vendor) per configuration and rewrites upstream host/path/authorization;
+- Handles streaming responses, first-byte timeout, retries, and API token failover.
+
+It can work with `ai-llm-router`: the router selects the target provider per request, and ai-proxy performs the final forwarding.
+
+How it works
+- Parse `providers[]` and select the default provider by `activeProviderId`.
+- Transform request headers/body per provider (Host/Path/Auth/model mapping), then call upstream.
+- Transform response headers/body as needed; support streaming (SSE) and non-streaming paths.
+- Apply retries/failover per configuration on errors.
+
+Per-request provider override
+- You can override the provider for a single request via request header:
+  - Header: `X-HI-Provider-Id`
+  - Value must match one of `providers[].id` (e.g., `openai`, `deepseek`).
+- Precedence: override header > `activeProviderId`.
+- Compatibility: unknown id falls back to `activeProviderId`.
+- No configuration change required. Typically set this header in `ai-llm-router`.
+
+Original headers
+- To aid debugging/auditing, original headers are preserved:
+  - `X-ENVOY-ORIGINAL-HOST` (original `:authority`)
+  - `X-ENVOY-ORIGINAL-PATH` (original `:path`)
+  - `X-HI-ORIGINAL-AUTH` (original `Authorization`)
+
+Streaming and first-byte timeout
+- For streaming (SSE), set `Accept: text/event-stream` when `stream=true` or the API is streaming.
+- For non-streaming, remove `Content-Length` to allow re-computation.
+- First-byte timeout for streaming can be injected via `x-envoy-upstream-rq-first-byte-timeout-ms`.
+
+Retries and API token failover
+- Immediate retry on failed requests is supported.
+- API tokens are health-checked and rotated: tokens with consecutive failures are temporarily removed and re-added when healthy.
+
+Configuration (snippet)
+```yaml
+defaultConfig:
+  providers:
+    - id: openai
+      type: openai
+      apiTokens: ["sk-***"]
+      openaiCustomUrl: "https://your.domain/api/v1"
+      # ... other vendors ...
+matchRules:
+  - config:
+      activeProviderId: openai
+    service:
+      - llm-openai.internal.dns
+```
+
+Working with ai-llm-router
+- Place `ai-llm-router` before ai-proxy.
+- `ai-llm-router` selects the target provider and sets:
+  - `X-HI-Provider-Id: <providers[].id>`
+- ai-proxy reads the header and forwards accordingly.
+
+Notes
+- Only transform JSON request bodies.
+- `Accept-Encoding` is removed to ensure response transformation works correctly.
+- `Content-Length` is removed when body/path is modified.
+- Route re-calculation is disabled to avoid re-routing after header changes.
+- Unknown override ids are ignored (fallback to default provider).
+
 ---
 title: AI Proxy
 keywords: [AI Gateway, AI Proxy]
