@@ -37,12 +37,19 @@ strategy:
       maxInputBytes: 10240
       promptTemplate: ""
       protocol: "openai"
-      # 可选：自定义标签列表（不配置则使用默认 5 个）
+      # 可选：定义标签列表（用于候选 Provider 打分与规则引擎引用）
       labels:
         - build_new_project
         - add_new_feature
         - fix_bug
-        - use_tool
+        - other
+      # 必选（当配置了 labels 时）：用于“语义分析分类”的标签子集；
+      # 未配置 labels 时可省略，默认使用内置集合；
+      # 若配置了 labels 但缺少 analysisLabels，将报错。
+      analysisLabels:
+        - build_new_project
+        - add_new_feature
+        - fix_bug
         - other
 
     inputExtraction:
@@ -96,12 +103,12 @@ strategy:
       # 规则文件加载已移除，不再支持 rulesFile
 ```
 
-重要约束
+ 重要约束
 - routing.candidates[].id 必须与 ai-proxy 的 providers[].id 对齐。
 - 仅对 Content-Type: application/json 且符合协议的请求生效。
 - 为保护敏感信息，发送给分析模型前会移除成对代码块并做长度截断。
 - analyzer 仅支持基于服务源（DNS）的访问方式。HTTPS 场景下需使用域名作为 serviceDomain 以满足证书与 SNI 要求；如必须直连 IP，请在 HTTP 场景或为该 IP 配置对应的域名。
-- 当自定义了 `labels` 且未提供 `promptTemplate` 时，插件会基于标签自动生成默认提示词；如需标签定义/描述，请显式提供 `promptTemplate`。
+- 当自定义了 `labels` 且未提供 `promptTemplate` 时，插件会基于 `analysisLabels` 自动生成默认提示词；如需标签定义/描述，请显式提供 `promptTemplate`。
 
 serviceDomain 为 IP 的情况
 - 支持将 `serviceDomain` 配置为 IP。此时默认会使用该值作为请求的 Host（:authority），并在 TLS 中作为 SNI 发送。

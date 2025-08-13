@@ -37,12 +37,19 @@ strategy:
       maxInputBytes: 10240
       promptTemplate: ""
       protocol: "openai"
-      # Optional: customize labels (defaults to the 5 built-in ones)
+      # Optional: labels used for provider scoring and rule engine references
       labels:
         - build_new_project
         - add_new_feature
         - fix_bug
-        - use_tool
+        - other
+      # Required when labels are provided: subset used strictly for semantic classification.
+      # When labels are not provided, this can be omitted and defaults to the built-in set.
+      # If labels are provided but analysisLabels are missing, the plugin will return an error.
+      analysisLabels:
+        - build_new_project
+        - add_new_feature
+        - fix_bug
         - other
 
     inputExtraction:
@@ -101,7 +108,7 @@ Constraints
 - Only effective for requests with `Content-Type: application/json` and supported protocols.
 - To protect sensitive data, code blocks are stripped and the analyzer input is truncated to `maxInputBytes`.
 - Analyzer currently supports DNS service-source only. For HTTPS, use a domain as `serviceDomain` to satisfy certificate/SNI; if you must connect to an IP directly, use HTTP or bind a domain to that IP.
- - When `labels` are customized and `promptTemplate` is not provided, the plugin auto-generates a minimal default prompt listing the labels. If you need label definitions/descriptions, provide your own `promptTemplate` explicitly.
+- When `labels` are customized and `promptTemplate` is not provided, the plugin auto-generates a minimal default prompt listing `analysisLabels`. If you need label definitions/descriptions, provide your own `promptTemplate` explicitly.
 
 When `serviceDomain` is an IP
 - You can set `serviceDomain` to an IP address. It will be used as the request Host (`:authority`) and SNI in TLS by default.

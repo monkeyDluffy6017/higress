@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"regexp"
 	"strings"
@@ -42,7 +43,7 @@ const defaultPromptTemplate = "You are a highly-specialized classification exper
 	"2.  add_new_feature: adding a new capability to an existing application/service/module.\n" +
 	"3.  fix_bug: fixing errors/defects or unexpected behavior in existing functionality.\n" +
 	"4.  other: anything else (refactoring, docs, performance, analysis, etc.).\n\n" +
-	"Instructions: respond with ONE label only: build_new_project, add_new_feature, fix_bug, use_tool, or other. No explanations.\n\n" +
+	"Instructions: respond with ONE label only: build_new_project, add_new_feature, fix_bug, or other. No explanations.\n\n" +
 	"User Request: {USER_INPUT}"
 
 // ===== 策略模式：通用接口与语义策略实现 =====
@@ -74,6 +75,7 @@ type AnalyzerConfig struct {
 	promptTemplate string
 	protocol       string
 	labels         []string
+	analysisLabels []string
 	labelRegex     *regexp.Regexp
 	// service-source based fields (optional). If serviceName is set, prefer DNS service source.
 	serviceName   string
@@ -145,7 +147,7 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 	if s.analyzer.protocol == "" {
 		s.analyzer.protocol = "openai"
 	}
-	// labels
+	// labels (general)
 	s.analyzer.labels = make([]string, 0)
 	for _, v := range j.Get("analyzer.labels").Array() {
 		sv := strings.TrimSpace(v.String())
@@ -153,14 +155,32 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 			s.analyzer.labels = append(s.analyzer.labels, sv)
 		}
 	}
-	if len(s.analyzer.labels) == 0 {
-		s.analyzer.labels = []string{"build_new_project", "add_new_feature", "fix_bug", "use_tool", "other"}
+	// analysisLabels (used strictly for semantic classification)
+	s.analyzer.analysisLabels = make([]string, 0)
+	if arr := j.Get("analyzer.analysisLabels"); arr.Exists() && arr.IsArray() {
+		for _, v := range arr.Array() {
+			sv := strings.TrimSpace(v.String())
+			if sv != "" {
+				s.analyzer.analysisLabels = append(s.analyzer.analysisLabels, sv)
+			}
+		}
 	}
-	// compile regex
+	// Validation: if labels are provided but analysisLabels are not, it's an error
+	if len(s.analyzer.labels) > 0 && len(s.analyzer.analysisLabels) == 0 {
+		return errors.New("analyzer.analysisLabels is required when analyzer.labels is provided")
+	}
+	if len(s.analyzer.labels) == 0 && len(s.analyzer.analysisLabels) > 0 {
+		return errors.New("analyzer.labels is required when analyzer.analysisLabels is provided")
+	}
+	// Defaults: if none provided, use built-in four labels
+	if len(s.analyzer.labels) == 0 && len(s.analyzer.analysisLabels) == 0 {
+		s.analyzer.analysisLabels = []string{"build_new_project", "add_new_feature", "fix_bug", "other"}
+	}
+	// compile regex based on analysisLabels
 	{
 		var b strings.Builder
 		b.WriteString("\\b(")
-		for i, sv := range s.analyzer.labels {
+		for i, sv := range s.analyzer.analysisLabels {
 			if i > 0 {
 				b.WriteString("|")
 			}
@@ -303,7 +323,7 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 	logs.Debugf("[ai-llm-router] extracted user text bytes=%d protocol=%s", len([]byte(userText)), s.inputExtraction.protocol)
 	logs.Debugf("[ai-llm-router] extracted user text content: %s", userText)
 
-	prompt := buildPrompt(s.analyzer.promptTemplate, userText, s.analyzer.labels)
+	prompt := buildPrompt(s.analyzer.promptTemplate, userText, s.analyzer.analysisLabels)
 	reqBody, _ := json.Marshal(map[string]interface{}{
 		"model":    s.analyzer.model,
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
@@ -335,7 +355,7 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 			reqBody,
 			func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 				logs.Debugf("[ai-llm-router] analyzer response: status=%d body=%s", statusCode, string(responseBody))
-				label := classifyLabel(statusCode, responseBody, s.analyzer.labelRegex, s.analyzer.labels)
+				label := classifyLabel(statusCode, responseBody, s.analyzer.labelRegex, s.analyzer.analysisLabels)
 				if label != "" {
 					logs.Infof("[ai-llm-router] analyzer classified label=%s", label)
 					// 第二阶段策略：基于候选模型（若有规则引擎预筛选）选择 provider
