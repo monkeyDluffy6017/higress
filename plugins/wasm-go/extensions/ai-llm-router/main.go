@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	logs "github.com/higress-group/wasm-go/pkg/log"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
@@ -212,26 +213,58 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 
 	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + config.analyzer.apiToken}}
 
-	// 异步调用，暂停请求，回调中 Resume
-	err := config.analyzer.client.Post(
-		config.analyzer.path,
-		headers,
-		reqBody,
-		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-			label := classifyLabel(statusCode, responseBody)
-			selected := selectProvider(label, config.routing)
-			if selected != "" {
-				_ = proxywasm.ReplaceHttpRequestHeader(config.routing.providerIdHeader, selected)
-				ctx.SetContext("selectedProviderId", selected)
+	// 异步调用 + 重试，最多重试3次，总时间不超过2s
+	maxRetries := 3
+	deadline := time.Now().Add(2 * time.Second)
+	attempt := 0
+
+	var send func()
+	send = func() {
+		remaining := time.Until(deadline) / time.Millisecond
+		if remaining <= 0 {
+			_ = proxywasm.ResumeHttpRequest()
+			return
+		}
+		callTimeout := config.analyzer.timeoutMs
+		if callTimeout == 0 || int64(callTimeout) > int64(remaining) {
+			callTimeout = uint32(remaining)
+		}
+		err := config.analyzer.client.Post(
+			config.analyzer.path,
+			headers,
+			reqBody,
+			func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+				label := classifyLabel(statusCode, responseBody)
+				if label != "other" {
+					selected := selectProvider(label, config.routing)
+					if selected != "" {
+						_ = proxywasm.ReplaceHttpRequestHeader(config.routing.providerIdHeader, selected)
+						ctx.SetContext("selectedProviderId", selected)
+					}
+					_ = proxywasm.ResumeHttpRequest()
+					return
+				}
+				// 非成功或无法解析到标签 -> 重试
+				if attempt < maxRetries && time.Until(deadline) > 0 {
+					attempt++
+					send()
+					return
+				}
+				_ = proxywasm.ResumeHttpRequest()
+			},
+			callTimeout,
+		)
+		if err != nil {
+			if attempt < maxRetries && time.Until(deadline) > 0 {
+				attempt++
+				send()
+				return
 			}
 			_ = proxywasm.ResumeHttpRequest()
-		},
-		config.analyzer.timeoutMs,
-	)
-	if err != nil {
-		_ = proxywasm.ResumeHttpRequest()
-		return types.ActionPause
+		}
 	}
+
+	send()
 	return types.ActionPause
 }
 
