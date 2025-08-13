@@ -53,6 +53,8 @@ type AnalyzerConfig struct {
 	maxInputBytes  int
 	promptTemplate string
 	protocol       string
+	labels         []string
+	labelRegex     *regexp.Regexp
 	// service-source based fields (optional). If serviceName is set, prefer DNS service source.
 	serviceName   string
 	servicePort   int64
@@ -113,6 +115,33 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 	config.analyzer.protocol = j.Get("analyzer.protocol").String()
 	if config.analyzer.protocol == "" {
 		config.analyzer.protocol = "openai"
+	}
+	// configurable labels
+	config.analyzer.labels = make([]string, 0)
+	for _, v := range j.Get("analyzer.labels").Array() {
+		s := strings.TrimSpace(v.String())
+		if s != "" {
+			config.analyzer.labels = append(config.analyzer.labels, s)
+		}
+	}
+	if len(config.analyzer.labels) == 0 {
+		config.analyzer.labels = []string{"build_new_project", "add_new_feature", "fix_bug", "use_tool", "other"}
+	}
+	// compile label regex: \b(l1|l2|...)\b
+	{
+		var b strings.Builder
+		b.WriteString("\\b(")
+		for i, s := range config.analyzer.labels {
+			if i > 0 {
+				b.WriteString("|")
+			}
+			// labels are literal words
+			b.WriteString(regexp.QuoteMeta(s))
+		}
+		b.WriteString(")\\b")
+		if re, err := regexp.Compile(b.String()); err == nil {
+			config.analyzer.labelRegex = re
+		}
 	}
 
 	if config.analyzer.enabled {
@@ -232,7 +261,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	logs.Debugf("[ai-llm-router] extracted user text content: %s", userText)
 
 	// 组织请求体
-	prompt := buildPrompt(config.analyzer.promptTemplate, userText)
+	prompt := buildPrompt(config.analyzer.promptTemplate, userText, config.analyzer.labels)
 	reqBody, _ := json.Marshal(map[string]interface{}{
 		"model":    config.analyzer.model,
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
@@ -268,7 +297,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 			reqBody,
 			func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 				logs.Debugf("[ai-llm-router] analyzer response: status=%d body=%s", statusCode, string(responseBody))
-				label := classifyLabel(statusCode, responseBody)
+				label := classifyLabel(statusCode, responseBody, config.analyzer.labelRegex, config.analyzer.labels)
 				if label != "" {
 					logs.Infof("[ai-llm-router] analyzer classified label=%s", label)
 					selected := selectProvider(label, config.routing)
@@ -400,9 +429,27 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 	return text
 }
 
-func buildPrompt(tpl string, user string) string {
+func buildPrompt(tpl string, user string, labels []string) string {
 	if strings.TrimSpace(tpl) == "" {
-		tpl = defaultPromptTemplate
+		// Build default template with dynamic labels if provided
+		if len(labels) == 0 {
+			tpl = defaultPromptTemplate
+		} else {
+			var b strings.Builder
+			b.WriteString("You are a highly-specialized classification expert. Your ONLY purpose is to classify a user's development request into one of labels based on the definitions below.\n\n")
+			b.WriteString("Here are the definitions for each label:\n\n")
+			// No per-label definition text here; users can still override via promptTemplate
+			// Just list labels and instruct to reply one only
+			b.WriteString("Labels: ")
+			for i, s := range labels {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(s)
+			}
+			b.WriteString(".\n\nInstructions: respond with ONE label only. No explanations.\n\nUser Request: {USER_INPUT}")
+			tpl = b.String()
+		}
 	}
 	return strings.ReplaceAll(tpl, "{USER_INPUT}", user)
 }
@@ -431,9 +478,7 @@ func indexOf(haystack []byte, needle []byte) int {
 	return -1
 }
 
-var labelRegex = regexp.MustCompile(`\b(build_new_project|add_new_feature|fix_bug|use_tool|other)\b`)
-
-func classifyLabel(statusCode int, resp []byte) string {
+func classifyLabel(statusCode int, resp []byte, re *regexp.Regexp, fallbackLabels []string) string {
 	if statusCode != 200 || len(resp) == 0 {
 		return ""
 	}
@@ -441,8 +486,18 @@ func classifyLabel(statusCode int, resp []byte) string {
 	if content == "" {
 		return ""
 	}
-	m := labelRegex.FindString(content)
-	return m
+	// prefer configured regex
+	if re != nil {
+		m := re.FindString(content)
+		return m
+	}
+	// fallback: simple scan for any configured label substring
+	for _, s := range fallbackLabels {
+		if s != "" && strings.Contains(content, s) {
+			return s
+		}
+	}
+	return ""
 }
 
 func selectProvider(label string, r RoutingConfig) string {

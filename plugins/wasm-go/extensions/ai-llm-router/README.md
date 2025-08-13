@@ -34,6 +34,13 @@ analyzer:
   maxInputBytes: 10240
   promptTemplate: ""
   protocol: "openai"
+  # 可选：自定义标签列表（不配置则使用默认 5 个）
+  labels:
+    - build_new_project
+    - add_new_feature
+    - fix_bug
+    - use_tool
+    - other
 
 inputExtraction:
   protocol: "openai"
@@ -71,6 +78,7 @@ routing:
 - 仅对 Content-Type: application/json 且符合协议的请求生效。
 - 为保护敏感信息，发送给分析模型前会移除成对代码块并做长度截断。
 - analyzer 仅支持基于服务源（DNS）的访问方式。HTTPS 场景下需使用域名作为 serviceDomain 以满足证书与 SNI 要求；如必须直连 IP，请在 HTTP 场景或为该 IP 配置对应的域名。
+- 当自定义了 `labels` 且未提供 `promptTemplate` 时，插件会基于标签自动生成默认提示词；如需标签定义/描述，请显式提供 `promptTemplate`。
 
 serviceDomain 为 IP 的情况
 - 支持将 `serviceDomain` 配置为 IP。此时默认会使用该值作为请求的 Host（:authority），并在 TLS 中作为 SNI 发送。

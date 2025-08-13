@@ -34,6 +34,13 @@ analyzer:
   maxInputBytes: 10240
   promptTemplate: ""
   protocol: "openai"
+  # Optional: customize labels (defaults to the 5 built-in ones)
+  labels:
+    - build_new_project
+    - add_new_feature
+    - fix_bug
+    - use_tool
+    - other
 
 inputExtraction:
   protocol: "openai"
@@ -71,6 +78,7 @@ Constraints
 - Only effective for requests with `Content-Type: application/json` and supported protocols.
 - To protect sensitive data, code blocks are stripped and the analyzer input is truncated to `maxInputBytes`.
 - Analyzer currently supports DNS service-source only. For HTTPS, use a domain as `serviceDomain` to satisfy certificate/SNI; if you must connect to an IP directly, use HTTP or bind a domain to that IP.
+ - When `labels` are customized and `promptTemplate` is not provided, the plugin auto-generates a minimal default prompt listing the labels. If you need label definitions/descriptions, provide your own `promptTemplate` explicitly.
 
 When `serviceDomain` is an IP
 - You can set `serviceDomain` to an IP address. It will be used as the request Host (`:authority`) and SNI in TLS by default.
