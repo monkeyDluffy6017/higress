@@ -1206,7 +1206,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 							responseBody, err := config.BuildFilteredModelsResponse(allowedModels, log)
 							if err != nil {
 								log.Errorf("failed to build models response: %v", err)
-								_ = sendJSONResponse(500, CodeBuildModelsFailed, "Failed to build models response", false, nil)
+								_ = sendJSONResponse(500, BuildModelsFailed, "Failed to build models response", false, nil)
 								return
 							}
 
@@ -1217,7 +1217,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 							err = proxywasm.SendHttpResponse(200, headers, responseBody, -1)
 							if err != nil {
 								log.Errorf("failed to send response: %v", err)
-								_ = sendJSONResponse(500, CodeSendModelsResponseFailed, "Failed to send models response", false, nil)
+								_ = sendJSONResponse(500, SendModelsResponseFailed, "Failed to send models response", false, nil)
 								return
 							}
 
@@ -1241,7 +1241,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		responseBody, err := config.BuildFilteredModelsResponse(allowedModels, log)
 		if err != nil {
 			log.Errorf("failed to build models response: %v", err)
-			_ = sendJSONResponse(500, CodeBuildModelsFailed, "Failed to build models response", false, nil)
+			_ = sendJSONResponse(500, BuildModelsFailed, "Failed to build models response", false, nil)
 			return types.ActionContinue
 		}
 
@@ -1252,7 +1252,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		err = proxywasm.SendHttpResponse(200, headers, responseBody, -1)
 		if err != nil {
 			log.Errorf("failed to send response: %v", err)
-			_ = sendJSONResponse(500, CodeSendModelsResponseFailed, "Failed to send models response", false, nil)
+			_ = sendJSONResponse(500, SendModelsResponseFailed, "Failed to send models response", false, nil)
 			return types.ActionContinue
 		}
 
@@ -1273,7 +1273,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		// for admin operations, check admin header and key
 		adminKey, err := proxywasm.GetHttpRequestHeader(config.AdminHeader)
 		if err != nil || adminKey != config.AdminKey {
-			sendJSONResponse(http.StatusForbidden, CodeUnauthorized, "Request denied by ai quota check. Unauthorized admin operation.", false, nil)
+			sendJSONResponse(http.StatusForbidden, Unauthorized, "Request denied by ai quota check. Unauthorized admin operation.", false, nil)
 			return types.ActionContinue
 		}
 
@@ -1304,14 +1304,14 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 	// get token
 	tokenHeader, err := proxywasm.GetHttpRequestHeader(config.TokenHeader)
 	if err != nil || tokenHeader == "" {
-		sendJSONResponse(http.StatusUnauthorized, CodeNoToken, "Request denied by ai quota check. No token found.", false, nil)
+		sendJSONResponse(http.StatusUnauthorized, NoToken, "Request denied by ai quota check. No token found.", false, nil)
 		return types.ActionContinue
 	}
 
 	// extract token (remove Bearer prefix etc.)
 	token := extractTokenFromHeader(tokenHeader)
 	if token == "" {
-		sendJSONResponse(http.StatusUnauthorized, CodeInvalidToken, "Request denied by ai quota check. Invalid token format.", false, nil)
+		sendJSONResponse(http.StatusUnauthorized, InvalidToken, "Request denied by ai quota check. Invalid token format.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -1319,12 +1319,12 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 	userInfo, err := parseUserInfoFromToken(token)
 	if err != nil {
 		log.Warnf("Failed to parse token: %v", err)
-		sendJSONResponse(http.StatusUnauthorized, CodeTokenParseFailed, "Request denied by ai quota check. Token parse failed.", false, nil)
+		sendJSONResponse(http.StatusUnauthorized, TokenParseFailed, "Request denied by ai quota check. Token parse failed.", false, nil)
 		return types.ActionContinue
 	}
 
 	if userInfo.EmployeeNumber == "" {
-		sendJSONResponse(http.StatusUnauthorized, CodeNoUserID, "Request denied by ai quota check. No employee number found in token.", false, nil)
+		sendJSONResponse(http.StatusUnauthorized, NoUserID, "Request denied by ai quota check. No employee number found in token.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -1483,7 +1483,7 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 			employeeNumber, ok := ctx.GetContext("employeeNumber").(string)
 			if !ok || employeeNumber == "" {
 				log.Warnf("[processQuotaLogic] Employee number not found in context for restricted model %s - BLOCKING REQUEST", modelName)
-				sendJSONResponse(http.StatusUnauthorized, CodeNoEmployeeNumber,
+				sendJSONResponse(http.StatusUnauthorized, NoEmployeeNumber,
 					fmt.Sprintf("Valid employee information required to access restricted model %s", modelName), false, nil)
 				return types.ActionContinue
 			}
@@ -1494,7 +1494,7 @@ func processQuotaLogic(ctx wrapper.HttpContext, config QuotaConfig, body []byte,
 			config.permissionChecker.CheckModelPermission(employeeNumber, modelName, log, func(hasPermission bool) {
 				if !hasPermission {
 					log.Warnf("[processQuotaLogic] User %s does not have permission to use restricted model %s - BLOCKING REQUEST", userId, modelName)
-					sendJSONResponse(http.StatusForbidden, CodeModelPermissionDenied,
+					sendJSONResponse(http.StatusForbidden, ModelPermissionDenied,
 						fmt.Sprintf("You don't have permission to use model %s", modelName), false, nil)
 					return
 				}
@@ -1543,7 +1543,7 @@ func handleTotalQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConf
 			log.Warnf("Retryable error encountered, quota check will be retried for user %s", userId)
 		}
 
-		sendJSONResponse(http.StatusForbidden, CodeTotalQuotaError,
+		sendJSONResponse(http.StatusForbidden, TotalQuotaError,
 			fmt.Sprintf("Failed to retrieve total quota: %s", redisErr.Error()), false, nil)
 		return
 	}
@@ -1585,7 +1585,7 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 			log.Warnf("Retryable error encountered, used quota check will be retried for user %s", userId)
 		}
 
-		sendJSONResponse(http.StatusForbidden, CodeUsedQuotaError,
+		sendJSONResponse(http.StatusForbidden, UsedQuotaError,
 			fmt.Sprintf("Failed to retrieve used quota: %s", redisErr.Error()), false, nil)
 		return
 	}
@@ -1644,7 +1644,7 @@ func handleUsedQuotaResponseWithRetry(ctx wrapper.HttpContext, config QuotaConfi
 		return
 	} else {
 		log.Warnf("Insufficient quota for user %s: remaining=%f, required=%f", userId, remainingQuota, quotaWeight)
-		sendJSONResponse(http.StatusForbidden, CodeInsufficientQuota,
+		sendJSONResponse(http.StatusForbidden, InsufficientQuota,
 			fmt.Sprintf("Insufficient quota. Required: %f, Available: %f", quotaWeight, remainingQuota), false, nil)
 	}
 }
@@ -1669,7 +1669,7 @@ func handleQuotaDeductionResponse(ctx wrapper.HttpContext, config QuotaConfig, i
 	if wrapper.IsRedisErrorResponse(incrResponse) {
 		redisErr := wrapper.GetRedisErrorFromResponse(incrResponse)
 		log.Errorf("Failed to deduct quota for user %s: %v", userId, redisErr)
-		sendJSONResponse(http.StatusInternalServerError, CodeDeductionFailed,
+		sendJSONResponse(http.StatusInternalServerError, DeductionFailed,
 			fmt.Sprintf("Quota deduction failed: %s", redisErr.Error()), false, nil)
 		return
 	}
@@ -1681,7 +1681,7 @@ func handleQuotaDeductionResponse(ctx wrapper.HttpContext, config QuotaConfig, i
 	if newUsedQuotaFloat < quotaWeight {
 		log.Errorf("Unexpected used quota after deduction for user %s: got %f, expected at least %f",
 			userId, newUsedQuotaFloat, quotaWeight)
-		sendJSONResponse(http.StatusInternalServerError, CodeDeductionInconsistent,
+		sendJSONResponse(http.StatusInternalServerError, DeductionInconsistent,
 			"Quota deduction resulted in inconsistent state", false, nil)
 		return
 	}
@@ -1835,20 +1835,20 @@ func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log 
 	userId := values["user_id"]
 	quota, err := strconv.ParseFloat(values["quota"], 64)
 	if userId == "" || err != nil {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. user_id can't be empty and quota must be a valid number.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. user_id can't be empty and quota must be a valid number.", false, nil)
 		return types.ActionContinue
 	}
 	err2 := config.redisClient.Set(config.QuotaManagement.RedisKeyPrefix+userId, fmt.Sprintf("%.6f", quota), func(response resp.Value) {
 		log.Debugf("Redis set key = %s quota = %f", config.QuotaManagement.RedisKeyPrefix+userId, quota)
 		if err := response.Error(); err != nil {
-			sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
+			sendJSONResponse(http.StatusServiceUnavailable, RedisError, fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
 		sendJSONResponse(http.StatusOK, Success, "refresh quota successful", true, nil)
 	})
 
 	if err2 != nil {
-		sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, RedisError, fmt.Sprintf("redis error:%v", err), false, nil)
 		return types.ActionContinue
 	}
 
@@ -1868,14 +1868,14 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 	if adminMode == AdminModeStarQuery {
 		employeeNumber = values["employee_number"]
 		if employeeNumber == "" {
-			sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+			sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 			return types.ActionContinue
 		}
 	} else {
 		// For quota queries, maintain backward compatibility with user_id
 		employeeNumber = values["user_id"]
 		if employeeNumber == "" {
-			sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. user_id can't be empty.", false, nil)
+			sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. user_id can't be empty.", false, nil)
 			return types.ActionContinue
 		}
 	}
@@ -1918,7 +1918,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 		if wrapper.IsRedisErrorResponse(response) {
 			redisErr := wrapper.GetRedisErrorFromResponse(response)
 			log.Errorf("Failed to query %s for employee %s: %v", responseType, employeeNumber, redisErr)
-			sendJSONResponse(http.StatusServiceUnavailable, CodeRedisError,
+			sendJSONResponse(http.StatusServiceUnavailable, RedisError,
 				fmt.Sprintf("Redis error: %s", redisErr.Error()), false, nil)
 			return
 		}
@@ -1960,7 +1960,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 					quota, parseErr = strconv.ParseFloat(quotaStr, 64)
 					if parseErr != nil {
 						log.Errorf("Invalid %s format for user %s: %s", responseType, employeeNumber, quotaStr)
-						sendJSONResponse(http.StatusInternalServerError, CodeInvalidQuotaFormat,
+						sendJSONResponse(http.StatusInternalServerError, InvalidQuotaFormat,
 							fmt.Sprintf("Invalid %s format", responseType), false, nil)
 						return
 					}
@@ -1968,7 +1968,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 					// Validate that quota is non-negative
 					if quota < 0 {
 						log.Errorf("Invalid %s value for user %s: %f (cannot be negative)", responseType, employeeNumber, quota)
-						sendJSONResponse(http.StatusInternalServerError, CodeInvalidQuotaValue,
+						sendJSONResponse(http.StatusInternalServerError, InvalidQuotaValue,
 							fmt.Sprintf("Invalid %s value", responseType), false, nil)
 						return
 					}
@@ -1986,7 +1986,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 		}
 	})
 	if err != nil {
-		sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, RedisError, fmt.Sprintf("redis error:%v", err), false, nil)
 		return types.ActionContinue
 	}
 	return types.ActionPause
@@ -2001,7 +2001,7 @@ func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wr
 	userId := values["user_id"]
 	value, err := strconv.ParseFloat(values["value"], 64)
 	if userId == "" || err != nil {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. user_id can't be empty and value must be a valid number.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. user_id can't be empty and value must be a valid number.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2009,7 +2009,7 @@ func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wr
 	incrementFloatValue(config.redisClient, key, value, func(newValue float64, err error) {
 		if err != nil {
 			log.Errorf("Redis delta operation failed for key = %s value = %f: %v", key, value, err)
-			sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
+			sendJSONResponse(http.StatusServiceUnavailable, RedisError, fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
 		log.Debugf("Redis delta operation successful for key = %s value = %f, new value = %f", key, value, newValue)
@@ -2028,20 +2028,20 @@ func refreshUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, 
 	userId := values["user_id"]
 	quota, err := strconv.ParseFloat(values["quota"], 64)
 	if userId == "" || err != nil {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. user_id can't be empty and quota must be a valid number.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. user_id can't be empty and quota must be a valid number.", false, nil)
 		return types.ActionContinue
 	}
 	err2 := config.redisClient.Set(config.QuotaManagement.RedisUsedPrefix+userId, fmt.Sprintf("%.6f", quota), func(response resp.Value) {
 		log.Debugf("Redis set key = %s quota = %f", config.QuotaManagement.RedisUsedPrefix+userId, quota)
 		if err := response.Error(); err != nil {
-			sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
+			sendJSONResponse(http.StatusServiceUnavailable, RedisError, fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
 		sendJSONResponse(http.StatusOK, Success, "refresh used quota successful", true, nil)
 	})
 
 	if err2 != nil {
-		sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, RedisError, fmt.Sprintf("redis error:%v", err), false, nil)
 		return types.ActionContinue
 	}
 
@@ -2057,7 +2057,7 @@ func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, lo
 	userId := values["user_id"]
 	value, err := strconv.ParseFloat(values["value"], 64)
 	if userId == "" || err != nil {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. user_id can't be empty and value must be a valid number.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. user_id can't be empty and value must be a valid number.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2065,7 +2065,7 @@ func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, lo
 	incrementFloatValue(config.redisClient, key, value, func(newValue float64, err error) {
 		if err != nil {
 			log.Errorf("Redis delta used operation failed for key = %s value = %f: %v", key, value, err)
-			sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
+			sendJSONResponse(http.StatusServiceUnavailable, RedisError, fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
 		log.Debugf("Redis delta used operation successful for key = %s value = %f, new value = %f", key, value, newValue)
@@ -2087,7 +2087,7 @@ func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log
 	employeeNumber := values["employee_number"]
 	starredProjects := values["starred_projects"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2104,7 +2104,7 @@ func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log
 	config.starCacheManager.SetStarredProjects(employeeNumber, projectsList, func(err error) {
 		if err != nil {
 			log.Errorf("Failed to set starred projects for employee %s: %v", employeeNumber, err)
-			sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
+			sendJSONResponse(http.StatusServiceUnavailable, RedisError, fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
 
@@ -2132,7 +2132,7 @@ func setUserPermission(ctx wrapper.HttpContext, config QuotaConfig, body string,
 	employeeNumber := values["employee_number"]
 	modelsParam := values["models"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2155,7 +2155,7 @@ func setUserPermission(ctx wrapper.HttpContext, config QuotaConfig, body string,
 		config.permissionChecker.SetUserPermission(employeeNumber, models, func(err error) {
 			if err != nil {
 				log.Errorf("Failed to set user permission for employee %s: %v", employeeNumber, err)
-				sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("Failed to set user permission: %v", err), false, nil)
+				sendJSONResponse(http.StatusServiceUnavailable, SetUserPermissionFailed, fmt.Sprintf("Failed to set user permission: %v", err), false, nil)
 				return
 			}
 			data := map[string]interface{}{
@@ -2166,7 +2166,7 @@ func setUserPermission(ctx wrapper.HttpContext, config QuotaConfig, body string,
 		})
 	} else {
 		log.Errorf("Permission checker not initialized, cannot set user permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, "Permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, PermissionNotConfigured, "Permission management not configured.", false, nil)
 	}
 
 	return types.ActionPause
@@ -2184,7 +2184,7 @@ func setStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, body st
 	employeeNumber := values["employee_number"]
 	enabledParam := values["enabled"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2201,7 +2201,7 @@ func setStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, body st
 		config.starCheckChecker.SetStarCheckPermission(employeeNumber, enabled, func(err error) {
 			if err != nil {
 				log.Errorf("Failed to set star check permission for employee %s: %v", employeeNumber, err)
-				sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("Failed to set star check permission: %v", err), false, nil)
+				sendJSONResponse(http.StatusServiceUnavailable, SetStarPermissionFailed, fmt.Sprintf("Failed to set star check permission: %v", err), false, nil)
 				return
 			}
 			data := map[string]interface{}{
@@ -2212,7 +2212,7 @@ func setStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, body st
 		})
 	} else {
 		log.Errorf("Star check permission checker not initialized, cannot set permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, "Star check permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, StarPermissionNotConfigured, "Star check permission management not configured.", false, nil)
 	}
 
 	return types.ActionPause
@@ -2227,7 +2227,7 @@ func queryStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, url *
 
 	employeeNumber := values["employee_number"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2243,7 +2243,7 @@ func queryStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, url *
 		})
 	} else {
 		log.Errorf("Star check permission checker not initialized, cannot query permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, "Star check permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, StarPermissionNotConfigured, "Star check permission management not configured.", false, nil)
 	}
 
 	return types.ActionPause
@@ -2275,7 +2275,7 @@ func performStarCheck(ctx wrapper.HttpContext, config QuotaConfig, body []byte, 
 			// Star check passed, continue with quota logic
 			processQuotaLogic(ctx, config, body, userId, log)
 		} else {
-			sendJSONResponse(http.StatusForbidden, CodeStarRequired, fmt.Sprintf("Please star the project first: https://github.com/%s", strings.ReplaceAll(config.StarCheckManagement.TargetRepo, ".", "/")), false, nil)
+			sendJSONResponse(http.StatusForbidden, StarRequired, fmt.Sprintf("Please star the project first: https://github.com/%s", strings.ReplaceAll(config.StarCheckManagement.TargetRepo, ".", "/")), false, nil)
 		}
 	})
 }
@@ -2293,7 +2293,7 @@ func setQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, body string
 	employeeNumber := values["employee_number"]
 	enabledParam := values["enabled"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2310,7 +2310,7 @@ func setQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, body string
 		config.quotaChecker.SetQuotaPermission(employeeNumber, enabled, func(err error) {
 			if err != nil {
 				log.Errorf("Failed to set quota control permission for employee %s: %v", employeeNumber, err)
-				sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("Failed to set quota control permission: %v", err), false, nil)
+				sendJSONResponse(http.StatusServiceUnavailable, SetQuotaPermissionFailed, fmt.Sprintf("Failed to set quota control permission: %v", err), false, nil)
 				return
 			}
 			data := map[string]interface{}{
@@ -2321,7 +2321,7 @@ func setQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, body string
 		})
 	} else {
 		log.Errorf("Quota permission checker not initialized, cannot set permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, "Quota control permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, QuotaPermissionNotConfigured, "Quota control permission management not configured.", false, nil)
 	}
 
 	return types.ActionPause
@@ -2336,7 +2336,7 @@ func queryQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.
 
 	employeeNumber := values["employee_number"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
@@ -2352,7 +2352,7 @@ func queryQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.
 		})
 	} else {
 		log.Errorf("Quota permission checker not initialized, cannot query permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, "Quota control permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, QuotaPermissionNotConfigured, "Quota control permission management not configured.", false, nil)
 	}
 
 	return types.ActionPause
@@ -2369,13 +2369,13 @@ func queryModelPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.
 
 	employeeNumber := values["employee_number"]
 	if employeeNumber == "" {
-		sendJSONResponse(http.StatusBadRequest, CodeInvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
+		sendJSONResponse(http.StatusBadRequest, InvalidParams, "Request denied by ai quota check. employee_number can't be empty.", false, nil)
 		return types.ActionContinue
 	}
 
 	if config.permissionChecker == nil {
 		log.Errorf("Permission checker not initialized, cannot query model permission for employee %s", employeeNumber)
-		sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, "Permission management not configured.", false, nil)
+		sendJSONResponse(http.StatusServiceUnavailable, PermissionNotConfigured, "Permission management not configured.", false, nil)
 		return types.ActionContinue
 	}
 
