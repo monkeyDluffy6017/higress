@@ -125,6 +125,13 @@ type RuleEngineConfig struct {
 	enabled bool
 	// 仅支持内联规则 inlineRules
 	inlineRules []ruleengine.Rule
+	// 前缀配置：用于 request_context 的动态填充来源
+	// 约定：
+	// - 以 bodyPrefix 开头的 request.xxx，会从请求体 JSON 路径提取（去掉前缀后作为 gjson 路径）
+	// - 以 headerPrefix 开头的 request.xxx，会从请求头读取（去掉前缀后作为 header 名）
+	// - 其他 request.xxx 保持原样（可由上游通过 extraRequestContext 注入）
+	bodyPrefix   string
+	headerPrefix string
 }
 
 type SemanticStrategy struct {
@@ -296,6 +303,16 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 			}
 		}
 	}
+	// rule engine request context prefixes
+	s.ruleEngine.bodyPrefix = strings.TrimSpace(j.Get("ruleEngine.bodyPrefix").String())
+	if s.ruleEngine.bodyPrefix == "" {
+		s.ruleEngine.bodyPrefix = "body."
+	}
+	s.ruleEngine.headerPrefix = strings.TrimSpace(j.Get("ruleEngine.headerPrefix").String())
+	if s.ruleEngine.headerPrefix == "" {
+		s.ruleEngine.headerPrefix = "header."
+	}
+
 	// dynamic metrics (optional) now under analyzer
 	dm := j.Get("analyzer.dynamicMetrics")
 	s.analyzer.dynamicMetricsPrefix = strings.TrimSpace(dm.Get("redisPrefix").String())
@@ -346,21 +363,47 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 		// If dynamic metrics are needed, handle asynchronously
 		if needsDynamicMetrics(s.analyzer) {
 			startRuleEngineWithDynamic(ctx, s.analyzer, s.ruleEngine, body, func(qms []map[string]any) {
-				if len(qms) > 0 {
-					bs, _ := json.Marshal(map[string]any{"qualified_models": qms})
-					_ = proxywasm.ReplaceHttpRequestHeader("x-qualified-models", string(bs))
+				// 若无合格模型，按需求：优先使用 fallback，若 fallback 为空则直接放行
+				if len(qms) == 0 {
+					if s.routing.fallbackProviderId != "" {
+						_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, s.routing.fallbackProviderId)
+						if b, ok := overrideRequestModelInBody(body, s.routing.fallbackProviderId); ok {
+							_ = proxywasm.ReplaceHttpRequestBody(b)
+							logs.Debugf("[ai-llm-router] override request model to fallback id: %s", s.routing.fallbackProviderId)
+						}
+						ctx.SetContext("selectedProviderId", s.routing.fallbackProviderId)
+						logs.Infof("[ai-llm-router] no qualified models, use fallback provider=%s", s.routing.fallbackProviderId)
+					} else {
+						logs.Infof("[ai-llm-router] no qualified models and no fallback, pass through")
+					}
+					_ = proxywasm.ResumeHttpRequest()
+					return
 				}
-				// continue analyzer flow after rule engine completes
-				continueAnalyzerFlow(ctx, s, body)
+				// 存在合格模型：基于合格集合过滤候选并继续分析流程
+				routing := buildRoutingFromQualified(qms, s.routing)
+				continueAnalyzerFlowWithRouting(ctx, s, body, &routing)
 			})
 			return types.ActionPause
 		}
-		if qms, err := runRuleEngine(s.ruleEngine, body, nil, nil); err != nil {
+		if qms, err := runRuleEngine(ctx, s.ruleEngine, body, nil, nil); err != nil {
 			logs.Warnf("[ai-llm-router] rule engine evaluate error: %v", err)
-		} else if len(qms) > 0 {
+		} else {
+			// 允许 qms 为空：表示没有合格模型
 			prefiltered = qms
-			bs, _ := json.Marshal(map[string]any{"qualified_models": prefiltered})
-			_ = proxywasm.ReplaceHttpRequestHeader("x-qualified-models", string(bs))
+			if len(prefiltered) == 0 {
+				if s.routing.fallbackProviderId != "" {
+					_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, s.routing.fallbackProviderId)
+					if b, ok := overrideRequestModelInBody(body, s.routing.fallbackProviderId); ok {
+						_ = proxywasm.ReplaceHttpRequestBody(b)
+						logs.Debugf("[ai-llm-router] override request model to fallback id: %s", s.routing.fallbackProviderId)
+					}
+					ctx.SetContext("selectedProviderId", s.routing.fallbackProviderId)
+					logs.Infof("[ai-llm-router] no qualified models, use fallback provider=%s", s.routing.fallbackProviderId)
+				} else {
+					logs.Infof("[ai-llm-router] no qualified models and no fallback, pass through")
+				}
+				return types.ActionContinue
+			}
 		}
 	}
 
@@ -388,6 +431,12 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 	deadline := time.Now().Add(time.Duration(s.analyzer.totalTimeoutMs) * time.Millisecond)
 	attempt := 0
 
+	// 规则引擎开启时：若有合格集合则只从合格集合中选择；若为空则已在前面处理（fallback 或放行）
+	routingUsed := s.routing
+	if s.ruleEngine.enabled && len(prefiltered) > 0 {
+		routingUsed = buildRoutingFromQualified(prefiltered, s.routing)
+	}
+
 	var send func()
 	send = func() {
 		logs.Debugf("[ai-llm-router] analyzer httpcall: timeoutMs=%d", s.analyzer.timeoutMs)
@@ -412,26 +461,12 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 				if label != "" {
 					logs.Infof("[ai-llm-router] analyzer classified label=%s", label)
 					// 第二阶段策略：基于候选模型（若有规则引擎预筛选）选择 provider
-					selected := selectProvider(label, s.routing)
+					selected := selectProvider(label, routingUsed)
 					if selected != "" {
 						_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, selected)
-						if len(body) > 0 {
-							bs := body
-							needle := []byte("\"model\":\"")
-							idx := indexOf(bs, needle)
-							if idx >= 0 {
-								start := idx + len(needle)
-								end := start
-								for end < len(bs) && bs[end] != '"' {
-									end++
-								}
-								var b []byte
-								b = append(b, bs[:start]...)
-								b = append(b, []byte(selected)...)
-								b = append(b, bs[end:]...)
-								_ = proxywasm.ReplaceHttpRequestBody(b)
-								logs.Debugf("[ai-llm-router] override request model to provider id: %s", selected)
-							}
+						if b, ok := overrideRequestModelInBody(body, selected); ok {
+							_ = proxywasm.ReplaceHttpRequestBody(b)
+							logs.Debugf("[ai-llm-router] override request model to provider id: %s", selected)
 						}
 						ctx.SetContext("selectedProviderId", selected)
 						logs.Infof("[ai-llm-router] selected provider=%s", selected)
@@ -643,6 +678,30 @@ func indexOf(haystack []byte, needle []byte) int {
 	return -1
 }
 
+// overrideRequestModelInBody 尝试将请求体中的 "model" 字段改为指定值
+// 返回修改后的字节切片与是否成功找到并替换
+func overrideRequestModelInBody(original []byte, newModel string) ([]byte, bool) {
+	if len(original) == 0 || newModel == "" {
+		return nil, false
+	}
+	bs := original
+	needle := []byte("\"model\":\"")
+	idx := indexOf(bs, needle)
+	if idx < 0 {
+		return nil, false
+	}
+	start := idx + len(needle)
+	end := start
+	for end < len(bs) && bs[end] != '"' {
+		end++
+	}
+	var b []byte
+	b = append(b, bs[:start]...)
+	b = append(b, []byte(newModel)...)
+	b = append(b, bs[end:]...)
+	return b, true
+}
+
 // mapFromGJSON 将 gjson.Result 转 map[string]any（只做浅层转换，嵌套 map/array 递归）
 func mapFromGJSON(r gjson.Result) map[string]any {
 	if !r.Exists() {
@@ -699,17 +758,13 @@ func valueFromGJSON(v gjson.Result) any {
 // - extraRequestContext: 额外补充/覆盖到 request_context 的键值
 // - defaultAvailableModels: 当请求体未提供 routing.available_models 时，使用该缺省集合
 // 返回：合格模型的对象数组（已按规则 sortBy 排序），或 nil
-func runRuleEngine(cfg RuleEngineConfig, body []byte, extraRequestContext map[string]any, defaultAvailableModels []map[string]any) ([]map[string]any, error) {
+func runRuleEngine(ctx wrapper.HttpContext, cfg RuleEngineConfig, body []byte, extraRequestContext map[string]any, defaultAvailableModels []map[string]any) ([]map[string]any, error) {
 	if !cfg.enabled {
 		return nil, nil
 	}
 
 	// 1) 构建 request_context
-	reqCtx := ruleengine.RequestContext{
-		"task_type": gjson.GetBytes(body, "task_type").String(),
-		"mode":      gjson.GetBytes(body, "mode").String(),
-		"language":  gjson.GetBytes(body, "language").String(),
-	}
+	reqCtx := buildRequestContext(ctx, body, cfg)
 	for k, v := range extraRequestContext {
 		reqCtx[k] = v
 	}
@@ -758,11 +813,7 @@ func needsDynamicMetrics(a AnalyzerConfig) bool {
 // startRuleEngineWithDynamic loads dy_ metrics from Redis and evaluates rules asynchronously
 func startRuleEngineWithDynamic(ctx wrapper.HttpContext, a AnalyzerConfig, cfg RuleEngineConfig, body []byte, done func([]map[string]any)) {
 	// Build reqCtx and models same as runRuleEngine
-	reqCtx := ruleengine.RequestContext{
-		"task_type": gjson.GetBytes(body, "task_type").String(),
-		"mode":      gjson.GetBytes(body, "mode").String(),
-		"language":  gjson.GetBytes(body, "language").String(),
-	}
+	reqCtx := buildRequestContext(ctx, body, cfg)
 	// available models
 	var models []ruleengine.Model
 	if arr := gjson.GetBytes(body, "routing.available_models"); arr.Exists() && arr.IsArray() {
@@ -875,8 +926,113 @@ func startRuleEngineWithDynamic(ctx wrapper.HttpContext, a AnalyzerConfig, cfg R
 	}
 }
 
+// buildRequestContext 基于前缀从请求体/请求头提取 request_context
+// 约定：
+// - 在规则中使用 request.<key>，<key> 可以以 cfg.bodyPrefix / cfg.headerPrefix 开头
+// - 去掉前缀后：
+//   - bodyPrefix：按 gjson 路径从 body 取值
+//   - headerPrefix：按 header 名从请求头取值
+//
+// - 无前缀：不做特殊处理（保留空值，等待 extra 注入或模型字段条件）
+func buildRequestContext(ctx wrapper.HttpContext, body []byte, cfg RuleEngineConfig) ruleengine.RequestContext {
+	rc := ruleengine.RequestContext{}
+	// 收集规则中出现的 request.* fact
+	keys := collectRequestFacts(cfg.inlineRules)
+	for _, k := range keys {
+		// k 是 request.xxx；我们只取 xxx 部分
+		if !strings.HasPrefix(k, "request.") {
+			continue
+		}
+		sub := k[len("request."):]
+		switch {
+		case strings.HasPrefix(sub, cfg.bodyPrefix):
+			path := strings.TrimPrefix(sub, cfg.bodyPrefix)
+			if path != "" {
+				v := gjson.GetBytes(body, path)
+				if v.Exists() {
+					// request.body.<path>
+					value := valueFromGJSON(v)
+					keys := append([]string{"body"}, strings.Split(path, ".")...)
+					setNestedRequestContext(rc, keys, value)
+				}
+			}
+		case strings.HasPrefix(sub, cfg.headerPrefix):
+			h := strings.TrimPrefix(sub, cfg.headerPrefix)
+			if h != "" {
+				if val, err := proxywasm.GetHttpRequestHeader(h); err == nil && val != "" {
+					// request.header.<Header-Name>
+					setNestedRequestContext(rc, []string{"header", h}, val)
+				}
+			}
+		default:
+			// 留空，允许额外注入
+		}
+	}
+	return rc
+}
+
+func collectRequestFacts(rules []ruleengine.Rule) []string {
+	set := map[string]struct{}{}
+	add := func(f string) {
+		if strings.HasPrefix(f, "request.") {
+			set[f] = struct{}{}
+		}
+	}
+	for _, r := range rules {
+		for _, c := range r.Conditions.All {
+			add(c.Fact)
+		}
+		for _, c := range r.Conditions.Any {
+			add(c.Fact)
+		}
+		if r.Conditions.Not != nil {
+			add(r.Conditions.Not.Fact)
+		}
+		for _, sk := range r.Action.SortBy {
+			if strings.HasPrefix(sk.Fact, "request.") {
+				add(sk.Fact)
+			}
+		}
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// setNestedRequestContext 根据路径键设置嵌套的 request_context 结构
+func setNestedRequestContext(rc ruleengine.RequestContext, keys []string, value any) {
+	if len(keys) == 0 {
+		return
+	}
+	cur := map[string]any(rc)
+	for i := 0; i < len(keys)-1; i++ {
+		k := keys[i]
+		next, ok := cur[k]
+		if !ok {
+			child := map[string]any{}
+			cur[k] = child
+			cur = child
+			continue
+		}
+		if m, ok := next.(map[string]any); ok {
+			cur = m
+		} else {
+			// 覆盖为 map，保证结构一致
+			child := map[string]any{}
+			cur[k] = child
+			cur = child
+		}
+	}
+	cur[keys[len(keys)-1]] = value
+}
+
+// 兼容旧签名：保持占位但不再使用
+func continueAnalyzerFlow(ctx wrapper.HttpContext, s *SemanticStrategy, body []byte) {}
+
 // continueAnalyzerFlow continues analyzer flow after async rule engine completes
-func continueAnalyzerFlow(ctx wrapper.HttpContext, s *SemanticStrategy, body []byte) {
+func continueAnalyzerFlowWithRouting(ctx wrapper.HttpContext, s *SemanticStrategy, body []byte, prouting *RoutingConfig) {
 	if !s.analyzer.enabled || s.analyzer.client == nil || s.analyzer.path == "" || s.analyzer.apiToken == "" || s.analyzer.model == "" {
 		logs.Debugf("[ai-llm-router] analyzer disabled or not configured, skip routing")
 		_ = proxywasm.ResumeHttpRequest()
@@ -894,6 +1050,11 @@ func continueAnalyzerFlow(ctx wrapper.HttpContext, s *SemanticStrategy, body []b
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
 	})
 	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + s.analyzer.apiToken}}
+	// choose routing: filtered if provided, otherwise default
+	routingUsed := s.routing
+	if prouting != nil {
+		routingUsed = *prouting
+	}
 	deadline := time.Now().Add(time.Duration(s.analyzer.totalTimeoutMs) * time.Millisecond)
 	attempt := 0
 	var send func()
@@ -914,7 +1075,7 @@ func continueAnalyzerFlow(ctx wrapper.HttpContext, s *SemanticStrategy, body []b
 			func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 				label := classifyLabel(statusCode, responseBody, s.analyzer.labelRegex, s.analyzer.analysisLabels)
 				if label != "" {
-					selected := selectProvider(label, s.routing)
+					selected := selectProvider(label, routingUsed)
 					if selected != "" {
 						_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, selected)
 					}
@@ -994,4 +1155,56 @@ func selectProvider(label string, r RoutingConfig) string {
 		return r.fallbackProviderId
 	}
 	return bestId
+}
+
+// buildRoutingFromQualified 基于规则引擎产出的合格模型集合过滤路由候选集
+// 允许的匹配键：provider_id、provider、id、model_id（字符串）
+func buildRoutingFromQualified(qms []map[string]any, base RoutingConfig) RoutingConfig {
+	allow := map[string]struct{}{}
+	for _, m := range qms {
+		// check common keys
+		if v, ok := m["provider_id"].(string); ok && v != "" {
+			allow[v] = struct{}{}
+		}
+		if v, ok := m["provider"].(string); ok && v != "" {
+			allow[v] = struct{}{}
+		}
+		if v, ok := m["id"].(string); ok && v != "" {
+			allow[v] = struct{}{}
+		}
+		if v, ok := m["model_id"].(string); ok && v != "" {
+			allow[v] = struct{}{}
+		}
+	}
+
+	filtered := make([]Candidate, 0, len(base.candidates))
+	for _, c := range base.candidates {
+		if _, ok := allow[c.id]; ok {
+			filtered = append(filtered, c)
+		}
+	}
+
+	// filter tieBreakOrder accordingly
+	filteredOrder := make([]string, 0, len(base.tieBreakOrder))
+	for _, id := range base.tieBreakOrder {
+		if _, ok := allow[id]; ok {
+			filteredOrder = append(filteredOrder, id)
+		}
+	}
+
+	// fallback 只能在合格集合内可用；否则置空
+	fallback := base.fallbackProviderId
+	if fallback != "" {
+		if _, ok := allow[fallback]; !ok {
+			fallback = ""
+		}
+	}
+
+	return RoutingConfig{
+		providerIdHeader:   base.providerIdHeader,
+		candidates:         filtered,
+		fallbackProviderId: fallback,
+		minScore:           base.minScore,
+		tieBreakOrder:      filteredOrder,
+	}
 }
