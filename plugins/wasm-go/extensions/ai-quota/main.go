@@ -1844,7 +1844,7 @@ func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log 
 			sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
-		sendJSONResponse(http.StatusOK, CodeRefreshQuota, "refresh quota successful", true, nil)
+		sendJSONResponse(http.StatusOK, Success, "refresh quota successful", true, nil)
 	})
 
 	if err2 != nil {
@@ -1902,7 +1902,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 				"starred_projects": strings.Join(projects, ","), // Return as comma-separated string
 				"type":             "star_status",
 			}
-			sendJSONResponse(http.StatusOK, CodeQueryStar, "query star status successful (cached)", true, data)
+			sendJSONResponse(http.StatusOK, Success, "query star status successful (cached)", true, data)
 			return types.ActionContinue
 		}
 
@@ -1948,7 +1948,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 				"starred_projects": strings.Join(starredProjects, ","), // Return as comma-separated string
 				"type":             responseType,
 			}
-			sendJSONResponse(http.StatusOK, CodeQueryStar, "query star projects successful", true, data)
+			sendJSONResponse(http.StatusOK, Success, "query star projects successful", true, data)
 		} else {
 			// Handle quota query (float value)
 			var quota float64 = 0
@@ -1982,7 +1982,7 @@ func queryQuota(ctx wrapper.HttpContext, config QuotaConfig, url *url.URL, admin
 				"quota":   quota,
 				"type":    responseType,
 			}
-			sendJSONResponse(http.StatusOK, CodeQueryQuota, "query quota successful", true, data)
+			sendJSONResponse(http.StatusOK, Success, "query quota successful", true, data)
 		}
 	})
 	if err != nil {
@@ -2013,7 +2013,7 @@ func deltaQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, log wr
 			return
 		}
 		log.Debugf("Redis delta operation successful for key = %s value = %f, new value = %f", key, value, newValue)
-		sendJSONResponse(http.StatusOK, CodeDeltaQuota, "delta quota successful", true, nil)
+		sendJSONResponse(http.StatusOK, Success, "delta quota successful", true, nil)
 	})
 
 	return types.ActionPause
@@ -2037,7 +2037,7 @@ func refreshUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, 
 			sendJSONResponse(http.StatusServiceUnavailable, CodeGenericError, fmt.Sprintf("redis error:%v", err), false, nil)
 			return
 		}
-		sendJSONResponse(http.StatusOK, CodeRefreshUsedQuota, "refresh used quota successful", true, nil)
+		sendJSONResponse(http.StatusOK, Success, "refresh used quota successful", true, nil)
 	})
 
 	if err2 != nil {
@@ -2069,7 +2069,7 @@ func deltaUsedQuota(ctx wrapper.HttpContext, config QuotaConfig, body string, lo
 			return
 		}
 		log.Debugf("Redis delta used operation successful for key = %s value = %f, new value = %f", key, value, newValue)
-		sendJSONResponse(http.StatusOK, CodeDeltaUsedQuota, "delta used quota successful", true, nil)
+		sendJSONResponse(http.StatusOK, Success, "delta used quota successful", true, nil)
 	})
 
 	return types.ActionPause
@@ -2114,7 +2114,7 @@ func setStarStatus(ctx wrapper.HttpContext, config QuotaConfig, body string, log
 			"employee_number":  employeeNumber,
 			"starred_projects": starredProjects,
 		}
-		sendJSONResponse(http.StatusOK, CodeSetStar, "set star projects successful", true, data)
+		sendJSONResponse(http.StatusOK, Success, "set star projects successful", true, data)
 	})
 
 	return types.ActionPause
@@ -2162,7 +2162,7 @@ func setUserPermission(ctx wrapper.HttpContext, config QuotaConfig, body string,
 				"employee_number": employeeNumber,
 				"models":          models,
 			}
-			sendJSONResponse(http.StatusOK, CodeSetPermission, "set user permission successful", true, data)
+			sendJSONResponse(http.StatusOK, Success, "set user permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Permission checker not initialized, cannot set user permission for employee %s", employeeNumber)
@@ -2208,7 +2208,7 @@ func setStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, body st
 				"employee_number": employeeNumber,
 				"enabled":         enabled,
 			}
-			sendJSONResponse(http.StatusOK, CodeSetStarPermission, "set star check permission successful", true, data)
+			sendJSONResponse(http.StatusOK, Success, "set star check permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Star check permission checker not initialized, cannot set permission for employee %s", employeeNumber)
@@ -2239,7 +2239,7 @@ func queryStarCheckPermission(ctx wrapper.HttpContext, config QuotaConfig, url *
 				"employee_number": employeeNumber,
 				"enabled":         enabled,
 			}
-			sendJSONResponse(http.StatusOK, CodeQueryStarPermission, "query star check permission successful", true, data)
+			sendJSONResponse(http.StatusOK, Success, "query star check permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Star check permission checker not initialized, cannot query permission for employee %s", employeeNumber)
@@ -2317,7 +2317,7 @@ func setQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, body string
 				"employee_number": employeeNumber,
 				"enabled":         enabled,
 			}
-			sendJSONResponse(http.StatusOK, CodeSetQuotaPermission, "set quota control permission successful", true, data)
+			sendJSONResponse(http.StatusOK, Success, "set quota control permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Quota permission checker not initialized, cannot set permission for employee %s", employeeNumber)
@@ -2348,7 +2348,7 @@ func queryQuotaPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.
 				"employee_number": employeeNumber,
 				"enabled":         enabled,
 			}
-			sendJSONResponse(http.StatusOK, CodeQueryQuotaPermission, "query quota control permission successful", true, data)
+			sendJSONResponse(http.StatusOK, Success, "query quota control permission successful", true, data)
 		})
 	} else {
 		log.Errorf("Quota permission checker not initialized, cannot query permission for employee %s", employeeNumber)
@@ -2389,7 +2389,7 @@ func queryModelPermission(ctx wrapper.HttpContext, config QuotaConfig, url *url.
 			"employee_number": employeeNumber,
 			"models":          models,
 		}
-		sendJSONResponse(http.StatusOK, CodeQueryModelPermission, "query model permission successful", true, data)
+		sendJSONResponse(http.StatusOK, Success, "query model permission successful", true, data)
 	})
 
 	return types.ActionPause

@@ -1,6 +1,8 @@
 package main
 
 const (
+	Success = "ai-gateway.success"
+
 	CodeBuildModelsFailed        = "ai-gateway.build_models_failed"
 	CodeSendModelsResponseFailed = "ai-gateway.send_models_response_failed"
 	CodeUnauthorized             = "ai-gateway.unauthorized"
@@ -10,31 +12,15 @@ const (
 	CodeNoUserID                 = "ai-gateway.no_userid"
 	CodeNoEmployeeNumber         = "ai-gateway.no_employee_number"
 	CodeModelPermissionDenied    = "ai-gateway.model_permission_denied"
-
-	CodeTotalQuotaError       = "ai-gateway.total_quota_error"
-	CodeUsedQuotaError        = "ai-gateway.used_quota_error"
-	CodeInsufficientQuota     = "ai-gateway.insufficient_quota"
-	CodeDeductionFailed       = "ai-gateway.deduction_failed"
-	CodeDeductionInconsistent = "ai-gateway.deduction_inconsistent"
-
-	CodeInvalidParams = "ai-gateway.invalid_params"
-	CodeGenericError  = "ai-gateway.error"
-	CodeRedisError    = "ai-gateway.redis_error"
-
-	CodeRefreshQuota         = "ai-gateway.refreshquota"
-	CodeDeltaQuota           = "ai-gateway.deltaquota"
-	CodeRefreshUsedQuota     = "ai-gateway.refreshusedquota"
-	CodeDeltaUsedQuota       = "ai-gateway.deltausedquota"
-	CodeQueryStar            = "ai-gateway.querystar"
-	CodeSetStar              = "ai-gateway.setstar"
-	CodeSetPermission        = "ai-gateway.setpermission"
-	CodeSetStarPermission    = "ai-gateway.set_star_permission"
-	CodeQueryStarPermission  = "ai-gateway.query_star_permission"
-	CodeSetQuotaPermission   = "ai-gateway.set_quota_permission"
-	CodeQueryQuotaPermission = "ai-gateway.query_quota_permission"
-	CodeQueryModelPermission = "ai-gateway.query_model_permission"
-	CodeInvalidQuotaFormat   = "ai-gateway.invalid_quota_format"
-	CodeInvalidQuotaValue    = "ai-gateway.invalid_quota_value"
-	CodeQueryQuota           = "ai-gateway.queryquota"
-	CodeStarRequired         = "ai-gateway.star_required"
+	CodeTotalQuotaError          = "ai-gateway.total_quota_error"
+	CodeUsedQuotaError           = "ai-gateway.used_quota_error"
+	CodeInsufficientQuota        = "ai-gateway.insufficient_quota"
+	CodeDeductionFailed          = "ai-gateway.deduction_failed"
+	CodeDeductionInconsistent    = "ai-gateway.deduction_inconsistent"
+	CodeInvalidParams            = "ai-gateway.invalid_params"
+	CodeGenericError             = "ai-gateway.error"
+	CodeRedisError               = "ai-gateway.redis_error"
+	CodeInvalidQuotaFormat       = "ai-gateway.invalid_quota_format"
+	CodeInvalidQuotaValue        = "ai-gateway.invalid_quota_value"
+	CodeStarRequired             = "ai-gateway.star_required"
 )
