@@ -1,6 +1,6 @@
 PLUGIN_NAME ?= hello-world
 BUILDER_REGISTRY ?= higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/
-REGISTRY ?= crpi-j8wrd0nl8l9v42wd.cn-shenzhen.personal.cr.aliyuncs.com/monkeydluffy6017/
+REGISTRY ?= crpi-j8wrd0nl8l9v42wd.cn-shenzhen.personal.cr.aliyuncs.com/shenma-ai/
 GO_VERSION ?= 1.24.4
 TINYGO_VERSION ?= 0.29.0
 ORAS_VERSION ?= 1.0.0
