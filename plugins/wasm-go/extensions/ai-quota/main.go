@@ -1665,37 +1665,6 @@ func incrementFloatValue(redisClient wrapper.RedisClient, key string, delta floa
 	})
 }
 
-func handleQuotaDeductionResponse(ctx wrapper.HttpContext, config QuotaConfig, incrResponse resp.Value, userId string, quotaWeight float64, modelName string, remainingQuota float64, log wrapper.Log) {
-	if wrapper.IsRedisErrorResponse(incrResponse) {
-		redisErr := wrapper.GetRedisErrorFromResponse(incrResponse)
-		log.Errorf("Failed to deduct quota for user %s: %v", userId, redisErr)
-		sendJSONResponse(http.StatusInternalServerError, DeductionFailed,
-			fmt.Sprintf("Quota deduction failed: %s", redisErr.Error()), false, nil)
-		return
-	}
-
-	// Validate the response from Redis operation
-	newUsedQuotaFloat := incrResponse.Float()
-
-	// Sanity check: the new used quota should be reasonable
-	if newUsedQuotaFloat < quotaWeight {
-		log.Errorf("Unexpected used quota after deduction for user %s: got %f, expected at least %f",
-			userId, newUsedQuotaFloat, quotaWeight)
-		sendJSONResponse(http.StatusInternalServerError, DeductionInconsistent,
-			"Quota deduction resulted in inconsistent state", false, nil)
-		return
-	}
-
-	// Calculate what the previous used quota should have been
-	expectedPreviousUsed := newUsedQuotaFloat - quotaWeight
-
-	// Log quota deduction details for audit and debugging
-	log.Infof("Successfully deducted %f quota for user %s, model %s. Previous used: %f, New used: %f",
-		quotaWeight, userId, modelName, expectedPreviousUsed, newUsedQuotaFloat)
-
-	proxywasm.ResumeHttpRequest()
-}
-
 func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool, log wrapper.Log) []byte {
 	return data
 }
@@ -1704,68 +1673,84 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Action {
 	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
 	if !ok || chatMode == ChatModeNone || chatMode == ChatModeAdmin {
+		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: invalid chatMode/admin. ok=%t chatMode=%v", ok, chatMode)
 		return types.ActionContinue
 	}
 
 	// Avoid duplicate finalization
 	if finalized, _ := ctx.GetContext("quota_finalized").(bool); finalized {
+		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: already finalized")
 		return types.ActionContinue
 	}
 
 	statusStr, err := proxywasm.GetHttpResponseHeader(":status")
 	if err != nil || statusStr == "" {
+		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: missing :status header, err=%v", err)
 		return types.ActionContinue
 	}
 	statusCode, err := strconv.Atoi(statusStr)
 	if err != nil {
+		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: invalid :status '%s': %v", statusStr, err)
 		return types.ActionContinue
 	}
 
 	amountAny := ctx.GetContext("quota_deduct_amount")
 	if amountAny == nil {
+		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: no deduction intent (quota_deduct_amount is nil), status=%d", statusCode)
 		ctx.SetContext("quota_finalized", true)
 		return types.ActionContinue
 	}
 	quotaWeight, _ := amountAny.(float64)
 	if quotaWeight <= 0 {
+		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: invalid quotaWeight %.6f", quotaWeight)
 		ctx.SetContext("quota_finalized", true)
 		return types.ActionContinue
 	}
 
 	userId, _ := ctx.GetContext("userId").(string)
 	headerMatched, _ := ctx.GetContext("quota_header_matched").(bool)
+	proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] status=%d userId=%s quotaWeight=%.6f headerMatched=%t deductReqNum=%d", statusCode, userId, quotaWeight, headerMatched, config.QuotaManagement.DeductReqNum)
 
 	if statusCode >= 200 && statusCode < 300 {
 		usedKey := config.QuotaManagement.RedisUsedPrefix + userId
 		if headerMatched {
-			config.redisClient.IncrByFloat(usedKey, quotaWeight, func(response resp.Value) {
-				// best effort; errors are logged in streaming code path
-			})
+			proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] 2xx + headerMatched, direct deduction. usedKey=%s amount=%.6f", usedKey, quotaWeight)
+			// redis async callback is not allowed in onHttpResponseHeaders and onHttpStreamingResponseBody
+			_ = config.redisClient.IncrByFloat(usedKey, quotaWeight, nil)
 			// 当启用按次数通道时，命中 header 扣减需重置计数器
 			if config.QuotaManagement.DeductReqNum > 0 {
 				countKey := quotaReqCountPrefix + userId
-				_ = config.redisClient.Set(countKey, 0, func(_ resp.Value) {})
+				proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] reset counter due to header match. countKey=%s", countKey)
+				_ = config.redisClient.Set(countKey, 0, nil)
 			}
 		} else if config.QuotaManagement.DeductReqNum > 0 {
 			countKey := quotaReqCountPrefix + userId
 			n := int64(config.QuotaManagement.DeductReqNum)
-			config.redisClient.Incr(countKey, func(incrResp resp.Value) {
-				if incrResp.Error() != nil {
-					return
-				}
-				cntStr := incrResp.String()
-				newCountInt, parseErr := strconv.ParseInt(cntStr, 10, 64)
-				if parseErr != nil {
-					return
-				}
-				if n > 0 && newCountInt%n == 0 {
-					config.redisClient.IncrByFloat(usedKey, quotaWeight, func(_ resp.Value) {})
-				}
-			})
+			proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] 2xx + times mode, atomic incr and maybe deduct via Lua. countKey=%s usedKey=%s N=%d amount=%.6f", countKey, usedKey, n, quotaWeight)
+			// 使用 Lua 脚本原子地自增计数并在满足 N 的倍数时扣减配额
+			script := `
+			local count = redis.call('incr', KEYS[1])
+			local n = tonumber(ARGV[1]) or 0
+			if n > 0 and (count % n) == 0 then
+			  local amount = tonumber(ARGV[2]) or 0
+			  if amount > 0 then
+			    redis.call('incrbyfloat', KEYS[2], amount)
+			  end
+			end
+			return count
+			`
+			keys := []interface{}{countKey, usedKey}
+			args := []interface{}{n, quotaWeight}
+			_ = config.redisClient.Eval(script, 2, keys, args, nil)
+		} else {
+			proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] 2xx but neither header matched nor times mode enabled. no deduction.")
 		}
+	} else {
+		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] non-2xx status, no deduction. status=%d", statusCode)
 	}
 
 	ctx.SetContext("quota_finalized", true)
+	proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] finalized quota for this request")
 	return types.ActionContinue
 }
 
