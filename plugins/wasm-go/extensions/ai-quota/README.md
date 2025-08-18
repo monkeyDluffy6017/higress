@@ -23,7 +23,7 @@ Plugin execution priority: `750`
 - **Complete Management APIs**: Supports query, refresh, and adjustment of total and used quotas
 - **Redis Cluster Support**: Compatible with both Redis standalone and cluster modes
 - **GitHub Project Star Management**: Supports multi-project star status management and verification
-- **Model List Display**: Supports displaying available model lists via `/ai-gateway/api/v1/models` endpoint with configurable providers, including detailed model attribute information
+- **Model List Display**: Supports displaying available model lists via `/ai-gateway/api/v1/models` endpoint with configurable providers
 - **Model Permission Management** (New): Supports fine-grained model access control based on user identity
 - **Restricted Models Configuration**: Configurable list of models requiring special permissions
 - **Intelligent Permission Caching**: High-performance permission validation with configurable TTL memory caching, ensuring timely effect of permission changes
@@ -66,6 +66,7 @@ The plugin extracts model name from request body and determines deduction amount
 | `admin_path`            | string    | Optional | /quota              | Prefix for quota management request paths      |
 | `restricted_models`     | array     | Optional | []                  | List of models requiring permission control (New) |
 | `permission_management` | object    | Optional | -                   | Permission management configuration (New)      |
+| `provider`              | object    | Optional | -                   | Single provider configuration for model lists  |
 | `providers`             | array     | Optional | -                   | Multi-provider configuration for model lists   |
 | `redis`                 | object    | Yes      | -                   | Redis related configuration                    |
 
@@ -143,6 +144,13 @@ restricted_models:
 permission_management:
   redis_permission_prefix: "model_perm:"
   admin_permission_path: "/model-permission"
+# Single provider configuration for model list display
+provider:
+  type: "openai"
+  models:
+    - "gpt-4"
+    - "gpt-3.5-turbo"
+    - "text-embedding-3-large"
 redis:
   service_name: redis-service.default.svc.cluster.local
   service_port: 6379
@@ -181,43 +189,13 @@ providers:
   - id: openai-provider
     type: openai
     models:
-      - name: "gpt-4"
-        maxTokens: 8192
-        contextWindow: 128000
-        supportsImages: true
-        supportsComputerUse: false
-        supportsPromptCache: true
-        supportsReasoningBudget: false
-        description: "Powerful multimodal AI model with image understanding and complex reasoning capabilities"
-      - name: "gpt-3.5-turbo"
-        maxTokens: 4096
-        contextWindow: 16385
-        supportsImages: false
-        supportsComputerUse: false
-        supportsPromptCache: false
-        supportsReasoningBudget: false
-        description: "Cost-effective conversational model suitable for general text processing tasks"
+      - "gpt-4"
+      - "gpt-3.5-turbo"
   - id: deepseek-provider
     type: deepseek
     models:
-      - name: "deepseek-r1"
-        maxTokens: 32768
-        contextWindow: 65536
-        supportsImages: false
-        supportsComputerUse: false
-        supportsPromptCache: true
-        supportsReasoningBudget: true
-        requiredReasoningBudget: true
-        maxThinkingTokens: 32000
-        description: "Deep reasoning model with powerful logical analysis capabilities"
-      - name: "deepseek-chat"
-        maxTokens: 16384
-        contextWindow: 32768
-        supportsImages: false
-        supportsComputerUse: false
-        supportsPromptCache: false
-        supportsReasoningBudget: false
-        description: "Optimized conversational model providing smooth interactive experience"
+      - "deepseek-r1"
+      - "deepseek-chat"
 redis:
   service_name: "local-redis.static"
   service_port: 80
@@ -575,29 +553,13 @@ Response:
       "id": "gpt-4",
       "object": "model",
       "created": 1686935002,
-      "owned_by": "openai",
-      "max_tokens": 8192,
-      "context_window": 128000,
-      "supports_images": true,
-      "supports_computer_use": false,
-      "supports_prompt_cache": true,
-      "supports_reasoning_budget": false,
-      "description": "Powerful multimodal AI model with image understanding and complex reasoning capabilities"
+      "owned_by": "openai"
     },
     {
       "id": "deepseek-r1",
       "object": "model",
       "created": 1686935002,
-      "owned_by": "unknown",
-      "max_tokens": 32768,
-      "context_window": 65536,
-      "supports_images": false,
-      "supports_computer_use": false,
-      "supports_prompt_cache": true,
-      "supports_reasoning_budget": true,
-      "required_reasoning_budget": true,
-      "max_thinking_tokens": 32000,
-      "description": "Deep reasoning model with powerful logical analysis capabilities"
+      "owned_by": "unknown"
     }
   ]
 }
@@ -606,8 +568,6 @@ Response:
 **Notes**:
 - In multi-provider mode, if multiple providers define same model name, first provider's configuration takes precedence
 - `owned_by` field is automatically set based on provider type (openai → "openai", qwen → "alibaba", etc.)
-- Model configuration supports object format with detailed attributes like maxTokens, contextWindow, supportsImages, etc.
-- Also supports simplified string format with default attribute values applied automatically
 - This endpoint is handled locally and doesn't forward requests to upstream services
 
 ## Error Handling

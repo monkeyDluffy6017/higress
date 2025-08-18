@@ -23,7 +23,7 @@ description: AI 配额管理插件配置参考
 - **完整的管理接口**：支持配额总数和已使用量的查询、刷新、增减操作
 - **Redis集群支持**：兼容Redis单机和集群模式
 - **GitHub项目关注管理**：支持多项目关注状态管理和验证
-- **模型列表展示**：支持通过 `/ai-gateway/api/v1/models` 端点展示可配置provider的可用模型列表，包含详细的模型属性信息
+- **模型列表展示**：支持通过 `/ai-gateway/api/v1/models` 端点展示可配置provider的可用模型列表
 - **模型权限管理**（新增）：支持基于用户身份的细粒度模型访问控制
 - **受限模型配置**：可配置需要特殊权限的模型列表
 - **智能权限缓存**：高性能的权限验证，支持可配置TTL的内存缓存，确保权限变更及时生效
@@ -66,6 +66,7 @@ description: AI 配额管理插件配置参考
 | `admin_path`           | string    | 选填     | /quota                 | 管理quota请求path前缀           |
 | `restricted_models`    | array     | 选填     | []                     | 需要权限控制的模型列表（新增）       |
 | `permission_management`| object    | 选填     | -                      | 权限管理配置（新增）                |
+| `provider`             | object    | 选填     | -                      | 单provider配置，用于模型列表展示 |
 | `providers`            | array     | 选填     | -                      | 多provider配置，用于模型列表展示 |
 | `redis`                | object    | 是       | -                      | redis相关配置                  |
 
@@ -143,6 +144,13 @@ restricted_models:
 permission_management:
   redis_permission_prefix: "model_perm:"
   admin_permission_path: "/model-permission"
+# 单provider配置，用于模型列表展示
+provider:
+  type: "openai"
+  models:
+    - "gpt-4"
+    - "gpt-3.5-turbo"
+    - "text-embedding-3-large"
 redis:
   service_name: redis-service.default.svc.cluster.local
   service_port: 6379
@@ -181,43 +189,13 @@ providers:
   - id: openai-provider
     type: openai
     models:
-      - name: "gpt-4"
-        maxTokens: 8192
-        contextWindow: 128000
-        supportsImages: true
-        supportsComputerUse: false
-        supportsPromptCache: true
-        supportsReasoningBudget: false
-        description: "强大的多模态AI模型，支持图像理解和复杂推理"
-      - name: "gpt-3.5-turbo"
-        maxTokens: 4096
-        contextWindow: 16385
-        supportsImages: false
-        supportsComputerUse: false
-        supportsPromptCache: false
-        supportsReasoningBudget: false
-        description: "经济高效的对话模型，适合一般文本处理任务"
+      - "gpt-4"
+      - "gpt-3.5-turbo"
   - id: deepseek-provider
     type: deepseek
     models:
-      - name: "deepseek-r1"
-        maxTokens: 32768
-        contextWindow: 65536
-        supportsImages: false
-        supportsComputerUse: false
-        supportsPromptCache: true
-        supportsReasoningBudget: true
-        requiredReasoningBudget: true
-        maxThinkingTokens: 32000
-        description: "支持深度推理的模型，具备强大的逻辑分析能力"
-      - name: "deepseek-chat"
-        maxTokens: 16384
-        contextWindow: 32768
-        supportsImages: false
-        supportsComputerUse: false
-        supportsPromptCache: false
-        supportsReasoningBudget: false
-        description: "优化的对话模型，提供流畅的交互体验"
+      - "deepseek-r1"
+      - "deepseek-chat"
 redis:
   service_name: "local-redis.static"
   service_port: 80
@@ -584,29 +562,13 @@ curl -X POST "https://example.com/quota/star/projects/set" \
       "id": "gpt-4",
       "object": "model",
       "created": 1686935002,
-      "owned_by": "openai",
-      "max_tokens": 8192,
-      "context_window": 128000,
-      "supports_images": true,
-      "supports_computer_use": false,
-      "supports_prompt_cache": true,
-      "supports_reasoning_budget": false,
-      "description": "强大的多模态AI模型，支持图像理解和复杂推理"
+      "owned_by": "openai"
     },
     {
       "id": "deepseek-r1",
       "object": "model",
       "created": 1686935002,
-      "owned_by": "unknown",
-      "max_tokens": 32768,
-      "context_window": 65536,
-      "supports_images": false,
-      "supports_computer_use": false,
-      "supports_prompt_cache": true,
-      "supports_reasoning_budget": true,
-      "required_reasoning_budget": true,
-      "max_thinking_tokens": 32000,
-      "description": "支持深度推理的模型，具备强大的逻辑分析能力"
+      "owned_by": "unknown"
     }
   ]
 }
@@ -615,8 +577,6 @@ curl -X POST "https://example.com/quota/star/projects/set" \
 **说明**:
 - 在多provider模式下，如果多个provider定义了相同的模型名称，第一个provider的配置优先
 - `owned_by` 字段会根据provider类型自动设置（openai → "openai", qwen → "alibaba" 等）
-- 模型配置支持对象格式，包含详细属性如 maxTokens、contextWindow、supportsImages 等
-- 也支持简化的字符串格式，自动应用默认属性值
 - 此端点由插件本地处理，不会转发请求到上游服务
 
 ## 错误处理

@@ -1293,7 +1293,14 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig, log w
 		if adminMode == AdminModePermQuery {
 			return queryModelPermission(context, config, path, log)
 		}
-		if adminMode == AdminModeRefresh || adminMode == AdminModeDelta || adminMode == AdminModeUsedRefresh || adminMode == AdminModeUsedDelta || adminMode == AdminModeStarSet || adminMode == AdminModeStargazerSet || adminMode == AdminModeQuotaSet {
+		if adminMode == AdminModeRefresh ||
+			adminMode == AdminModeDelta ||
+			adminMode == AdminModeUsedRefresh ||
+			adminMode == AdminModeUsedDelta ||
+			adminMode == AdminModeStarSet ||
+			adminMode == AdminModeStargazerSet ||
+			adminMode == AdminModeQuotaSet ||
+			adminMode == AdminModePermSet {
 			context.BufferRequestBody()
 			return types.HeaderStopIteration
 		}
