@@ -225,13 +225,28 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 			if port == 0 {
 				port = 443
 			}
-			s.analyzer.domain = s.analyzer.serviceDomain
-			s.analyzer.port = port
-			s.analyzer.client = wrapper.NewClusterClient(wrapper.DnsCluster{
-				ServiceName: s.analyzer.serviceName,
-				Port:        port,
-				Domain:      s.analyzer.serviceDomain,
-			})
+			// 当域名或服务名包含点号时，视为已提供完整域，优先使用 FQDN 集群；否则使用 DNS 集群
+			useFQDN := strings.Contains(s.analyzer.serviceDomain, ".") || strings.Contains(s.analyzer.serviceName, ".")
+			if useFQDN {
+				fqdn := s.analyzer.serviceName
+				if !strings.Contains(fqdn, ".") {
+					fqdn = s.analyzer.serviceName + "." + s.analyzer.serviceDomain
+				}
+				s.analyzer.domain = fqdn
+				s.analyzer.port = port
+				s.analyzer.client = wrapper.NewClusterClient(wrapper.FQDNCluster{
+					FQDN: fqdn,
+					Port: port,
+				})
+			} else {
+				s.analyzer.domain = s.analyzer.serviceDomain
+				s.analyzer.port = port
+				s.analyzer.client = wrapper.NewClusterClient(wrapper.DnsCluster{
+					ServiceName: s.analyzer.serviceName,
+					Port:        port,
+					Domain:      s.analyzer.serviceDomain,
+				})
+			}
 		}
 	}
 
