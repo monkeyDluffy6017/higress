@@ -1,39 +1,75 @@
+# --- Common Variables ---
 PLUGIN_NAME ?= hello-world
 BUILDER_REGISTRY ?= higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/
 REGISTRY ?= crpi-j8wrd0nl8l9v42wd.cn-shenzhen.personal.cr.aliyuncs.com/shenma-ai/
-GO_VERSION ?= 1.24.4
 TINYGO_VERSION ?= 0.29.0
 ORAS_VERSION ?= 1.0.0
 HIGRESS_VERSION ?= 1.0.0-rc
 USE_HIGRESS_TINYGO ?= false
-BUILDER ?= ${BUILDER_REGISTRY}wasm-go-builder:go${GO_VERSION}-oras${ORAS_VERSION}
 BUILD_TIME := $(shell date "+%Y%m%d-%H%M%S")
 COMMIT_ID := $(shell git rev-parse --short HEAD 2>/dev/null)
 IMAGE_TAG ?= 0.0.1
 IMG ?= ${REGISTRY}${PLUGIN_NAME}:${IMAGE_TAG}
 GOPROXY := $(shell go env GOPROXY)
 
+# --- Conditional Build Logic ---
+# Check if the plugin name is 'ai-quota'
+ifeq ($(PLUGIN_NAME), ai-quota)
+    # Use the original logic for the 'ai-quota' plugin
+    GO_VERSION ?= 1.20.14
+    BUILDER ?= ${BUILDER_REGISTRY}wasm-go-builder:go${GO_VERSION}-tinygo${TINYGO_VERSION}-oras${ORAS_VERSION}
+    EXTRA_TAGS := $(shell [ -f extensions/${PLUGIN_NAME}/.buildrc ] && . extensions/${PLUGIN_NAME}/.buildrc && echo $$EXTRA_TAGS || echo "")
 
 .DEFAULT:
 build:
 	DOCKER_BUILDKIT=1 docker build --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
-	                            --build-arg BUILDER=${BUILDER}  \
-	                            --build-arg GOPROXY=$(GOPROXY) \
-	                            -t ${IMG} \
-	                            --output extensions/${PLUGIN_NAME} \
-	                            .
+	                     --build-arg BUILDER=${BUILDER}  \
+	                     --build-arg GOPROXY=$(GOPROXY) \
+	                     --build-arg EXTRA_TAGS=${EXTRA_TAGS} \
+	                     -t ${IMG} \
+	                     --output extensions/${PLUGIN_NAME} \
+	                     .
 	@echo ""
 	@echo "output wasm file: extensions/${PLUGIN_NAME}/plugin.wasm"
 
 build-image:
 	DOCKER_BUILDKIT=1 docker build --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
-	                            --build-arg BUILDER=${BUILDER}  \
-	                            --build-arg GOPROXY=$(GOPROXY) \
-	                            -t ${IMG} \
-	                            .
+	                     --build-arg BUILDER=${BUILDER}  \
+	                     --build-arg GOPROXY=$(GOPROXY) \
+	                     --build-arg EXTRA_TAGS=${EXTRA_TAGS} \
+	                     -t ${IMG} \
+	                     .
 	@echo ""
-	@echo "image:            ${IMG}"
+	@echo "image:           ${IMG}"
 
+else
+    # Use the new logic for all other plugins
+    GO_VERSION ?= 1.24.4
+    BUILDER ?= ${BUILDER_REGISTRY}wasm-go-builder:go${GO_VERSION}-oras${ORAS_VERSION}
+
+.DEFAULT:
+build:
+	DOCKER_BUILDKIT=1 docker build --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
+	                     --build-arg BUILDER=${BUILDER}   \
+	                     --build-arg GOPROXY=$(GOPROXY) \
+	                     -t ${IMG} \
+	                     --output extensions/${PLUGIN_NAME} \
+	                     .
+	@echo ""
+	@echo "output wasm file: extensions/${PLUGIN_NAME}/plugin.wasm"
+
+build-image:
+	DOCKER_BUILDKIT=1 docker build --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
+	                     --build-arg BUILDER=${BUILDER}   \
+	                     --build-arg GOPROXY=$(GOPROXY) \
+	                     -t ${IMG} \
+	                     .
+	@echo ""
+	@echo "image:           ${IMG}"
+
+endif
+
+# --- Common Target ---
 build-push: build-image
 	docker push ${IMG}
 
