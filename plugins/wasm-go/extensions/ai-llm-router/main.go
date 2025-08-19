@@ -107,9 +107,10 @@ type InputExtractionConfig struct {
 }
 
 type Candidate struct {
-	id      string
-	enabled bool
-	scores  map[string]int
+	id        string
+	modelName string
+	enabled   bool
+	scores    map[string]int
 }
 
 type RoutingConfig struct {
@@ -291,6 +292,7 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 	s.routing.candidates = make([]Candidate, 0)
 	for _, v := range j.Get("routing.candidates").Array() {
 		c := Candidate{id: v.Get("id").String(), enabled: true, scores: map[string]int{}}
+		c.modelName = strings.TrimSpace(v.Get("modelName").String())
 		if v.Get("enabled").Exists() {
 			c.enabled = v.Get("enabled").Bool()
 		}
@@ -382,9 +384,14 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 				if len(qms) == 0 {
 					if s.routing.fallbackProviderId != "" {
 						_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, s.routing.fallbackProviderId)
-						if b, ok := overrideRequestModelInBody(body, s.routing.fallbackProviderId); ok {
+						// prefer candidate.modelName when set
+						effModel := modelNameForProvider(s.routing.fallbackProviderId, s.routing)
+						if effModel == "" {
+							effModel = s.routing.fallbackProviderId
+						}
+						if b, ok := overrideRequestModelInBody(body, effModel); ok {
 							_ = proxywasm.ReplaceHttpRequestBody(b)
-							logs.Debugf("[ai-llm-router] override request model to fallback id: %s", s.routing.fallbackProviderId)
+							logs.Debugf("[ai-llm-router] override request model to fallback provider=%s model=%s", s.routing.fallbackProviderId, effModel)
 						}
 						ctx.SetContext("selectedProviderId", s.routing.fallbackProviderId)
 						logs.Infof("[ai-llm-router] no qualified models, use fallback provider=%s", s.routing.fallbackProviderId)
@@ -408,9 +415,14 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 			if len(prefiltered) == 0 {
 				if s.routing.fallbackProviderId != "" {
 					_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, s.routing.fallbackProviderId)
-					if b, ok := overrideRequestModelInBody(body, s.routing.fallbackProviderId); ok {
+					// prefer candidate.modelName if set
+					effModel := modelNameForProvider(s.routing.fallbackProviderId, s.routing)
+					if effModel == "" {
+						effModel = s.routing.fallbackProviderId
+					}
+					if b, ok := overrideRequestModelInBody(body, effModel); ok {
 						_ = proxywasm.ReplaceHttpRequestBody(b)
-						logs.Debugf("[ai-llm-router] override request model to fallback id: %s", s.routing.fallbackProviderId)
+						logs.Debugf("[ai-llm-router] override request model to fallback provider=%s model=%s", s.routing.fallbackProviderId, effModel)
 					}
 					ctx.SetContext("selectedProviderId", s.routing.fallbackProviderId)
 					logs.Infof("[ai-llm-router] no qualified models, use fallback provider=%s", s.routing.fallbackProviderId)
@@ -479,9 +491,14 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 					selected := selectProvider(label, routingUsed)
 					if selected != "" {
 						_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, selected)
-						if b, ok := overrideRequestModelInBody(body, selected); ok {
+						// prefer configured modelName for this provider
+						effModel := modelNameForProvider(selected, routingUsed)
+						if effModel == "" {
+							effModel = selected
+						}
+						if b, ok := overrideRequestModelInBody(body, effModel); ok {
 							_ = proxywasm.ReplaceHttpRequestBody(b)
-							logs.Debugf("[ai-llm-router] override request model to provider id: %s", selected)
+							logs.Debugf("[ai-llm-router] override request model to provider=%s model=%s", selected, effModel)
 						}
 						ctx.SetContext("selectedProviderId", selected)
 						logs.Infof("[ai-llm-router] selected provider=%s", selected)
@@ -624,6 +641,8 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 		}
 	}
 	text := strings.Join(textParts, ie.userJoinSep)
+	// Clean up agent/tooling metadata; keep only actual user input
+	text = cleanUserText(text)
 	if ie.stripCodeFences {
 		pattern := ie.codeFenceRegex
 		if pattern == "" {
@@ -642,6 +661,25 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 		text = string(bs)
 	}
 	return text
+}
+
+// cleanUserText removes environment/tooling metadata and prefers explicit <task> content when present.
+func cleanUserText(text string) string {
+	s := text
+	// Prefer content inside <task>...</task>
+	if re := regexp.MustCompile("(?s)<task>\\n?\\s*(.*?)\\s*\\n?</task>"); re != nil {
+		if m := re.FindStringSubmatch(s); len(m) >= 2 {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	// Strip <environment_details>...</environment_details>
+	if re := regexp.MustCompile("(?s)<environment_details>[\\s\\S]*?</environment_details>"); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	// Remove common assistant-run footers/instructions that can leak into user content
+	s = strings.ReplaceAll(s, "No need to acknowledge these instructions directly in your response.", "")
+	s = strings.ReplaceAll(s, "Always respond in zh-CN", "")
+	return strings.TrimSpace(s)
 }
 
 func buildPrompt(tpl string, user string, labels []string) string {
@@ -1093,6 +1131,14 @@ func continueAnalyzerFlowWithRouting(ctx wrapper.HttpContext, s *SemanticStrateg
 					selected := selectProvider(label, routingUsed)
 					if selected != "" {
 						_ = proxywasm.ReplaceHttpRequestHeader(s.routing.providerIdHeader, selected)
+						// prefer configured modelName
+						effModel := modelNameForProvider(selected, routingUsed)
+						if effModel == "" {
+							effModel = selected
+						}
+						if b, ok := overrideRequestModelInBody(body, effModel); ok {
+							_ = proxywasm.ReplaceHttpRequestBody(b)
+						}
 					}
 					_ = proxywasm.ResumeHttpRequest()
 					return
@@ -1170,6 +1216,20 @@ func selectProvider(label string, r RoutingConfig) string {
 		return r.fallbackProviderId
 	}
 	return bestId
+}
+
+// modelNameForProvider returns the configured modelName for a provider id
+// from the given routing config. Empty string means no override is configured.
+func modelNameForProvider(providerId string, r RoutingConfig) string {
+	if providerId == "" {
+		return ""
+	}
+	for _, c := range r.candidates {
+		if c.id == providerId && strings.TrimSpace(c.modelName) != "" {
+			return c.modelName
+		}
+	}
+	return ""
 }
 
 // buildRoutingFromQualified 基于规则引擎产出的合格模型集合过滤路由候选集
