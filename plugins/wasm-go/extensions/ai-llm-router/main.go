@@ -604,31 +604,80 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config Config, body []byte) typ
 // ===== Helpers =====
 
 func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) string {
-	var textParts []string
+	var text string
 	switch ie.protocol {
 	case "openai":
+		// 仅提取最近一条 user 消息，避免早期对话覆盖最新输入
 		msgs := gjson.GetBytes(body, "messages").Array()
-		for _, m := range msgs {
-			if m.Get("role").String() == "user" {
-				c := m.Get("content")
-				if c.Exists() {
-					if c.IsArray() {
-						// simple concat of parts if array (not fully handling structured content)
-						var b strings.Builder
-						for _, p := range c.Array() {
-							s := p.Get("text").String()
-							if s == "" {
-								s = p.String()
-							}
-							if s != "" {
-								b.WriteString(s)
-								b.WriteString("\n")
-							}
-						}
-						textParts = append(textParts, strings.TrimSpace(b.String()))
-					} else {
-						textParts = append(textParts, c.String())
+		for i := len(msgs) - 1; i >= 0; i-- {
+			m := msgs[i]
+			if m.Get("role").String() != "user" {
+				continue
+			}
+			c := m.Get("content")
+			if !c.Exists() {
+				continue
+			}
+			var candidate string
+			if c.IsArray() {
+				var b strings.Builder
+				for _, p := range c.Array() {
+					s := p.Get("text").String()
+					if s == "" {
+						s = p.String()
 					}
+					if s != "" {
+						b.WriteString(s)
+						b.WriteString("\n")
+					}
+				}
+				candidate = strings.TrimSpace(b.String())
+			} else {
+				candidate = c.String()
+			}
+			candidate = cleanUserText(candidate)
+			if strings.TrimSpace(candidate) != "" {
+				text = candidate
+				break
+			}
+		}
+		// 回退：若未从 user 消息中提取到非空文本，则从最近的一条消息（忽略 role）尝试提取
+		if strings.TrimSpace(text) == "" {
+			for i := len(msgs) - 1; i >= 0; i-- {
+				m := msgs[i]
+				c := m.Get("content")
+				if !c.Exists() {
+					continue
+				}
+				var candidate string
+				if c.IsArray() {
+					var b strings.Builder
+					for _, p := range c.Array() {
+						s := p.Get("text").String()
+						if s == "" {
+							s = p.String()
+						}
+						if s != "" {
+							b.WriteString(s)
+							b.WriteString("\n")
+						}
+					}
+					candidate = strings.TrimSpace(b.String())
+				} else {
+					candidate = c.String()
+				}
+				candidate = cleanUserText(candidate)
+				if strings.TrimSpace(candidate) != "" {
+					text = candidate
+					break
+				}
+			}
+		}
+		// 最后回退：直接从原始 body 中解析 <task>...</task>
+		if strings.TrimSpace(text) == "" {
+			if re := regexp.MustCompile("(?s)<task>\\n?\\s*(.*?)\\s*\\n?</task>"); re != nil {
+				if m := re.FindSubmatch(body); len(m) >= 2 {
+					text = strings.TrimSpace(string(m[1]))
 				}
 			}
 		}
@@ -636,12 +685,11 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 		if path := ie.contentJsonPath; path != "" {
 			s := gjson.GetBytes(body, path).String()
 			if s != "" {
-				textParts = append(textParts, s)
+				text = s
 			}
 		}
 	}
-	text := strings.Join(textParts, ie.userJoinSep)
-	// Clean up agent/tooling metadata; keep only actual user input
+	// 清理并裁剪（清理已在循环中做过，此处保守再清一次）
 	text = cleanUserText(text)
 	if ie.stripCodeFences {
 		pattern := ie.codeFenceRegex
@@ -652,7 +700,6 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 			text = re.ReplaceAllString(text, "")
 		}
 	}
-	// truncate to maxBytes
 	if maxBytes > 0 && len([]byte(text)) > maxBytes {
 		bs := []byte(text)
 		if maxBytes < len(bs) {
@@ -672,8 +719,30 @@ func cleanUserText(text string) string {
 			return strings.TrimSpace(m[1])
 		}
 	}
+	// Prefer content inside <feedback>...</feedback>
+	if re := regexp.MustCompile("(?s)<feedback>\\n?\\s*(.*?)\\s*\\n?</feedback>"); re != nil {
+		if m := re.FindStringSubmatch(s); len(m) >= 2 {
+			fs := strings.TrimSpace(m[1])
+			// Strip leading mention markers like "@/ " or "@ "
+			if re2 := regexp.MustCompile("^@/?\\s*"); re2 != nil {
+				fs = re2.ReplaceAllString(fs, "")
+			}
+			return strings.TrimSpace(fs)
+		}
+	}
 	// Strip <environment_details>...</environment_details>
 	if re := regexp.MustCompile("(?s)<environment_details>[\\s\\S]*?</environment_details>"); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	// Strip <attempt_completion>...</attempt_completion>
+	if re := regexp.MustCompile("(?s)<attempt_completion>[\\s\\S]*?</attempt_completion>"); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	// Remove attempt_completion noise lines
+	if re := regexp.MustCompile("(?m)^\\[attempt_completion\\].*$"); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	if re := regexp.MustCompile("(?m)^The user has provided feedback.*$"); re != nil {
 		s = re.ReplaceAllString(s, "")
 	}
 	// Remove common assistant-run footers/instructions that can leak into user content
