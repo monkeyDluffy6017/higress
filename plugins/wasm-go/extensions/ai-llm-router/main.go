@@ -452,6 +452,8 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 	}
 	logs.Debugf("[ai-llm-router] extracted (history bytes=%d, current bytes=%d) protocol=%s", len([]byte(historyText)), len([]byte(currentText)), s.inputExtraction.protocol)
 	logs.Debugf("[ai-llm-router] extracted current content: %s", currentText)
+	// 保存当前轮用户输入，供响应头返回
+	ctx.SetContext("currentUserInput", currentText)
 
 	prompt := buildPrompt(s.analyzer.promptTemplate, historyText, currentText)
 	reqBody, _ := json.Marshal(map[string]interface{}{
@@ -540,6 +542,11 @@ func (s *SemanticStrategy) OnResponseHeaders(ctx wrapper.HttpContext) types.Acti
 		if id, _ := v.(string); id != "" {
 			_ = proxywasm.ReplaceHttpResponseHeader("x-select-llm", id)
 			logs.Debugf("[ai-llm-router] response header x-select-llm=%s", id)
+		}
+	}
+	if v := ctx.GetContext("currentUserInput"); v != nil {
+		if cur, _ := v.(string); strings.TrimSpace(cur) != "" {
+			_ = proxywasm.ReplaceHttpResponseHeader("x-user-input", cur)
 		}
 	}
 	return types.ActionContinue
@@ -977,84 +984,22 @@ func extractAllUserInputs(body []byte, ie InputExtractionConfig, maxBytes int) s
 
 // cleanUserText removes environment/tooling metadata and prefers explicit <task> content when present.
 func cleanUserText(text string) string {
-	s := text
-	// Prefer content inside <task>...</task>
-	if re := regexp.MustCompile(`(?s)<task>\n?\s*(.*?)\s*\n?</task>`); re != nil {
-		if m := re.FindStringSubmatch(s); len(m) >= 2 {
-			return strings.TrimSpace(m[1])
+	if text == "" {
+		return ""
+	}
+	// 轻量清洗：不改变语义，仅做格式规范与无形字符去除
+	// 1) 规范换行：\r\n / \r -> \n
+	s := strings.ReplaceAll(text, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	// 2) 去除零宽字符：U+200B/U+200C/U+200D/U+FEFF
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '\u200B', '\u200C', '\u200D', '\uFEFF':
+			return -1
 		}
-	}
-	// Prefer content inside <user_message>...</user_message>
-	if re := regexp.MustCompile(`(?s)<user_message>\n?\s*(.*?)\s*\n?</user_message>`); re != nil {
-		if m := re.FindStringSubmatch(s); len(m) >= 2 {
-			return strings.TrimSpace(m[1])
-		}
-	}
-	// Prefer content inside <answer>...</answer>
-	if re := regexp.MustCompile(`(?s)<answer>\n?\s*(.*?)\s*\n?</answer>`); re != nil {
-		if m := re.FindStringSubmatch(s); len(m) >= 2 {
-			return strings.TrimSpace(m[1])
-		}
-	}
-	// Prefer content inside <feedback>...</feedback>
-	if re := regexp.MustCompile(`(?s)<feedback>\n?\s*(.*?)\s*\n?</feedback>`); re != nil {
-		if m := re.FindStringSubmatch(s); len(m) >= 2 {
-			fs := strings.TrimSpace(m[1])
-			// Strip leading mention markers like "@/ " or "@ "
-			if re2 := regexp.MustCompile(`^@/?\s*`); re2 != nil {
-				fs = re2.ReplaceAllString(fs, "")
-			}
-			return strings.TrimSpace(fs)
-		}
-	}
-	// Strip <environment_details>...</environment_details>
-	if re := regexp.MustCompile("(?s)<environment_details>[\\s\\S]*?</environment_details>"); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	// Strip <attempt_completion>...</attempt_completion>
-	if re := regexp.MustCompile("(?s)<attempt_completion>[\\s\\S]*?</attempt_completion>"); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	// Remove attempt_completion noise lines
-	if re := regexp.MustCompile("(?m)^\\[attempt_completion\\].*$"); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	if re := regexp.MustCompile("(?m)^The user has provided feedback.*$"); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	// Remove common assistant-run footers/instructions that can leak into user content
-	s = strings.ReplaceAll(s, "No need to acknowledge these instructions directly in your response.", "")
-	s = strings.ReplaceAll(s, "Always respond in zh-CN", "")
-	// Strip generic language-enforcement lines such as "Always respond in en" (case-insensitive)
-	if re := regexp.MustCompile(`(?mi)^Always\s+respond\s+in[^\n\r]*$`); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	// Strip common summarization prompts injected by tools
-	if re := regexp.MustCompile(`(?mi)^Summarize\s+the\s+conversation\s+so\s+far.*$`); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	// Strip tool-enforcement and system automation lines
-	if re := regexp.MustCompile(`(?mi)^\[ERROR\][^\n\r]*$`); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	if re := regexp.MustCompile(`(?mi)^(#\s*Reminder:)?\s*Instructions\s*for\s*Tool\s*Use.*$`); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	if re := regexp.MustCompile(`(?mi)Tool\s+uses\s+are\s+formatted\s+using\s+XML-style\s+tags`); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	if re := regexp.MustCompile(`(?mi)^Next\s+Steps\s*$`); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	if re := regexp.MustCompile(`(?mi)This\s+is\s+an\s+automated\s+message`); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	if re := regexp.MustCompile(`(?mi)Always\s+use\s+the\s+actual\s+tool\s+name\s+as\s+the\s+XML\s+tag\s+name`); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
-	if re := regexp.MustCompile(`(?mi)use\s+the\s+attempt_completion\s+tool|use\s+the\s+ask_followup_question\s+tool`); re != nil {
-		s = re.ReplaceAllString(s, "")
-	}
+		return r
+	}, s)
+	// 3) 去首尾空白
 	return strings.TrimSpace(s)
 }
 
@@ -1604,9 +1549,6 @@ func setNestedRequestContext(rc ruleengine.RequestContext, keys []string, value 
 	}
 	cur[keys[len(keys)-1]] = value
 }
-
-// 兼容旧签名：保持占位但不再使用
-func continueAnalyzerFlow(ctx wrapper.HttpContext, s *SemanticStrategy, body []byte) {}
 
 // continueAnalyzerFlow continues analyzer flow after async rule engine completes
 func continueAnalyzerFlowWithRouting(ctx wrapper.HttpContext, s *SemanticStrategy, body []byte, prouting *RoutingConfig) {
