@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 	"regexp"
 	"strings"
@@ -38,14 +37,28 @@ func init() {
 
 }
 
-const defaultPromptTemplate = "You are a highly-specialized classification expert. Your ONLY purpose is to classify a user's development request into one of five labels based on the detailed definitions below.\n\n" +
-	"Here are the definitions for each label:\n\n" +
-	"1.  build_new_project: creating a brand-new, standalone application/service/module/system from scratch.\n" +
-	"2.  add_new_feature: adding a new capability to an existing application/service/module.\n" +
-	"3.  fix_bug: fixing errors/defects or unexpected behavior in existing functionality.\n" +
-	"4.  other: anything else (refactoring, docs, performance, analysis, etc.).\n\n" +
-	"Instructions: respond with ONE label only: build_new_project, add_new_feature, fix_bug, or other. No explanations.\n\n" +
-	"User Request: {USER_INPUT}"
+const defaultPromptTemplate = `You are a classification specialist. Classify ONLY based on the CURRENT turn. Use history strictly for disambiguation of short messages (e.g., "retry", "continue", "same as above").
+
+Labels and definitions:
+1) simple_request: Non-technical, conversational queries. Includes greetings (e.g., "hello"), identity questions (e.g., "who are you?"), or general chat not involving programming/code/dev tasks.
+2) planning_request: Requests for analysis/planning/explanation about code or a task without directly writing or editing code. Examples: review code and give feedback, create a technical plan/outline, discuss architecture, explain an algorithm.
+3) code_modification: Requests that require generating, editing, or modifying code. Examples: implement a function, fix a bug, add a new feature, refactor, translate comments, or convert code between languages.
+
+Special rules:
+- Classify ONLY using the Current section below. Do NOT summarize or rewrite anything.
+- History may be referenced only to interpret very short Current inputs.
+- If Current contains file paths, line ranges (e.g., foo.go:12-20), diffs, or code blocks indicating an edit intent, prefer code_modification unless clearly chit-chat.
+- If the Current contains imperative phrases indicating immediate implementation (e.g., "实施", "实现", "开始实现", "开始编码", "按计划实施", "落地", "修改", "修复", "apply the plan", "go ahead and implement", "implement now"), classify as code_modification.
+
+History (older → newer):
+{HISTORY}
+
+Current:
+{CURRENT}
+
+Instructions:
+- Output exactly one of: simple_request, planning_request, code_modification
+- Output the label only. No extra words.`
 
 // ===== 策略模式：通用接口与语义策略实现 =====
 
@@ -75,7 +88,6 @@ type AnalyzerConfig struct {
 	maxInputBytes  int
 	promptTemplate string
 	protocol       string
-	labels         []string
 	analysisLabels []string
 	labelRegex     *regexp.Regexp
 	// service-source based fields (optional). If serviceName is set, prefer DNS service source.
@@ -104,6 +116,8 @@ type InputExtractionConfig struct {
 	stripCodeFences bool
 	codeFenceRegex  string
 	contentJsonPath string
+	maxUserMessages int
+	maxHistoryBytes int
 }
 
 type Candidate struct {
@@ -157,21 +171,11 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 		s.analyzer.timeoutMs = 3000
 	}
 	s.analyzer.maxInputBytes = int(j.Get("analyzer.maxInputBytes").Int())
-	if s.analyzer.maxInputBytes <= 0 {
-		s.analyzer.maxInputBytes = 10 * 1024
-	}
+	// 默认不生效：当未配置或<=0时，不做长度限制（保持为0）
 	s.analyzer.promptTemplate = j.Get("analyzer.promptTemplate").String()
 	s.analyzer.protocol = j.Get("analyzer.protocol").String()
 	if s.analyzer.protocol == "" {
 		s.analyzer.protocol = "openai"
-	}
-	// labels (general)
-	s.analyzer.labels = make([]string, 0)
-	for _, v := range j.Get("analyzer.labels").Array() {
-		sv := strings.TrimSpace(v.String())
-		if sv != "" {
-			s.analyzer.labels = append(s.analyzer.labels, sv)
-		}
 	}
 	// analysisLabels (used strictly for semantic classification)
 	s.analyzer.analysisLabels = make([]string, 0)
@@ -183,16 +187,9 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 			}
 		}
 	}
-	// Validation: if labels are provided but analysisLabels are not, it's an error
-	if len(s.analyzer.labels) > 0 && len(s.analyzer.analysisLabels) == 0 {
-		return errors.New("analyzer.analysisLabels is required when analyzer.labels is provided")
-	}
-	if len(s.analyzer.labels) == 0 && len(s.analyzer.analysisLabels) > 0 {
-		return errors.New("analyzer.labels is required when analyzer.analysisLabels is provided")
-	}
-	// Defaults: if none provided, use built-in four labels
-	if len(s.analyzer.labels) == 0 && len(s.analyzer.analysisLabels) == 0 {
-		s.analyzer.analysisLabels = []string{"build_new_project", "add_new_feature", "fix_bug", "other"}
+	// Defaults: if none provided, use built-in labels
+	if len(s.analyzer.analysisLabels) == 0 {
+		s.analyzer.analysisLabels = []string{"simple_request", "planning_request", "code_modification"}
 	}
 	// compile regex based on analysisLabels
 	{
@@ -274,6 +271,16 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 	}
 	s.inputExtraction.codeFenceRegex = j.Get("inputExtraction.codeFenceRegex").String()
 	s.inputExtraction.contentJsonPath = j.Get("inputExtraction.contentJsonPath").String()
+	// history window config (optional)
+	if j.Get("inputExtraction.maxUserMessages").Exists() {
+		s.inputExtraction.maxUserMessages = int(j.Get("inputExtraction.maxUserMessages").Int())
+	}
+	if s.inputExtraction.maxUserMessages <= 0 {
+		s.inputExtraction.maxUserMessages = 100
+	}
+	if j.Get("inputExtraction.maxHistoryBytes").Exists() {
+		s.inputExtraction.maxHistoryBytes = int(j.Get("inputExtraction.maxHistoryBytes").Int())
+	}
 
 	// routing
 	s.routing.providerIdHeader = j.Get("routing.providerIdHeader").String()
@@ -438,15 +445,15 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 		logs.Debugf("[ai-llm-router] analyzer disabled or not configured, skip routing")
 		return types.ActionContinue
 	}
-	userText := extractUserInput(body, s.inputExtraction, s.analyzer.maxInputBytes)
-	if strings.TrimSpace(userText) == "" {
+	historyText, currentText := extractHistoryAndCurrent(body, s.inputExtraction, s.analyzer.maxInputBytes)
+	if strings.TrimSpace(currentText) == "" {
 		logs.Debugf("[ai-llm-router] empty user text after extraction, skip routing")
 		return types.ActionContinue
 	}
-	logs.Debugf("[ai-llm-router] extracted user text bytes=%d protocol=%s", len([]byte(userText)), s.inputExtraction.protocol)
-	logs.Debugf("[ai-llm-router] extracted user text content: %s", userText)
+	logs.Debugf("[ai-llm-router] extracted (history bytes=%d, current bytes=%d) protocol=%s", len([]byte(historyText)), len([]byte(currentText)), s.inputExtraction.protocol)
+	logs.Debugf("[ai-llm-router] extracted current content: %s", currentText)
 
-	prompt := buildPrompt(s.analyzer.promptTemplate, userText, s.analyzer.analysisLabels)
+	prompt := buildPrompt(s.analyzer.promptTemplate, historyText, currentText)
 	reqBody, _ := json.Marshal(map[string]interface{}{
 		"model":    s.analyzer.model,
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
@@ -607,8 +614,69 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 	var text string
 	switch ie.protocol {
 	case "openai":
-		// 仅提取最近一条 user 消息，避免早期对话覆盖最新输入
+		// 更智能的提取：
+		// 1) 优先提取 <task>/<feedback> 标签内容
+		// 2) 跳过疑似工具生成的内容（工具XML、[read_file] Result、<files>、<environment_details> 等）
+		// 3) 若本轮没有有效用户输入，回溯上一轮用户消息，直到找到
 		msgs := gjson.GetBytes(body, "messages").Array()
+
+		isLikelyToolGenerated := func(s string) bool {
+			t := strings.TrimSpace(s)
+			if t == "" {
+				return false
+			}
+			// XML 风格工具标签
+			if re := regexp.MustCompile("(?s)<(read_file|search_files|list_files|apply_diff|insert_content|write_to_file|search_and_replace|ask_followup_question|attempt_completion|switch_mode|new_task|update_todo_list)[^>]*>"); re != nil && re.MatchString(t) {
+				return true
+			}
+			// 结果/环境块
+			if re := regexp.MustCompile("(?s)<files>.*?</files>"); re != nil && re.MatchString(t) {
+				return true
+			}
+			if re := regexp.MustCompile("(?s)<environment_details>.*?</environment_details>"); re != nil && re.MatchString(t) {
+				return true
+			}
+			// 方括号工具输出行，如 [read_file ...] Result:
+			if re := regexp.MustCompile(`(?m)^\[(read_file|search_files|list_files|apply_diff|insert_content|write_to_file|search_and_replace|ask_followup_question|attempt_completion|switch_mode|new_task|update_todo_list)[^\]]*\]`); re != nil && re.MatchString(t) {
+				return true
+			}
+			// 常见的环境/系统提示关键字
+			if strings.Contains(t, "VSCode Visible Files") || strings.Contains(t, "VSCode Open Tabs") || strings.Contains(t, "Current Workspace Directory") {
+				return true
+			}
+			return false
+		}
+
+		extractExplicit := func(s string) (string, bool) {
+			if re := regexp.MustCompile(`(?s)<task>\\n?\\s*(.*?)\\s*\\n?</task>`); re != nil {
+				if m := re.FindStringSubmatch(s); len(m) >= 2 {
+					return strings.TrimSpace(m[1]), true
+				}
+			}
+			if re := regexp.MustCompile(`(?s)<user_message>\\n?\\s*(.*?)\\s*\\n?</user_message>`); re != nil {
+				if m := re.FindStringSubmatch(s); len(m) >= 2 {
+					return strings.TrimSpace(m[1]), true
+				}
+			}
+			// 支持 <answer> 作为用户显式输入来源
+			if re := regexp.MustCompile(`(?s)<answer>\\n?\\s*(.*?)\\s*\\n?</answer>`); re != nil {
+				if m := re.FindStringSubmatch(s); len(m) >= 2 {
+					return strings.TrimSpace(m[1]), true
+				}
+			}
+			if re := regexp.MustCompile(`(?s)<feedback>\\n?\\s*(.*?)\\s*\\n?</feedback>`); re != nil {
+				if m := re.FindStringSubmatch(s); len(m) >= 2 {
+					fs := strings.TrimSpace(m[1])
+					if re2 := regexp.MustCompile(`^@/?\\s*`); re2 != nil {
+						fs = re2.ReplaceAllString(fs, "")
+					}
+					return strings.TrimSpace(fs), true
+				}
+			}
+			return "", false
+		}
+
+		// 先回溯用户消息
 		for i := len(msgs) - 1; i >= 0; i-- {
 			m := msgs[i]
 			if m.Get("role").String() != "user" {
@@ -618,7 +686,7 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 			if !c.Exists() {
 				continue
 			}
-			var candidate string
+			var raw string
 			if c.IsArray() {
 				var b strings.Builder
 				for _, p := range c.Array() {
@@ -631,17 +699,25 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 						b.WriteString("\n")
 					}
 				}
-				candidate = strings.TrimSpace(b.String())
+				raw = strings.TrimSpace(b.String())
 			} else {
-				candidate = c.String()
+				raw = c.String()
 			}
-			candidate = cleanUserText(candidate)
-			if strings.TrimSpace(candidate) != "" {
-				text = candidate
+
+			if v, ok := extractExplicit(raw); ok && strings.TrimSpace(v) != "" {
+				text = v
+				break
+			}
+			cleaned := cleanUserText(raw)
+			if isLikelyToolGenerated(raw) || isLikelyToolGenerated(cleaned) {
+				continue
+			}
+			if strings.TrimSpace(cleaned) != "" {
+				text = cleaned
 				break
 			}
 		}
-		// 回退：若未从 user 消息中提取到非空文本，则从最近的一条消息（忽略 role）尝试提取
+		// 若仍为空，从最近到最远遍历所有消息（忽略 role），同样优先显式标签并过滤工具内容
 		if strings.TrimSpace(text) == "" {
 			for i := len(msgs) - 1; i >= 0; i-- {
 				m := msgs[i]
@@ -649,7 +725,7 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 				if !c.Exists() {
 					continue
 				}
-				var candidate string
+				var raw string
 				if c.IsArray() {
 					var b strings.Builder
 					for _, p := range c.Array() {
@@ -662,22 +738,37 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 							b.WriteString("\n")
 						}
 					}
-					candidate = strings.TrimSpace(b.String())
+					raw = strings.TrimSpace(b.String())
 				} else {
-					candidate = c.String()
+					raw = c.String()
 				}
-				candidate = cleanUserText(candidate)
-				if strings.TrimSpace(candidate) != "" {
-					text = candidate
+
+				if v, ok := extractExplicit(raw); ok && strings.TrimSpace(v) != "" {
+					text = v
+					break
+				}
+				cleaned := cleanUserText(raw)
+				if isLikelyToolGenerated(raw) || isLikelyToolGenerated(cleaned) {
+					continue
+				}
+				if strings.TrimSpace(cleaned) != "" {
+					text = cleaned
 					break
 				}
 			}
 		}
-		// 最后回退：直接从原始 body 中解析 <task>...</task>
+		// 最后回退：直接从原始 body 中解析 <task>/<user_message>...
 		if strings.TrimSpace(text) == "" {
-			if re := regexp.MustCompile("(?s)<task>\\n?\\s*(.*?)\\s*\\n?</task>"); re != nil {
+			if re := regexp.MustCompile(`(?s)<task>\\n?\\s*(.*?)\\s*\\n?</task>`); re != nil {
 				if m := re.FindSubmatch(body); len(m) >= 2 {
 					text = strings.TrimSpace(string(m[1]))
+				}
+			}
+			if strings.TrimSpace(text) == "" {
+				if re := regexp.MustCompile(`(?s)<user_message>\\n?\\s*(.*?)\\s*\\n?</user_message>`); re != nil {
+					if m := re.FindSubmatch(body); len(m) >= 2 {
+						text = strings.TrimSpace(string(m[1]))
+					}
 				}
 			}
 		}
@@ -710,21 +801,207 @@ func extractUserInput(body []byte, ie InputExtractionConfig, maxBytes int) strin
 	return text
 }
 
+// extractAllUserInputs 汇总所有用户输入：
+// - 遍历所有 messages 中 role=user 的消息（从旧到新）
+// - 优先抽取 <task>/<feedback>，否则清洗后加入
+// - 过滤工具/环境噪声
+// - 使用 ie.userJoinSep 连接，并应用 stripCodeFences 与 maxBytes
+func extractAllUserInputs(body []byte, ie InputExtractionConfig, maxBytes int) string {
+	if ie.protocol != "openai" {
+		return extractUserInput(body, ie, maxBytes)
+	}
+	msgs := gjson.GetBytes(body, "messages").Array()
+	if len(msgs) == 0 {
+		return extractUserInput(body, ie, maxBytes)
+	}
+
+	isLikelyToolGenerated := func(s string) bool {
+		t := strings.TrimSpace(s)
+		if t == "" {
+			return false
+		}
+		if re := regexp.MustCompile("(?s)<(read_file|search_files|list_files|apply_diff|insert_content|write_to_file|search_and_replace|ask_followup_question|attempt_completion|switch_mode|new_task|update_todo_list)[^>]*>"); re != nil && re.MatchString(t) {
+			return true
+		}
+		if re := regexp.MustCompile("(?s)<files>.*?</files>"); re != nil && re.MatchString(t) {
+			return true
+		}
+		if re := regexp.MustCompile("(?s)<environment_details>.*?</environment_details>"); re != nil && re.MatchString(t) {
+			return true
+		}
+		if re := regexp.MustCompile(`(?m)^\[(read_file|search_files|list_files|apply_diff|insert_content|write_to_file|search_and_replace|ask_followup_question|attempt_completion|switch_mode|new_task|update_todo_list)[^\]]*\]`); re != nil && re.MatchString(t) {
+			return true
+		}
+		if strings.Contains(t, "VSCode Visible Files") || strings.Contains(t, "VSCode Open Tabs") || strings.Contains(t, "Current Workspace Directory") {
+			return true
+		}
+		return false
+	}
+
+	extractExplicit := func(s string) (string, bool) {
+		if re := regexp.MustCompile(`(?s)<task>\n?\s*(.*?)\s*\n?</task>`); re != nil {
+			if m := re.FindStringSubmatch(s); len(m) >= 2 {
+				return strings.TrimSpace(m[1]), true
+			}
+		}
+		if re := regexp.MustCompile(`(?s)<user_message>\n?\s*(.*?)\s*\n?</user_message>`); re != nil {
+			if m := re.FindStringSubmatch(s); len(m) >= 2 {
+				return strings.TrimSpace(m[1]), true
+			}
+		}
+		// 支持 <answer> 作为用户显式输入来源
+		if re := regexp.MustCompile(`(?s)<answer>\n?\s*(.*?)\s*\n?</answer>`); re != nil {
+			if m := re.FindStringSubmatch(s); len(m) >= 2 {
+				return strings.TrimSpace(m[1]), true
+			}
+		}
+		if re := regexp.MustCompile(`(?s)<feedback>\n?\s*(.*?)\s*\n?</feedback>`); re != nil {
+			if m := re.FindStringSubmatch(s); len(m) >= 2 {
+				fs := strings.TrimSpace(m[1])
+				if re2 := regexp.MustCompile(`^@/?\s*`); re2 != nil {
+					fs = re2.ReplaceAllString(fs, "")
+				}
+				return strings.TrimSpace(fs), true
+			}
+		}
+		return "", false
+	}
+
+	// 限制最多聚合的用户消息条数
+	startIdx := 0
+	if ie.maxUserMessages > 0 && len(msgs) > ie.maxUserMessages {
+		// 从最后 ie.maxUserMessages 条用户消息开始，但需要跳过非 user 的消息
+		// 简化做法：先收集所有 user 索引
+		userIdx := make([]int, 0, len(msgs))
+		for i := 0; i < len(msgs); i++ {
+			if msgs[i].Get("role").String() == "user" {
+				userIdx = append(userIdx, i)
+			}
+		}
+		if len(userIdx) > ie.maxUserMessages {
+			userIdx = userIdx[len(userIdx)-ie.maxUserMessages:]
+		}
+		if len(userIdx) > 0 {
+			startIdx = userIdx[0]
+		}
+	}
+
+	parts := make([]string, 0)
+	for i := startIdx; i < len(msgs); i++ {
+		m := msgs[i]
+		if m.Get("role").String() != "user" {
+			continue
+		}
+		c := m.Get("content")
+		if !c.Exists() {
+			continue
+		}
+		var raw string
+		if c.IsArray() {
+			var b strings.Builder
+			for _, p := range c.Array() {
+				s := p.Get("text").String()
+				if s == "" {
+					s = p.String()
+				}
+				if s != "" {
+					b.WriteString(s)
+					b.WriteString("\n")
+				}
+			}
+			raw = strings.TrimSpace(b.String())
+		} else {
+			raw = c.String()
+		}
+
+		if v, ok := extractExplicit(raw); ok && strings.TrimSpace(v) != "" {
+			parts = append(parts, v)
+			continue
+		}
+		cleaned := cleanUserText(raw)
+		if isLikelyToolGenerated(raw) || isLikelyToolGenerated(cleaned) {
+			continue
+		}
+		if strings.TrimSpace(cleaned) != "" {
+			parts = append(parts, cleaned)
+		}
+	}
+
+	var text string
+	if len(parts) > 0 {
+		sep := ie.userJoinSep
+		if sep == "" {
+			sep = "\n\n"
+		}
+		text = strings.Join(parts, sep)
+	} else {
+		// 回退：直接从原始 body 中解析 <task>/<user_message>...
+		if re := regexp.MustCompile(`(?s)<task>\n?\s*(.*?)\s*\n?</task>`); re != nil {
+			if m := re.FindSubmatch(body); len(m) >= 2 {
+				text = strings.TrimSpace(string(m[1]))
+			}
+		}
+		if strings.TrimSpace(text) == "" {
+			if re := regexp.MustCompile(`(?s)<user_message>\n?\s*(.*?)\s*\n?</user_message>`); re != nil {
+				if m := re.FindSubmatch(body); len(m) >= 2 {
+					text = strings.TrimSpace(string(m[1]))
+				}
+			}
+		}
+	}
+
+	text = cleanUserText(text)
+	if ie.stripCodeFences {
+		pattern := ie.codeFenceRegex
+		if pattern == "" {
+			pattern = "(?s)```{3,4}[\\s\\S]*?```{3,4}"
+		}
+		if re, err := regexp.Compile(pattern); err == nil {
+			text = re.ReplaceAllString(text, "")
+		}
+	}
+	// 综合 maxHistoryBytes 与 maxBytes 限制，取更严格的限制
+	effectiveLimit := maxBytes
+	if ie.maxHistoryBytes > 0 && (effectiveLimit == 0 || ie.maxHistoryBytes < effectiveLimit) {
+		effectiveLimit = ie.maxHistoryBytes
+	}
+	if effectiveLimit > 0 && len([]byte(text)) > effectiveLimit {
+		bs := []byte(text)
+		if effectiveLimit < len(bs) {
+			bs = bs[:effectiveLimit]
+		}
+		text = string(bs)
+	}
+	return text
+}
+
 // cleanUserText removes environment/tooling metadata and prefers explicit <task> content when present.
 func cleanUserText(text string) string {
 	s := text
 	// Prefer content inside <task>...</task>
-	if re := regexp.MustCompile("(?s)<task>\\n?\\s*(.*?)\\s*\\n?</task>"); re != nil {
+	if re := regexp.MustCompile(`(?s)<task>\n?\s*(.*?)\s*\n?</task>`); re != nil {
+		if m := re.FindStringSubmatch(s); len(m) >= 2 {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	// Prefer content inside <user_message>...</user_message>
+	if re := regexp.MustCompile(`(?s)<user_message>\n?\s*(.*?)\s*\n?</user_message>`); re != nil {
+		if m := re.FindStringSubmatch(s); len(m) >= 2 {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	// Prefer content inside <answer>...</answer>
+	if re := regexp.MustCompile(`(?s)<answer>\n?\s*(.*?)\s*\n?</answer>`); re != nil {
 		if m := re.FindStringSubmatch(s); len(m) >= 2 {
 			return strings.TrimSpace(m[1])
 		}
 	}
 	// Prefer content inside <feedback>...</feedback>
-	if re := regexp.MustCompile("(?s)<feedback>\\n?\\s*(.*?)\\s*\\n?</feedback>"); re != nil {
+	if re := regexp.MustCompile(`(?s)<feedback>\n?\s*(.*?)\s*\n?</feedback>`); re != nil {
 		if m := re.FindStringSubmatch(s); len(m) >= 2 {
 			fs := strings.TrimSpace(m[1])
 			// Strip leading mention markers like "@/ " or "@ "
-			if re2 := regexp.MustCompile("^@/?\\s*"); re2 != nil {
+			if re2 := regexp.MustCompile(`^@/?\s*`); re2 != nil {
 				fs = re2.ReplaceAllString(fs, "")
 			}
 			return strings.TrimSpace(fs)
@@ -748,32 +1025,210 @@ func cleanUserText(text string) string {
 	// Remove common assistant-run footers/instructions that can leak into user content
 	s = strings.ReplaceAll(s, "No need to acknowledge these instructions directly in your response.", "")
 	s = strings.ReplaceAll(s, "Always respond in zh-CN", "")
+	// Strip generic language-enforcement lines such as "Always respond in en" (case-insensitive)
+	if re := regexp.MustCompile(`(?mi)^Always\s+respond\s+in[^\n\r]*$`); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	// Strip common summarization prompts injected by tools
+	if re := regexp.MustCompile(`(?mi)^Summarize\s+the\s+conversation\s+so\s+far.*$`); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	// Strip tool-enforcement and system automation lines
+	if re := regexp.MustCompile(`(?mi)^\[ERROR\][^\n\r]*$`); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	if re := regexp.MustCompile(`(?mi)^(#\s*Reminder:)?\s*Instructions\s*for\s*Tool\s*Use.*$`); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	if re := regexp.MustCompile(`(?mi)Tool\s+uses\s+are\s+formatted\s+using\s+XML-style\s+tags`); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	if re := regexp.MustCompile(`(?mi)^Next\s+Steps\s*$`); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	if re := regexp.MustCompile(`(?mi)This\s+is\s+an\s+automated\s+message`); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	if re := regexp.MustCompile(`(?mi)Always\s+use\s+the\s+actual\s+tool\s+name\s+as\s+the\s+XML\s+tag\s+name`); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
+	if re := regexp.MustCompile(`(?mi)use\s+the\s+attempt_completion\s+tool|use\s+the\s+ask_followup_question\s+tool`); re != nil {
+		s = re.ReplaceAllString(s, "")
+	}
 	return strings.TrimSpace(s)
 }
 
-func buildPrompt(tpl string, user string, labels []string) string {
+func buildPrompt(tpl string, history string, current string) string {
+	// When promptTemplate is not provided, always use the defaultPromptTemplate.
 	if strings.TrimSpace(tpl) == "" {
-		// Build default template with dynamic labels if provided
-		if len(labels) == 0 {
-			tpl = defaultPromptTemplate
-		} else {
-			var b strings.Builder
-			b.WriteString("You are a highly-specialized classification expert. Your ONLY purpose is to classify a user's development request into one of labels based on the definitions below.\n\n")
-			b.WriteString("Here are the definitions for each label:\n\n")
-			// No per-label definition text here; users can still override via promptTemplate
-			// Just list labels and instruct to reply one only
-			b.WriteString("Labels: ")
-			for i, s := range labels {
-				if i > 0 {
-					b.WriteString(", ")
-				}
-				b.WriteString(s)
+		tpl = defaultPromptTemplate
+	}
+	// New template style only (no backward compatibility)
+	tpl = strings.ReplaceAll(tpl, "{HISTORY}", history)
+	tpl = strings.ReplaceAll(tpl, "{CURRENT}", current)
+	return tpl
+}
+
+// extractHistoryAndCurrent 将消息划分为 History 与 Current 两部分：
+// - Current：最后一条 role=user 的消息（优先取 <task>/<feedback>/<answer>，否则清洗）
+// - History：其余的 role=user 消息（从旧到新连接），同样优先显式标签并清洗
+// - 应用 stripCodeFences 与字节截断；History 受 maxHistoryBytes 限制，Current 受 maxBytes 限制
+func extractHistoryAndCurrent(body []byte, ie InputExtractionConfig, maxBytes int) (string, string) {
+	if ie.protocol != "openai" {
+		// 对非 openai 协议，沿用旧逻辑，全部算作 current
+		cur := extractUserInput(body, ie, maxBytes)
+		return "", cur
+	}
+	msgs := gjson.GetBytes(body, "messages").Array()
+	if len(msgs) == 0 {
+		cur := extractUserInput(body, ie, maxBytes)
+		return "", cur
+	}
+
+	// NOTE: tool-generated content detection is unused when only explicit tags are accepted
+
+	extractExplicit := func(s string) (string, bool) {
+		if re := regexp.MustCompile(`(?s)<task>\n?\s*(.*?)\s*\n?</task>`); re != nil {
+			if m := re.FindStringSubmatch(s); len(m) >= 2 {
+				return strings.TrimSpace(m[1]), true
 			}
-			b.WriteString(".\n\nInstructions: respond with ONE label only. No explanations.\n\nUser Request: {USER_INPUT}")
-			tpl = b.String()
+		}
+		if re := regexp.MustCompile(`(?s)<user_message>\n?\s*(.*?)\s*\n?</user_message>`); re != nil {
+			if m := re.FindStringSubmatch(s); len(m) >= 2 {
+				return strings.TrimSpace(m[1]), true
+			}
+		}
+		if re := regexp.MustCompile(`(?s)<answer>\n?\s*(.*?)\s*\n?</answer>`); re != nil {
+			if m := re.FindStringSubmatch(s); len(m) >= 2 {
+				return strings.TrimSpace(m[1]), true
+			}
+		}
+		if re := regexp.MustCompile(`(?s)<feedback>\n?\s*(.*?)\s*\n?</feedback>`); re != nil {
+			if m := re.FindStringSubmatch(s); len(m) >= 2 {
+				fs := strings.TrimSpace(m[1])
+				if re2 := regexp.MustCompile(`^@/?\s*`); re2 != nil {
+					fs = re2.ReplaceAllString(fs, "")
+				}
+				return strings.TrimSpace(fs), true
+			}
+		}
+		return "", false
+	}
+
+	// 收集所有 user 消息索引
+	userIdx := make([]int, 0, len(msgs))
+	for i := 0; i < len(msgs); i++ {
+		if msgs[i].Get("role").String() == "user" {
+			userIdx = append(userIdx, i)
 		}
 	}
-	return strings.ReplaceAll(tpl, "{USER_INPUT}", user)
+	if len(userIdx) == 0 {
+		return "", ""
+	}
+	curIdx := userIdx[len(userIdx)-1]
+
+	// 处理 current
+	getRaw := func(c gjson.Result) string {
+		if !c.Exists() {
+			return ""
+		}
+		if c.IsArray() {
+			var b strings.Builder
+			for _, p := range c.Array() {
+				s := p.Get("text").String()
+				if s == "" {
+					s = p.String()
+				}
+				if s != "" {
+					b.WriteString(s)
+					b.WriteString("\n")
+				}
+			}
+			return strings.TrimSpace(b.String())
+		}
+		return c.String()
+	}
+
+	curRaw := getRaw(msgs[curIdx].Get("content"))
+	var cur string
+	if v, ok := extractExplicit(curRaw); ok && strings.TrimSpace(v) != "" {
+		cur = strings.TrimSpace(v)
+	}
+	// 若最后一条 user 消息无有效内容，回退寻找上一条有效的用户输入作为 Current
+	chosenCurIdx := curIdx
+	if strings.TrimSpace(cur) == "" {
+		for i := len(userIdx) - 2; i >= 0; i-- {
+			idx := userIdx[i]
+			raw := getRaw(msgs[idx].Get("content"))
+			if v, ok := extractExplicit(raw); ok && strings.TrimSpace(v) != "" {
+				cur = strings.TrimSpace(v)
+				chosenCurIdx = idx
+				break
+			}
+		}
+	}
+	if ie.stripCodeFences {
+		pattern := ie.codeFenceRegex
+		if pattern == "" {
+			pattern = "(?s)```{3,4}[\\s\\S]*?```{3,4}"
+		}
+		if re, err := regexp.Compile(pattern); err == nil {
+			cur = re.ReplaceAllString(cur, "")
+		}
+	}
+	if maxBytes > 0 && len([]byte(cur)) > maxBytes {
+		bs := []byte(cur)
+		if maxBytes < len(bs) {
+			bs = bs[:maxBytes]
+		}
+		cur = string(bs)
+	}
+
+	// 处理 history（除去 current 的其他 user 消息，仅提取显式标签）
+	parts := make([]string, 0)
+	if ie.maxUserMessages > 0 && len(userIdx) > ie.maxUserMessages {
+		userIdx = userIdx[len(userIdx)-ie.maxUserMessages:]
+	}
+	for _, idx := range userIdx {
+		// History 仅包含早于 Current 的用户消息
+		if idx >= chosenCurIdx {
+			continue
+		}
+		c := msgs[idx].Get("content")
+		raw := getRaw(c)
+		if v, ok := extractExplicit(raw); ok && strings.TrimSpace(v) != "" {
+			parts = append(parts, v)
+			continue
+		}
+	}
+	var history string
+	if len(parts) > 0 {
+		sep := ie.userJoinSep
+		if sep == "" {
+			sep = "\n\n"
+		}
+		history = strings.Join(parts, sep)
+	}
+	if ie.stripCodeFences {
+		pattern := ie.codeFenceRegex
+		if pattern == "" {
+			pattern = "(?s)```{3,4}[\\s\\S]*?```{3,4}"
+		}
+		if re, err := regexp.Compile(pattern); err == nil {
+			history = re.ReplaceAllString(history, "")
+		}
+	}
+	// History 字节限制优先生效
+	effectiveHistoryLimit := ie.maxHistoryBytes
+	if effectiveHistoryLimit > 0 && len([]byte(history)) > effectiveHistoryLimit {
+		bs := []byte(history)
+		if effectiveHistoryLimit < len(bs) {
+			bs = bs[:effectiveHistoryLimit]
+		}
+		history = string(bs)
+	}
+
+	return history, cur
 }
 
 // indexOf returns the first index of needle in haystack, or -1 if not found.
@@ -1160,13 +1615,13 @@ func continueAnalyzerFlowWithRouting(ctx wrapper.HttpContext, s *SemanticStrateg
 		_ = proxywasm.ResumeHttpRequest()
 		return
 	}
-	userText := extractUserInput(body, s.inputExtraction, s.analyzer.maxInputBytes)
-	if strings.TrimSpace(userText) == "" {
+	historyText, currentText := extractHistoryAndCurrent(body, s.inputExtraction, s.analyzer.maxInputBytes)
+	if strings.TrimSpace(currentText) == "" {
 		logs.Debugf("[ai-llm-router] empty user text after extraction, skip routing")
 		_ = proxywasm.ResumeHttpRequest()
 		return
 	}
-	prompt := buildPrompt(s.analyzer.promptTemplate, userText, s.analyzer.analysisLabels)
+	prompt := buildPrompt(s.analyzer.promptTemplate, historyText, currentText)
 	reqBody, _ := json.Marshal(map[string]interface{}{
 		"model":    s.analyzer.model,
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
