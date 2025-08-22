@@ -546,7 +546,10 @@ func (s *SemanticStrategy) OnResponseHeaders(ctx wrapper.HttpContext) types.Acti
 	}
 	if v := ctx.GetContext("currentUserInput"); v != nil {
 		if cur, _ := v.(string); strings.TrimSpace(cur) != "" {
-			_ = proxywasm.ReplaceHttpResponseHeader("x-user-input", cur)
+			safe := sanitizeHeaderValue(cur)
+			if safe != "" {
+				_ = proxywasm.ReplaceHttpResponseHeader("x-user-input", safe)
+			}
 		}
 	}
 	return types.ActionContinue
@@ -1001,6 +1004,29 @@ func cleanUserText(text string) string {
 	}, s)
 	// 3) 去首尾空白
 	return strings.TrimSpace(s)
+}
+
+// sanitizeHeaderValue removes CR/LF and control characters from header values and trims length.
+// This prevents HTTP/1.x header injection/breakages when echoing user inputs in headers.
+func sanitizeHeaderValue(val string) string {
+	if strings.TrimSpace(val) == "" {
+		return ""
+	}
+	// remove CR/LF and other CTLs
+	runes := make([]rune, 0, len(val))
+	for _, r := range val {
+		if r == '\r' || r == '\n' || r == 0x7f || r < 0x20 {
+			continue
+		}
+		runes = append(runes, r)
+	}
+	out := strings.TrimSpace(string(runes))
+	// limit length to avoid very long headers
+	const maxLen = 128
+	if len(out) > maxLen {
+		out = out[:maxLen]
+	}
+	return out
 }
 
 func buildPrompt(tpl string, history string, current string) string {
