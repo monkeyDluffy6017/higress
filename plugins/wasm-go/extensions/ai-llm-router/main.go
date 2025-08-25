@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -547,8 +548,9 @@ func (s *SemanticStrategy) OnResponseHeaders(ctx wrapper.HttpContext) types.Acti
 	if v := ctx.GetContext("currentUserInput"); v != nil {
 		if cur, _ := v.(string); strings.TrimSpace(cur) != "" {
 			safe := sanitizeHeaderValue(cur)
-			if safe != "" {
-				_ = proxywasm.ReplaceHttpResponseHeader("x-user-input", safe)
+			encodedCur := url.QueryEscape(safe)
+			if encodedCur != "" {
+				_ = proxywasm.ReplaceHttpResponseHeader("x-user-input", encodedCur)
 			}
 		}
 	}
