@@ -1088,120 +1088,109 @@ func extractHistoryAndCurrent(body []byte, ie InputExtractionConfig, maxBytes in
 		return "", false
 	}
 
-	// 收集所有 user 消息索引
-	userIdx := make([]int, 0, len(msgs))
-	for i := 0; i < len(msgs); i++ {
-		if msgs[i].Get("role").String() == "user" {
-			userIdx = append(userIdx, i)
-		}
-	}
-	if len(userIdx) == 0 {
-		return "", ""
-	}
-	curIdx := userIdx[len(userIdx)-1]
-
-	// 处理 current
-	getRaw := func(c gjson.Result) string {
-		if !c.Exists() {
-			return ""
-		}
-		if c.IsArray() {
-			var b strings.Builder
-			for _, p := range c.Array() {
-				s := p.Get("text").String()
-				if s == "" {
-					s = p.String()
+	// Unified scan: 从最新到最旧扫描；优先选择首先出现的 assistant 或含有显式标签的 user 作为 current
+	// 其余较旧的（assistant 与含显式标签的 user）作为 history；assistant 不需要通过标签过滤
+	{
+		getRawUnified := func(c gjson.Result) string {
+			if !c.Exists() {
+				return ""
+			}
+			if c.IsArray() {
+				var b strings.Builder
+				for _, p := range c.Array() {
+					s := p.Get("text").String()
+					if s == "" {
+						s = p.String()
+					}
+					if s != "" {
+						b.WriteString(s)
+						b.WriteString("\n")
+					}
 				}
-				if s != "" {
-					b.WriteString(s)
-					b.WriteString("\n")
+				return strings.TrimSpace(b.String())
+			}
+			return c.String()
+		}
+
+		var cur string
+		found := false
+		histParts := make([]string, 0)
+		for i := len(msgs) - 1; i >= 0; i-- {
+			role := msgs[i].Get("role").String()
+			raw := getRawUnified(msgs[i].Get("content"))
+			if strings.TrimSpace(raw) == "" {
+				continue
+			}
+			if !found {
+				if role == "assistant" {
+					cur = raw
+					found = true
+					continue
+				}
+				if role == "user" {
+					if v, ok := extractExplicit(raw); ok && strings.TrimSpace(v) != "" {
+						cur = strings.TrimSpace(v)
+						found = true
+						continue
+					}
+				}
+				continue
+			}
+			// After current found, collect older assistant or tagged user into history
+			if role == "assistant" {
+				histParts = append(histParts, raw)
+				continue
+			}
+			if role == "user" {
+				if v, ok := extractExplicit(raw); ok && strings.TrimSpace(v) != "" {
+					histParts = append(histParts, v)
 				}
 			}
-			return strings.TrimSpace(b.String())
 		}
-		return c.String()
-	}
 
-	curRaw := getRaw(msgs[curIdx].Get("content"))
-	var cur string
-	if v, ok := extractExplicit(curRaw); ok && strings.TrimSpace(v) != "" {
-		cur = strings.TrimSpace(v)
-	}
-	// 若最后一条 user 消息无有效内容，回退寻找上一条有效的用户输入作为 Current
-	chosenCurIdx := curIdx
-	if strings.TrimSpace(cur) == "" {
-		for i := len(userIdx) - 2; i >= 0; i-- {
-			idx := userIdx[i]
-			raw := getRaw(msgs[idx].Get("content"))
-			if v, ok := extractExplicit(raw); ok && strings.TrimSpace(v) != "" {
-				cur = strings.TrimSpace(v)
-				chosenCurIdx = idx
-				break
-			}
+		if !found {
+			return "", ""
 		}
-	}
-	if ie.stripCodeFences {
-		pattern := ie.codeFenceRegex
-		if pattern == "" {
-			pattern = "(?s)```{3,4}[\\s\\S]*?```{3,4}"
-		}
-		if re, err := regexp.Compile(pattern); err == nil {
-			cur = re.ReplaceAllString(cur, "")
-		}
-	}
-	if maxBytes > 0 && len([]byte(cur)) > maxBytes {
-		bs := []byte(cur)
-		if maxBytes < len(bs) {
-			bs = bs[:maxBytes]
-		}
-		cur = string(bs)
-	}
 
-	// 处理 history（除去 current 的其他 user 消息，仅提取显式标签）
-	parts := make([]string, 0)
-	if ie.maxUserMessages > 0 && len(userIdx) > ie.maxUserMessages {
-		userIdx = userIdx[len(userIdx)-ie.maxUserMessages:]
-	}
-	for _, idx := range userIdx {
-		// History 仅包含早于 Current 的用户消息
-		if idx >= chosenCurIdx {
-			continue
+		// Reverse history parts to be from older -> newer
+		for i, j := 0, len(histParts)-1; i < j; i, j = i+1, j-1 {
+			histParts[i], histParts[j] = histParts[j], histParts[i]
 		}
-		c := msgs[idx].Get("content")
-		raw := getRaw(c)
-		if v, ok := extractExplicit(raw); ok && strings.TrimSpace(v) != "" {
-			parts = append(parts, v)
-			continue
-		}
-	}
-	var history string
-	if len(parts) > 0 {
 		sep := ie.userJoinSep
 		if sep == "" {
 			sep = "\n\n"
 		}
-		history = strings.Join(parts, sep)
-	}
-	if ie.stripCodeFences {
-		pattern := ie.codeFenceRegex
-		if pattern == "" {
-			pattern = "(?s)```{3,4}[\\s\\S]*?```{3,4}"
-		}
-		if re, err := regexp.Compile(pattern); err == nil {
-			history = re.ReplaceAllString(history, "")
-		}
-	}
-	// History 字节限制优先生效
-	effectiveHistoryLimit := ie.maxHistoryBytes
-	if effectiveHistoryLimit > 0 && len([]byte(history)) > effectiveHistoryLimit {
-		bs := []byte(history)
-		if effectiveHistoryLimit < len(bs) {
-			bs = bs[:effectiveHistoryLimit]
-		}
-		history = string(bs)
-	}
+		history := strings.Join(histParts, sep)
 
-	return history, cur
+		if ie.stripCodeFences {
+			pattern := ie.codeFenceRegex
+			if pattern == "" {
+				pattern = "(?s)```{3,4}[\\s\\S]*?```{3,4}"
+			}
+			if re, err := regexp.Compile(pattern); err == nil {
+				history = re.ReplaceAllString(history, "")
+				cur = re.ReplaceAllString(cur, "")
+			}
+		}
+		if maxBytes > 0 && len([]byte(cur)) > maxBytes {
+			bs := []byte(cur)
+			if maxBytes < len(bs) {
+				bs = bs[:maxBytes]
+			}
+			cur = string(bs)
+		}
+		// History byte limit applies
+		effectiveHistoryLimit := ie.maxHistoryBytes
+		if effectiveHistoryLimit > 0 && len([]byte(history)) > effectiveHistoryLimit {
+			bs := []byte(history)
+			if effectiveHistoryLimit < len(bs) {
+				bs = bs[:effectiveHistoryLimit]
+			}
+			history = string(bs)
+		}
+
+		return history, cur
+	}
 }
 
 // indexOf returns the first index of needle in haystack, or -1 if not found.
