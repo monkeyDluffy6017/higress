@@ -1,9 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -548,7 +548,7 @@ func (s *SemanticStrategy) OnResponseHeaders(ctx wrapper.HttpContext) types.Acti
 	if v := ctx.GetContext("currentUserInput"); v != nil {
 		if cur, _ := v.(string); strings.TrimSpace(cur) != "" {
 			safe := sanitizeHeaderValue(cur)
-			encodedCur := url.QueryEscape(safe)
+			encodedCur := base64.StdEncoding.EncodeToString([]byte(safe))
 			if encodedCur != "" {
 				_ = proxywasm.ReplaceHttpResponseHeader("x-user-input", encodedCur)
 			}
