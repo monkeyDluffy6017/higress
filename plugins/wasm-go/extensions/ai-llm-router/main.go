@@ -8,11 +8,10 @@ import (
 	"strings"
 	"time"
 
-	logs "github.com/higress-group/wasm-go/pkg/log"
-	"github.com/higress-group/wasm-go/pkg/wrapper"
-
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
+	"github.com/higress-group/wasm-go/pkg/log"
+	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/resp"
 
@@ -26,9 +25,9 @@ func init() {
 		// 插件名称
 		"ai-llm-router",
 		// 为解析插件配置，设置自定义函数
-		wrapper.ParseConfigBy(parseConfig),
+		wrapper.ParseConfig(parseConfig),
 		// 为处理请求头，设置自定义函数
-		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
+		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		// wrapper.ProcessStreamingResponseBody(onHttpStreamingResponseBody),
@@ -66,8 +65,8 @@ Instructions:
 // Strategy 定义了路由策略的统一接口
 type Strategy interface {
 	Name() string
-	Parse(j gjson.Result, log logs.Log) error
-	OnRequestHeaders(ctx wrapper.HttpContext, log logs.Log) types.Action
+	Parse(j gjson.Result) error
+	OnRequestHeaders(ctx wrapper.HttpContext) types.Action
 	OnRequestBody(ctx wrapper.HttpContext, body []byte) types.Action
 	OnResponseHeaders(ctx wrapper.HttpContext) types.Action
 	OnResponseBody(ctx wrapper.HttpContext, body []byte) types.Action
@@ -159,7 +158,7 @@ type SemanticStrategy struct {
 
 func (s *SemanticStrategy) Name() string { return "semantic" }
 
-func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
+func (s *SemanticStrategy) Parse(j gjson.Result) error {
 	// analyzer
 	s.analyzer.enabled = j.Get("analyzer.enabled").Bool()
 	if !j.Get("analyzer.enabled").Exists() {
@@ -253,7 +252,7 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 	if s.analyzer.totalTimeoutMs == 0 {
 		s.analyzer.totalTimeoutMs = 10000
 	}
-	log.Infof("[ai-llm-router] analyzer.enabled=%v model=%s timeoutMs=%d totalTimeoutMs=%d maxInputBytes=%d protocol=%s domain=%s port=%d path=%s",
+	log.Infof("analyzer.enabled=%v model=%s timeoutMs=%d totalTimeoutMs=%d maxInputBytes=%d protocol=%s domain=%s port=%d path=%s",
 		s.analyzer.enabled, s.analyzer.model, s.analyzer.timeoutMs, s.analyzer.totalTimeoutMs, s.analyzer.maxInputBytes, s.analyzer.protocol, s.analyzer.domain, s.analyzer.port, s.analyzer.path)
 
 	// input extraction
@@ -311,7 +310,7 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 			s.routing.candidates = append(s.routing.candidates, c)
 		}
 	}
-	logs.Infof("[ai-llm-router] routing candidates=%d providerIdHeader=%s fallback=%s minScore=%d",
+	log.Infof("routing candidates=%d providerIdHeader=%s fallback=%s minScore=%d",
 		len(s.routing.candidates), s.routing.providerIdHeader, s.routing.fallbackProviderId, s.routing.minScore)
 
 	// rule engine
@@ -324,7 +323,7 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 			if err := json.Unmarshal([]byte(it.Raw), &r); err == nil {
 				s.ruleEngine.inlineRules = append(s.ruleEngine.inlineRules, r)
 			} else {
-				log.Warnf("[ai-llm-router] invalid inline rule: %v", err)
+				log.Warnf("invalid inline rule: %v", err)
 			}
 		}
 	}
@@ -364,17 +363,17 @@ func (s *SemanticStrategy) Parse(j gjson.Result, log logs.Log) error {
 				Port: int64(s.analyzer.redisServicePort),
 			})
 			_ = s.analyzer.redisClient.Init(s.analyzer.redisUsername, s.analyzer.redisPassword, int64(s.analyzer.redisTimeoutMs), wrapper.WithDataBase(s.analyzer.redisDatabase))
-			log.Infof("[ai-llm-router] dynamic metrics redis ready: service=%s port=%d prefix=%s", s.analyzer.redisServiceName, s.analyzer.redisServicePort, s.analyzer.dynamicMetricsPrefix)
+			log.Infof("dynamic metrics redis ready: service=%s port=%d prefix=%s", s.analyzer.redisServiceName, s.analyzer.redisServicePort, s.analyzer.dynamicMetricsPrefix)
 		} else {
-			log.Warnf("[ai-llm-router] dynamicMetrics.redisPrefix is set but serviceName is empty; dynamic metrics disabled")
+			log.Warnf("dynamicMetrics.redisPrefix is set but serviceName is empty; dynamic metrics disabled")
 		}
 	}
-	log.Infof("[ai-llm-router] ruleEngine.enabled=%v inlineRules=%d",
+	log.Infof("ruleEngine.enabled=%v inlineRules=%d",
 		s.ruleEngine.enabled, len(s.ruleEngine.inlineRules))
 	return nil
 }
 
-func (s *SemanticStrategy) OnRequestHeaders(ctx wrapper.HttpContext, log logs.Log) types.Action {
+func (s *SemanticStrategy) OnRequestHeaders(ctx wrapper.HttpContext) types.Action {
 	// 读取请求体进行语义分析
 	ctx.DisableReroute()
 	ctx.SetRequestBodyBufferLimit(1024 * 1024)
@@ -399,12 +398,12 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 						}
 						if b, ok := overrideRequestModelInBody(body, effModel); ok {
 							_ = proxywasm.ReplaceHttpRequestBody(b)
-							logs.Debugf("[ai-llm-router] override request model to fallback provider=%s model=%s", s.routing.fallbackProviderId, effModel)
+							log.Debugf("override request model to fallback provider=%s model=%s", s.routing.fallbackProviderId, effModel)
 						}
 						ctx.SetContext("selectedProviderId", s.routing.fallbackProviderId)
-						logs.Infof("[ai-llm-router] no qualified models, use fallback provider=%s", s.routing.fallbackProviderId)
+						log.Infof("no qualified models, use fallback provider=%s", s.routing.fallbackProviderId)
 					} else {
-						logs.Infof("[ai-llm-router] no qualified models and no fallback, pass through")
+						log.Infof("no qualified models and no fallback, pass through")
 					}
 					_ = proxywasm.ResumeHttpRequest()
 					return
@@ -416,7 +415,7 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 			return types.ActionPause
 		}
 		if qms, err := runRuleEngine(ctx, s.ruleEngine, body, nil, nil); err != nil {
-			logs.Warnf("[ai-llm-router] rule engine evaluate error: %v", err)
+			log.Warnf("rule engine evaluate error: %v", err)
 		} else {
 			// 允许 qms 为空：表示没有合格模型
 			prefiltered = qms
@@ -430,12 +429,12 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 					}
 					if b, ok := overrideRequestModelInBody(body, effModel); ok {
 						_ = proxywasm.ReplaceHttpRequestBody(b)
-						logs.Debugf("[ai-llm-router] override request model to fallback provider=%s model=%s", s.routing.fallbackProviderId, effModel)
+						log.Debugf("override request model to fallback provider=%s model=%s", s.routing.fallbackProviderId, effModel)
 					}
 					ctx.SetContext("selectedProviderId", s.routing.fallbackProviderId)
-					logs.Infof("[ai-llm-router] no qualified models, use fallback provider=%s", s.routing.fallbackProviderId)
+					log.Infof("no qualified models, use fallback provider=%s", s.routing.fallbackProviderId)
 				} else {
-					logs.Infof("[ai-llm-router] no qualified models and no fallback, pass through")
+					log.Infof("no qualified models and no fallback, pass through")
 				}
 				return types.ActionContinue
 			}
@@ -443,16 +442,16 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 	}
 
 	if !s.analyzer.enabled || s.analyzer.client == nil || s.analyzer.path == "" || s.analyzer.apiToken == "" || s.analyzer.model == "" {
-		logs.Debugf("[ai-llm-router] analyzer disabled or not configured, skip routing")
+		log.Debugf("analyzer disabled or not configured, skip routing")
 		return types.ActionContinue
 	}
 	historyText, currentText := extractHistoryAndCurrent(body, s.inputExtraction, s.analyzer.maxInputBytes)
 	if strings.TrimSpace(currentText) == "" {
-		logs.Debugf("[ai-llm-router] empty user text after extraction, skip routing")
+		log.Debugf("empty user text after extraction, skip routing")
 		return types.ActionContinue
 	}
-	logs.Debugf("[ai-llm-router] extracted (history bytes=%d, current bytes=%d) protocol=%s", len([]byte(historyText)), len([]byte(currentText)), s.inputExtraction.protocol)
-	logs.Debugf("[ai-llm-router] extracted current content: %s", currentText)
+	log.Debugf("extracted (history bytes=%d, current bytes=%d) protocol=%s", len([]byte(historyText)), len([]byte(currentText)), s.inputExtraction.protocol)
+	log.Debugf("extracted current content: %s", currentText)
 	// 保存当前轮用户输入，供响应头返回
 	ctx.SetContext("currentUserInput", currentText)
 
@@ -462,7 +461,7 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
 	})
 	headers := [][2]string{{"Content-Type", "application/json"}, {"Authorization", "Bearer " + s.analyzer.apiToken}}
-	logs.Debugf("[ai-llm-router] analyzer request: host=%s port=%d path=%s body=%s", s.analyzer.domain, s.analyzer.port, s.analyzer.path, string(reqBody))
+	log.Debugf("analyzer request: host=%s port=%d path=%s body=%s", s.analyzer.domain, s.analyzer.port, s.analyzer.path, string(reqBody))
 
 	maxRetries := 3
 	deadline := time.Now().Add(time.Duration(s.analyzer.totalTimeoutMs) * time.Millisecond)
@@ -476,10 +475,10 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 
 	var send func()
 	send = func() {
-		logs.Debugf("[ai-llm-router] analyzer httpcall: timeoutMs=%d", s.analyzer.timeoutMs)
+		log.Debugf("analyzer httpcall: timeoutMs=%d", s.analyzer.timeoutMs)
 		remaining := time.Until(deadline) / time.Millisecond
 		if remaining <= 0 {
-			logs.Warnf("[ai-llm-router] analyzer deadline reached, stop retrying")
+			log.Warnf("analyzer deadline reached, stop retrying")
 			_ = proxywasm.ResumeHttpRequest()
 			return
 		}
@@ -487,16 +486,16 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 		if callTimeout == 0 || int64(callTimeout) > int64(remaining) {
 			callTimeout = uint32(remaining)
 		}
-		logs.Debugf("[ai-llm-router] analyzer attempt=%d timeoutMs=%d remainingMs=%d path=%s", attempt+1, callTimeout, remaining, s.analyzer.path)
+		log.Debugf("analyzer attempt=%d timeoutMs=%d remainingMs=%d path=%s", attempt+1, callTimeout, remaining, s.analyzer.path)
 		err := s.analyzer.client.Post(
 			s.analyzer.path,
 			headers,
 			reqBody,
 			func(statusCode int, responseHeaders http.Header, responseBody []byte) {
-				logs.Debugf("[ai-llm-router] analyzer response: status=%d body=%s", statusCode, string(responseBody))
+				log.Debugf("analyzer response: status=%d body=%s", statusCode, string(responseBody))
 				label := classifyLabel(statusCode, responseBody, s.analyzer.labelRegex, s.analyzer.analysisLabels)
 				if label != "" {
-					logs.Infof("[ai-llm-router] analyzer classified label=%s", label)
+					log.Infof("analyzer classified label=%s", label)
 					// 第二阶段策略：基于候选模型（若有规则引擎预筛选）选择 provider
 					selected := selectProvider(label, routingUsed)
 					if selected != "" {
@@ -508,27 +507,27 @@ func (s *SemanticStrategy) OnRequestBody(ctx wrapper.HttpContext, body []byte) t
 						}
 						if b, ok := overrideRequestModelInBody(body, effModel); ok {
 							_ = proxywasm.ReplaceHttpRequestBody(b)
-							logs.Debugf("[ai-llm-router] override request model to provider=%s model=%s", selected, effModel)
+							log.Debugf("override request model to provider=%s model=%s", selected, effModel)
 						}
 						ctx.SetContext("selectedProviderId", selected)
-						logs.Infof("[ai-llm-router] selected provider=%s", selected)
+						log.Infof("selected provider=%s", selected)
 					}
 					_ = proxywasm.ResumeHttpRequest()
 					return
 				}
 				if attempt < maxRetries && time.Until(deadline) > 0 {
-					logs.Warnf("[ai-llm-router] analyzer classify failed (status=%d), retrying... attempt=%d", statusCode, attempt+2)
+					log.Warnf("analyzer classify failed (status=%d), retrying... attempt=%d", statusCode, attempt+2)
 					attempt++
 					send()
 					return
 				}
-				logs.Warnf("[ai-llm-router] analyzer classify failed and no more retries, status=%d", statusCode)
+				log.Warnf("analyzer classify failed and no more retries, status=%d", statusCode)
 				_ = proxywasm.ResumeHttpRequest()
 			},
 			callTimeout,
 		)
 		if err != nil {
-			logs.Warnf("[ai-llm-router] analyzer http error: %v, path=%s host=%s port=%d", err, s.analyzer.path, s.analyzer.domain, s.analyzer.port)
+			log.Warnf("analyzer http error: %v, path=%s host=%s port=%d", err, s.analyzer.path, s.analyzer.domain, s.analyzer.port)
 			_ = proxywasm.ResumeHttpRequest()
 			return
 		}
@@ -542,7 +541,6 @@ func (s *SemanticStrategy) OnResponseHeaders(ctx wrapper.HttpContext) types.Acti
 	if v := ctx.GetContext("selectedProviderId"); v != nil {
 		if id, _ := v.(string); id != "" {
 			_ = proxywasm.ReplaceHttpResponseHeader("x-select-llm", id)
-			logs.Debugf("[ai-llm-router] response header x-select-llm=%s", id)
 		}
 	}
 	if v := ctx.GetContext("currentUserInput"); v != nil {
@@ -570,7 +568,7 @@ func (s *SemanticStrategy) OnResponseBody(ctx wrapper.HttpContext, body []byte) 
 //	  analyzer: {...}
 //	  inputExtraction: {...}
 //	  routing: {...}
-func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
+func parseConfig(j gjson.Result, config *Config) error {
 	st := strings.TrimSpace(j.Get("strategy.type").String())
 	if st == "" {
 		st = "semantic"
@@ -580,23 +578,23 @@ func parseConfig(j gjson.Result, config *Config, log logs.Log) error {
 	switch st {
 	case "semantic":
 		s := &SemanticStrategy{}
-		if err := s.Parse(j.Get("strategy.semantic"), log); err != nil {
+		if err := s.Parse(j.Get("strategy.semantic")); err != nil {
 			return err
 		}
 		config.strategy = s
-		log.Infof("[ai-llm-router] strategy=%s ready", s.Name())
+		log.Infof("strategy=%s ready", s.Name())
 	default:
-		log.Warnf("[ai-llm-router] unknown strategy type: %s", st)
+		log.Warnf("unknown strategy type: %s", st)
 		config.strategy = nil
 	}
 	return nil
 }
 
-func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config, log logs.Log) types.Action {
+func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 	if config.strategy == nil {
 		return types.ActionContinue
 	}
-	return config.strategy.OnRequestHeaders(ctx, log)
+	return config.strategy.OnRequestHeaders(ctx)
 }
 
 func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) types.Action {
@@ -1570,13 +1568,13 @@ func setNestedRequestContext(rc ruleengine.RequestContext, keys []string, value 
 // continueAnalyzerFlow continues analyzer flow after async rule engine completes
 func continueAnalyzerFlowWithRouting(ctx wrapper.HttpContext, s *SemanticStrategy, body []byte, prouting *RoutingConfig) {
 	if !s.analyzer.enabled || s.analyzer.client == nil || s.analyzer.path == "" || s.analyzer.apiToken == "" || s.analyzer.model == "" {
-		logs.Debugf("[ai-llm-router] analyzer disabled or not configured, skip routing")
+		log.Debugf("analyzer disabled or not configured, skip routing")
 		_ = proxywasm.ResumeHttpRequest()
 		return
 	}
 	historyText, currentText := extractHistoryAndCurrent(body, s.inputExtraction, s.analyzer.maxInputBytes)
 	if strings.TrimSpace(currentText) == "" {
-		logs.Debugf("[ai-llm-router] empty user text after extraction, skip routing")
+		log.Debugf("empty user text after extraction, skip routing")
 		_ = proxywasm.ResumeHttpRequest()
 		return
 	}

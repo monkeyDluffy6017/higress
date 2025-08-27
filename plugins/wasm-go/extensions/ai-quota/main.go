@@ -150,7 +150,7 @@ func main() {
 		wrapper.ParseConfigBy(parseConfig),
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
-		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
+		wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBodyBy(onHttpStreamingResponseBody),
 	)
 }
@@ -1677,63 +1677,63 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 }
 
 // onHttpResponseHeaders finalizes quota deduction based on upstream HTTP status code
-func onHttpResponseHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Action {
+func onHttpResponseHeaders(ctx wrapper.HttpContext, config QuotaConfig, log wrapper.Log) types.Action {
 	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
 	if !ok || chatMode == ChatModeNone || chatMode == ChatModeAdmin {
-		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: invalid chatMode/admin. ok=%t chatMode=%v", ok, chatMode)
+		log.Debugf("[onHttpResponseHeaders] skip: invalid chatMode/admin. ok=%t chatMode=%v", ok, chatMode)
 		return types.ActionContinue
 	}
 
 	// Avoid duplicate finalization
 	if finalized, _ := ctx.GetContext("quota_finalized").(bool); finalized {
-		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: already finalized")
+		log.Debugf("[onHttpResponseHeaders] skip: already finalized")
 		return types.ActionContinue
 	}
 
 	statusStr, err := proxywasm.GetHttpResponseHeader(":status")
 	if err != nil || statusStr == "" {
-		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: missing :status header, err=%v", err)
+		log.Debugf("[onHttpResponseHeaders] skip: missing :status header, err=%v", err)
 		return types.ActionContinue
 	}
 	statusCode, err := strconv.Atoi(statusStr)
 	if err != nil {
-		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: invalid :status '%s': %v", statusStr, err)
+		log.Debugf("[onHttpResponseHeaders] skip: invalid :status '%s': %v", statusStr, err)
 		return types.ActionContinue
 	}
 
 	amountAny := ctx.GetContext("quota_deduct_amount")
 	if amountAny == nil {
-		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: no deduction intent (quota_deduct_amount is nil), status=%d", statusCode)
+		log.Debugf("[onHttpResponseHeaders] skip: no deduction intent (quota_deduct_amount is nil), status=%d", statusCode)
 		ctx.SetContext("quota_finalized", true)
 		return types.ActionContinue
 	}
 	quotaWeight, _ := amountAny.(float64)
 	if quotaWeight <= 0 {
-		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] skip: invalid quotaWeight %.6f", quotaWeight)
+		log.Debugf("[onHttpResponseHeaders] skip: invalid quotaWeight %.6f", quotaWeight)
 		ctx.SetContext("quota_finalized", true)
 		return types.ActionContinue
 	}
 
 	userId, _ := ctx.GetContext("userId").(string)
 	headerMatched, _ := ctx.GetContext("quota_header_matched").(bool)
-	proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] status=%d userId=%s quotaWeight=%.6f headerMatched=%t deductReqNum=%d", statusCode, userId, quotaWeight, headerMatched, config.QuotaManagement.DeductReqNum)
+	log.Debugf("[onHttpResponseHeaders] status=%d userId=%s quotaWeight=%.6f headerMatched=%t deductReqNum=%d", statusCode, userId, quotaWeight, headerMatched, config.QuotaManagement.DeductReqNum)
 
 	if statusCode >= 200 && statusCode < 300 {
 		usedKey := config.QuotaManagement.RedisUsedPrefix + userId
 		if headerMatched {
-			proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] 2xx + headerMatched, direct deduction. usedKey=%s amount=%.6f", usedKey, quotaWeight)
+			log.Debugf("[onHttpResponseHeaders] 2xx + headerMatched, direct deduction. usedKey=%s amount=%.6f", usedKey, quotaWeight)
 			// redis async callback is not allowed in onHttpResponseHeaders and onHttpStreamingResponseBody
 			_ = config.redisClient.IncrByFloat(usedKey, quotaWeight, nil)
 			// 当启用按次数通道时，命中 header 扣减需重置计数器
 			if config.QuotaManagement.DeductReqNum > 0 {
 				countKey := quotaReqCountPrefix + userId
-				proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] reset counter due to header match. countKey=%s", countKey)
+				log.Debugf("[onHttpResponseHeaders] reset counter due to header match. countKey=%s", countKey)
 				_ = config.redisClient.Set(countKey, 0, nil)
 			}
 		} else if config.QuotaManagement.DeductReqNum > 0 {
 			countKey := quotaReqCountPrefix + userId
 			n := int64(config.QuotaManagement.DeductReqNum)
-			proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] 2xx + times mode, atomic incr and maybe deduct via Lua. countKey=%s usedKey=%s N=%d amount=%.6f", countKey, usedKey, n, quotaWeight)
+			log.Debugf("[onHttpResponseHeaders] 2xx + times mode, atomic incr and maybe deduct via Lua. countKey=%s usedKey=%s N=%d amount=%.6f", countKey, usedKey, n, quotaWeight)
 			// 使用 Lua 脚本原子地自增计数并在满足 N 的倍数时扣减配额
 			script := `
 			local count = redis.call('incr', KEYS[1])
@@ -1750,14 +1750,14 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Ac
 			args := []interface{}{n, quotaWeight}
 			_ = config.redisClient.Eval(script, 2, keys, args, nil)
 		} else {
-			proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] 2xx but neither header matched nor times mode enabled. no deduction.")
+			log.Debugf("[onHttpResponseHeaders] 2xx but neither header matched nor times mode enabled. no deduction.")
 		}
 	} else {
-		proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] non-2xx status, no deduction. status=%d", statusCode)
+		log.Debugf("[onHttpResponseHeaders] non-2xx status, no deduction. status=%d", statusCode)
 	}
 
 	ctx.SetContext("quota_finalized", true)
-	proxywasm.LogDebugf("[ai-quota][onHttpResponseHeaders] finalized quota for this request")
+	log.Debugf("[onHttpResponseHeaders] finalized quota for this request")
 	return types.ActionContinue
 }
 
