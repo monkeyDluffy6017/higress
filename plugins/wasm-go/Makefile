@@ -13,67 +13,63 @@ IMG ?= ${REGISTRY}${PLUGIN_NAME}:${IMAGE_TAG}
 GOPROXY := $(shell go env GOPROXY)
 
 # --- Conditional Build Logic ---
-# Check if the plugin name is 'ai-quota'
+# Set build variables based on the plugin name
 ifeq ($(PLUGIN_NAME), ai-quota)
-    # Use the original logic for the 'ai-quota' plugin
-    GO_VERSION ?= 1.20.14
+	# Use the original logic for the 'ai-quota' plugin
+	GO_VERSION ?= 1.20.14
 	DOCKERFILE ?= Dockerfile.tinygo
-    BUILDER ?= ${BUILDER_REGISTRY}wasm-go-builder:go${GO_VERSION}-tinygo${TINYGO_VERSION}-oras${ORAS_VERSION}
-    EXTRA_TAGS := $(shell [ -f extensions/${PLUGIN_NAME}/.buildrc ] && . extensions/${PLUGIN_NAME}/.buildrc && echo $$EXTRA_TAGS || echo "")
-
-.DEFAULT:
-build:
-	DOCKER_BUILDKIT=1 docker build -f ${DOCKERFILE} --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
-	                     --build-arg BUILDER=${BUILDER}  \
-	                     --build-arg GOPROXY=$(GOPROXY) \
-	                     --build-arg EXTRA_TAGS=${EXTRA_TAGS} \
-	                     -t ${IMG} \
-	                     --output extensions/${PLUGIN_NAME} \
-	                     .
-	@echo ""
-	@echo "output wasm file: extensions/${PLUGIN_NAME}/plugin.wasm"
-
-build-image:
-	DOCKER_BUILDKIT=1 docker build -f ${DOCKERFILE} --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
-	                     --build-arg BUILDER=${BUILDER}  \
-	                     --build-arg GOPROXY=$(GOPROXY) \
-	                     --build-arg EXTRA_TAGS=${EXTRA_TAGS} \
-	                     -t ${IMG} \
-	                     .
-	@echo ""
-	@echo "image:           ${IMG}"
-
+	BUILDER ?= ${BUILDER_REGISTRY}wasm-go-builder:go${GO_VERSION}-tinygo${TINYGO_VERSION}-oras${ORAS_VERSION}
+	EXTRA_TAGS := $(shell [ -f extensions/${PLUGIN_NAME}/.buildrc ] && . extensions/${PLUGIN_NAME}/.buildrc && echo $$EXTRA_TAGS || echo "")
 else
-    # Use the new logic for all other plugins
-    GO_VERSION ?= 1.24.4
+	# Use the new logic for all other plugins
+	GO_VERSION ?= 1.24.4
 	DOCKERFILE ?= Dockerfile.go
-    BUILDER ?= ${BUILDER_REGISTRY}wasm-go-builder:go${GO_VERSION}-oras${ORAS_VERSION}
-
-.DEFAULT:
-build:
-	DOCKER_BUILDKIT=1 docker build -f ${DOCKERFILE} --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
-	                     --build-arg BUILDER=${BUILDER}   \
-	                     --build-arg GOPROXY=$(GOPROXY) \
-	                     -t ${IMG} \
-	                     --output extensions/${PLUGIN_NAME} \
-	                     .
-	@echo ""
-	@echo "output wasm file: extensions/${PLUGIN_NAME}/plugin.wasm"
-
-build-image:
-	DOCKER_BUILDKIT=1 docker build -f ${DOCKERFILE} --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
-	                     --build-arg BUILDER=${BUILDER}   \
-	                     --build-arg GOPROXY=$(GOPROXY) \
-	                     -t ${IMG} \
-	                     .
-	@echo ""
-	@echo "image:           ${IMG}"
-
+	BUILDER ?= ${BUILDER_REGISTRY}wasm-go-builder:go${GO_VERSION}-oras${ORAS_VERSION}
+	EXTRA_TAGS := "" # Define EXTRA_TAGS to avoid it being unset
 endif
 
-# --- Common Target ---
+# --- Build Targets ---
+# The default target is 'build'
+.DEFAULT: build
+
+# Build the wasm plugin file
+build:
+	# IMPORTANT: The following lines MUST be indented with a Tab character, not spaces.
+	DOCKER_BUILDKIT=1 docker build -f ${DOCKERFILE} --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
+		--build-arg BUILDER=${BUILDER} \
+		--build-arg GOPROXY=$(GOPROXY) \
+		--build-arg EXTRA_TAGS=${EXTRA_TAGS} \
+		-t ${IMG} \
+		--output extensions/${PLUGIN_NAME} \
+		.
+	@echo ""
+	@echo "output wasm file: extensions/${PLUGIN_NAME}/plugin.wasm"
+
+# Build the container image with the wasm plugin
+build-image:
+	DOCKER_BUILDKIT=1 docker build -f ${DOCKERFILE} --build-arg PLUGIN_NAME=${PLUGIN_NAME} \
+		--build-arg BUILDER=${BUILDER} \
+		--build-arg GOPROXY=$(GOPROXY) \
+		--build-arg EXTRA_TAGS=${EXTRA_TAGS} \
+		-t ${IMG} \
+		.
+	@echo ""
+	@echo "image:           ${IMG}"
+
+# Build and push the image to the primary registry
 build-push: build-image
+	# IMPORTANT: The following line MUST be indented with a Tab character, not spaces.
 	docker push ${IMG}
+
+# Build the image and push it to a secondary location (Docker Hub via git)
+build-push-dockerhub: build-image
+	# IMPORTANT: The following lines MUST be indented with a Tab character, not spaces.
+	cd ~/sangfor/upload-docker-images/images-zgsm/ && \
+	rm -f * && \
+	docker save -o ${PLUGIN_NAME}-${IMAGE_TAG}.tar ${IMG} && \
+	git add -A && \
+	git commit -m "feat: add ${PLUGIN_NAME}-${IMAGE_TAG}.tar" && \
+	git push origin main
 
 # builder:
 # To build a wasm-go-builder image.
