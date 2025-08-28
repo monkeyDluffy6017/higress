@@ -9,7 +9,7 @@ USE_HIGRESS_TINYGO ?= false
 BUILD_TIME := $(shell date "+%Y%m%d-%H%M%S")
 COMMIT_ID := $(shell git rev-parse --short HEAD 2>/dev/null)
 IMAGE_TAG ?= 0.0.1
-IMG ?= ${REGISTRY}${PLUGIN_NAME}:${IMAGE_TAG}
+IMG ?= ${REGISTRY}/${PLUGIN_NAME}:${IMAGE_TAG}
 GOPROXY := $(shell go env GOPROXY)
 
 # --- Conditional Build Logic ---
