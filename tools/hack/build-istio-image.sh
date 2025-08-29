@@ -19,11 +19,9 @@ set -euo pipefail
 source "$(dirname -- "$0")/setup-istio-env.sh"
 
 cd ${ROOT}/external/istio
-rm -rf out/linux_${TARGET_ARCH};
+rm -rf out/linux_${TARGET_ARCH}; 
 
 CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${ROOT}/external/package,destination=/home/package "
-# 挂载本地 envoy 源码以配合 external/proxy 的本地仓库覆盖
-CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${ROOT}/external/envoy,destination=/home/envoy "
 
 DOCKER_RUN_OPTIONS+="-e HTTP_PROXY -e HTTPS_PROXY"
 
