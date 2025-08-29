@@ -1,0 +1,31 @@
+package main
+
+const (
+	Success = "ai-gateway.success"
+
+	BuildModelsFailed            = "ai-gateway.build_models_failed"
+	SendModelsResponseFailed     = "ai-gateway.send_models_response_failed"
+	Unauthorized                 = "ai-gateway.unauthorized"
+	NoToken                      = "ai-gateway.no_token"
+	InvalidToken                 = "ai-gateway.invalid_token"
+	TokenParseFailed             = "ai-gateway.token_parse_failed"
+	NoUserID                     = "ai-gateway.no_userid"
+	NoEmployeeNumber             = "ai-gateway.no_employee_number"
+	ModelPermissionDenied        = "ai-gateway.model_permission_denied"
+	TotalQuotaError              = "ai-gateway.total_quota_error"
+	UsedQuotaError               = "ai-gateway.used_quota_error"
+	InsufficientQuota            = "ai-gateway.insufficient_quota"
+	DeductionFailed              = "ai-gateway.deduction_failed"
+	DeductionInconsistent        = "ai-gateway.deduction_inconsistent"
+	InvalidParams                = "ai-gateway.invalid_params"
+	PermissionNotConfigured      = "ai-gateway.permission_not_configured"
+	StarPermissionNotConfigured  = "ai-gateway.star_permission_not_configured"
+	QuotaPermissionNotConfigured = "ai-gateway.quota_permission_not_configured"
+	SetUserPermissionFailed      = "ai-gateway.set_user_permission_failed"
+	SetStarPermissionFailed      = "ai-gateway.set_star_permission_failed"
+	SetQuotaPermissionFailed     = "ai-gateway.set_quota_permission_failed"
+	RedisError                   = "ai-gateway.redis_error"
+	InvalidQuotaFormat           = "ai-gateway.invalid_quota_format"
+	InvalidQuotaValue            = "ai-gateway.invalid_quota_value"
+	StarRequired                 = "ai-gateway.star_required"
+)

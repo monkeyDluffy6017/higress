@@ -242,6 +242,17 @@ impl RedisClient {
         self.command(&cmd, call_fn)
     }
 
+    pub fn incrbyfloat(
+        &self,
+        key: &str,
+        delta: f64,
+        call_fn: Box<RedisValueCallbackFn>,
+    ) -> Result<u32, Status> {
+        let mut cmd = redis::cmd("incrbyfloat");
+        cmd.arg(key).arg(delta);
+        self.command(&cmd, call_fn)
+    }
+
     pub fn decrby(
         &self,
         key: &str,

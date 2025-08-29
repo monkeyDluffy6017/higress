@@ -1,6 +1,6 @@
 PLUGIN_NAME ?= hello-world
 BUILDER_REGISTRY ?= higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/
-REGISTRY ?= higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/
+REGISTRY ?= crpi-j8wrd0nl8l9v42wd.cn-shenzhen.personal.cr.aliyuncs.com/shenma-ai/
 GO_VERSION ?= 1.20.14
 TINYGO_VERSION ?= 0.29.0
 ORAS_VERSION ?= 1.0.0
@@ -9,7 +9,7 @@ USE_HIGRESS_TINYGO ?= false
 BUILDER ?= ${BUILDER_REGISTRY}wasm-go-builder:go${GO_VERSION}-tinygo${TINYGO_VERSION}-oras${ORAS_VERSION}
 BUILD_TIME := $(shell date "+%Y%m%d-%H%M%S")
 COMMIT_ID := $(shell git rev-parse --short HEAD 2>/dev/null)
-IMAGE_TAG = $(if $(strip $(PLUGIN_VERSION)),${PLUGIN_VERSION},${BUILD_TIME}-${COMMIT_ID})
+IMAGE_TAG ?= 0.0.1
 IMG ?= ${REGISTRY}${PLUGIN_NAME}:${IMAGE_TAG}
 GOPROXY := $(shell go env GOPROXY)
 EXTRA_TAGS := $(shell [ -f extensions/${PLUGIN_NAME}/.buildrc ] && . extensions/${PLUGIN_NAME}/.buildrc && echo $$EXTRA_TAGS || echo "")

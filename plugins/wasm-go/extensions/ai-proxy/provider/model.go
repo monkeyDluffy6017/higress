@@ -437,3 +437,16 @@ func (r embeddingsRequest) ParseInput() []string {
 	}
 	return input
 }
+
+// OpenAI Models API types
+type modelsResponse struct {
+	Object string       `json:"object"`
+	Data   []modelInfo  `json:"data"`
+}
+
+type modelInfo struct {
+	Id       string `json:"id"`
+	Object   string `json:"object"`
+	Created  int64  `json:"created"`
+	OwnedBy  string `json:"owned_by"`
+}
